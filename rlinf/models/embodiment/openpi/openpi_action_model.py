@@ -21,8 +21,10 @@ from typing import Any, Literal
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from openpi import transforms as _transforms
+from openpi.models import gemma as _gemma
 from openpi.models import model as _model
 from openpi.models.pi0_config import Pi0Config
 from openpi.models_pytorch.pi0_pytorch import PI0Pytorch, make_att_2d_masks
@@ -31,6 +33,7 @@ from torch.utils._pytree import tree_map
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
 from rlinf.models.embodiment.modules.explore_noise_net import ExploreNoiseNet
 from rlinf.models.embodiment.modules.value_head import ValueHead
+from rlinf.models.embodiment.openpi.tactile_encoder import TactileTCNEncoder
 from rlinf.utils.logging import get_logger
 from rlinf.utils.nested_dict_process import copy_dict_tensor
 from rlinf.utils.pytree import register_pytree_dataclasses
@@ -60,6 +63,28 @@ class OpenPi0Config(Pi0Config):
     action_chunk: int = 5  # action chunk
     action_env_dim: int = 7  # for environment action dim
     num_steps: int = 10  # denoise steps
+
+    # Tabero / T2-VLA tactile-compatible parameters. The upstream OpenPI package
+    # used by RLinf does not expose these fields, so RLinf carries them locally.
+    tactile_type: str = "no"
+    tactile_dim: int = 14
+    tactile_dim_in: int | None = None
+    tactile_history: int | None = None
+    effective_action_dim: int | None = None
+    tactile_loss_weight: float = 0.1
+    padding_loss_weight: float = 1.0
+    expert_his_c_fut_loss_mode: str = "weighted_full"
+    tactile_encoder_type: str = "mlp"
+    tactile_use_reference_frame: bool = False
+    tactile_diff_from_reference: bool = True
+    tactile_prefix_dim_in: int | None = None
+    tactile_prefix_history: int | None = None
+    tactile_prefix_encoder_type: str | None = None
+    tactile_prefix_use_reference_frame: bool | None = None
+    tactile_prefix_diff_from_reference: bool | None = None
+    tactile_streams: tuple[str, ...] = field(default_factory=tuple)
+    tactile_suffix_placement: str = "suffix"
+
     # training config
     train_expert_only: bool = False
     safe_get_logprob: bool = False
@@ -87,6 +112,13 @@ class OpenPi0Config(Pi0Config):
 
     # ===== NFT-specific parameters =====
     is_nft: bool = False
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.tactile_dim_in is None:
+            object.__setattr__(self, "tactile_dim_in", self.tactile_dim)
+        if self.effective_action_dim is None:
+            object.__setattr__(self, "effective_action_dim", self.action_dim)
 
 
 class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
@@ -139,6 +171,8 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         sample_actions_func = self.sample_actions
         super().__init__(config)
         self.sample_actions = sample_actions_func
+        self._replace_projection_layers_for_config()
+        self._init_tactile_prefix_encoder()
         self.logger = get_logger()
         self.global_step = 0
         # assert
@@ -248,6 +282,80 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
 
         self.torch_compile_enabled = False
 
+    def _replace_projection_layers_for_config(self):
+        """Align PyTorch projection layers with checkpoint action dimension."""
+        expert_width = self.action_in_proj.out_features
+        device = self.action_in_proj.weight.device
+        dtype = self.action_in_proj.weight.dtype
+
+        if self.action_in_proj.in_features == self.config.action_dim:
+            return
+
+        self.action_in_proj = nn.Linear(self.config.action_dim, expert_width).to(
+            device=device, dtype=dtype
+        )
+        self.action_out_proj = nn.Linear(expert_width, self.config.action_dim).to(
+            device=device, dtype=dtype
+        )
+        if not self.pi05:
+            self.state_proj = nn.Linear(self.config.action_dim, expert_width).to(
+                device=device, dtype=dtype
+            )
+            self.action_time_mlp_in = nn.Linear(2 * expert_width, expert_width).to(
+                device=device, dtype=dtype
+            )
+            self.action_time_mlp_out = nn.Linear(expert_width, expert_width).to(
+                device=device, dtype=dtype
+            )
+
+    def _init_tactile_prefix_encoder(self):
+        """Create the optional Tabero tactile prefix encoder."""
+        tactile_streams = tuple(self.config.tactile_streams or ())
+        if (
+            "tactile_prefix" not in tactile_streams
+            or not self.config.tactile_prefix_dim_in
+            or self.config.tactile_prefix_dim_in <= 0
+        ):
+            self.tactile_prefix_encoder = None
+            return
+
+        if self.config.tactile_prefix_encoder_type != "tcn":
+            raise ValueError(
+                "Only tactile_prefix_encoder_type='tcn' is supported for Tabero."
+            )
+        if self.config.tactile_prefix_history is None:
+            raise ValueError("tactile_prefix_history is required for TCN tactile.")
+        if self.config.tactile_prefix_use_reference_frame is None:
+            raise ValueError(
+                "tactile_prefix_use_reference_frame is required for TCN tactile."
+            )
+        if self.config.tactile_prefix_diff_from_reference is None:
+            raise ValueError(
+                "tactile_prefix_diff_from_reference is required for TCN tactile."
+            )
+
+        steps = (
+            self.config.tactile_prefix_history + 1
+            if self.config.tactile_prefix_use_reference_frame
+            else self.config.tactile_prefix_history
+        )
+        if self.config.tactile_prefix_dim_in % steps != 0:
+            raise ValueError(
+                "tactile_prefix_dim_in must be divisible by the effective "
+                f"history length; got dim={self.config.tactile_prefix_dim_in}, "
+                f"steps={steps}."
+            )
+
+        prefix_width = _gemma.get_config(self.config.paligemma_variant).width
+        self.tactile_prefix_encoder = TactileTCNEncoder(
+            input_dim=self.config.tactile_prefix_dim_in // steps,
+            hidden_dim=2 * prefix_width,
+            output_dim=prefix_width,
+            history_len=self.config.tactile_prefix_history,
+            has_reference_frame=self.config.tactile_prefix_use_reference_frame,
+            diff_from_reference=self.config.tactile_prefix_diff_from_reference,
+        )
+
     def set_global_step(self, global_step):
         self.global_step = global_step
 
@@ -258,6 +366,20 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
     ):
         self._input_transform = _transforms.compose(transforms)
         self._output_transform = _transforms.compose(output_transforms)
+
+    def _observation_from_dict(self, data: dict):
+        """Create an OpenPI observation while preserving RLinf-local tactile fields."""
+        observation = _model.Observation.from_dict(data)
+        if "tactile_prefix" in data:
+            object.__setattr__(observation, "tactile_prefix", data["tactile_prefix"])
+        return observation
+
+    def _preprocess_observation_with_tactile(self, observation, *, train=True):
+        images, img_masks, lang_tokens, lang_masks, state = (
+            self._preprocess_observation(observation, train=train)
+        )
+        tactile_prefix = getattr(observation, "tactile_prefix", None)
+        return images, img_masks, lang_tokens, lang_masks, state, tactile_prefix
 
     def input_transform(self, obs: dict, transpose=True):
         inputs = tree_map(lambda x: x, obs)
@@ -319,6 +441,13 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         )
         outputs["actions"] = outputs["actions"][:, : self.config.action_chunk]
         return outputs
+
+    def _make_output_transform_input(self, actions, observation):
+        output_data = {"actions": actions, "state": observation.state}
+        tactile_prefix = getattr(observation, "tactile_prefix", None)
+        if tactile_prefix is not None:
+            output_data["tactile_prefix"] = tactile_prefix
+        return output_data
 
     def forward(self, forward_type=ForwardType.DEFAULT, **kwargs):
         if forward_type == ForwardType.SFT:
@@ -387,7 +516,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             )
             processed_obs = self.input_transform(obs_dict, transpose=False)
             processed_obs = self.precision_processor(processed_obs)
-            observation = _model.Observation.from_dict(processed_obs)
+            observation = self._observation_from_dict(processed_obs)
         else:
             obs_dict["actions"] = batch["action"].reshape(
                 bsz, self.config.action_chunk, -1
@@ -399,7 +528,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             if "tokenized_prompt_mask" in batch:
                 processed_obs["tokenized_prompt_mask"] = batch["tokenized_prompt_mask"]
             processed_obs = self.precision_processor(processed_obs)
-            observation = _model.Observation.from_dict(processed_obs)
+            observation = self._observation_from_dict(processed_obs)
             actions = processed_obs["actions"].clone()
             processed_obs.pop("actions")
 
@@ -424,9 +553,9 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         denoise_inds = forward_inputs["denoise_inds"]
         # input transform
         observation = self.input_transform(forward_inputs, transpose=False)
-        observation = _model.Observation.from_dict(observation)
-        images, img_masks, lang_tokens, lang_masks, state = (
-            self._preprocess_observation(observation, train=False)
+        observation = self._observation_from_dict(observation)
+        images, img_masks, lang_tokens, lang_masks, state, tactile_prefix = (
+            self._preprocess_observation_with_tactile(observation, train=False)
         )
         # transfer to device
         device = chains.device
@@ -440,6 +569,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             lang_tokens,
             lang_masks,
             state,
+            tactile_prefix,
             chains,
             denoise_inds,
             compute_values,
@@ -470,9 +600,9 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         """Compute velocity v_theta at explicit (x_t, timesteps) for NFT loss."""
         # obs process
         observation = self.input_transform(forward_inputs, transpose=False)
-        observation = _model.Observation.from_dict(observation)
-        images, img_masks, lang_tokens, lang_masks, state = (
-            self._preprocess_observation(observation, train=False)
+        observation = self._observation_from_dict(observation)
+        images, img_masks, lang_tokens, lang_masks, state, tactile_prefix = (
+            self._preprocess_observation_with_tactile(observation, train=False)
         )
         # move device
         device = next(self.parameters()).device
@@ -485,7 +615,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         t = nft_inputs["timesteps"].to(device)
         # get v_theta
         _, prefix_pad_masks, past_key_values = self._build_prefix_cache(
-            images, img_masks, lang_tokens, lang_masks
+            images, img_masks, lang_tokens, lang_masks, tactile_prefix
         )
         compute_values = kwargs.get("compute_values", False)
         v_theta, suffix_out = self.get_velocity(
@@ -499,6 +629,33 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         return result
 
     def obs_processor(self, env_obs):
+        if "tabero" in self.config.config_name:
+            processed_obs = {
+                "image": env_obs["main_images"],
+                "wrist_image": env_obs["wrist_images"],
+                "state": env_obs["states"],
+                "prompt": env_obs["task_descriptions"],
+            }
+            if "tacimg" in self.config.config_name:
+                tactile_image = env_obs.get("tactile_images")
+                if tactile_image is None:
+                    tactile_image = env_obs.get("extra_view_images")
+                if tactile_image is None:
+                    raise KeyError(
+                        "Tabero tacimg expects 'tactile_images' or "
+                        "'extra_view_images' in env_obs."
+                    )
+                processed_obs["tactile_image"] = tactile_image
+            if "tacfield" in self.config.config_name:
+                if "tactile_marker_motion" not in env_obs:
+                    raise KeyError(
+                        "Tabero tacfield expects 'tactile_marker_motion' in env_obs."
+                    )
+                processed_obs["tactile_marker_motion"] = env_obs[
+                    "tactile_marker_motion"
+                ]
+            return processed_obs
+
         processed_obs = {
             "observation/image": env_obs["main_images"],
             "prompt": env_obs["task_descriptions"],
@@ -549,7 +706,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         processed_obs = self.precision_processor(
             processed_obs
         )  # obs precision processor
-        observation = _model.Observation.from_dict(processed_obs)
+        observation = self._observation_from_dict(processed_obs)
 
         is_dsrl_active = self.config.use_dsrl
         if is_dsrl_active:
@@ -572,7 +729,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
 
             # Step 3: Extract actual actions for environment interaction
             real_actions = self.output_transform(
-                {"actions": outputs["actions"], "state": observation.state}
+                self._make_output_transform_input(outputs["actions"], observation)
             )["actions"]
 
             # Return actual actions to environment, but forward_inputs stores noise.
@@ -587,7 +744,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 observation, mode=mode, compute_values=compute_values
             )
             actions = self.output_transform(
-                {"actions": outputs["actions"], "state": observation.state}
+                self._make_output_transform_input(outputs["actions"], observation)
             )["actions"]
             prev_logprobs = outputs["prev_logprobs"]
             prev_values = outputs["prev_values"]
@@ -647,12 +804,12 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             # DSRL: SAC provides noise, convert dtype to match action_in_proj
             noise = noise.to(self.action_in_proj.weight.dtype)
 
-        images, img_masks, lang_tokens, lang_masks, state = (
-            self._preprocess_observation(observation, train=False)
+        images, img_masks, lang_tokens, lang_masks, state, tactile_prefix = (
+            self._preprocess_observation_with_tactile(observation, train=False)
         )
 
         prefix_output, prefix_pad_masks, past_key_values = self._build_prefix_cache(
-            images, img_masks, lang_tokens, lang_masks
+            images, img_masks, lang_tokens, lang_masks, tactile_prefix
         )
 
         x_t = noise
@@ -886,10 +1043,53 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         v_t = self.action_out_proj(suffix_out)
         return v_t, suffix_out
 
-    def _build_prefix_cache(self, images, img_masks, lang_tokens, lang_masks):
+    def embed_prefix(
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        tactile_prefix=None,
+    ):
+        """Embed image/language prefix tokens and optional Tabero tactile token."""
+        prefix_embs, prefix_pad_masks, prefix_att_masks = super().embed_prefix(
+            images, img_masks, lang_tokens, lang_masks
+        )
+        if self.tactile_prefix_encoder is None or tactile_prefix is None:
+            return prefix_embs, prefix_pad_masks, prefix_att_masks
+
+        tactile_prefix = tactile_prefix.to(
+            device=prefix_embs.device,
+            dtype=self.tactile_prefix_encoder.out_proj.weight.dtype,
+        )
+
+        def tactile_embed_func(tactile):
+            return self.tactile_prefix_encoder(tactile)
+
+        tactile_emb = self._apply_checkpoint(tactile_embed_func, tactile_prefix)
+        tactile_emb = tactile_emb.to(dtype=prefix_embs.dtype)[:, None, :]
+        tactile_pad_mask = torch.ones(
+            tactile_emb.shape[:2],
+            dtype=torch.bool,
+            device=prefix_pad_masks.device,
+        )
+        tactile_att_mask = torch.zeros(
+            tactile_emb.shape[:2],
+            dtype=torch.bool,
+            device=prefix_att_masks.device,
+        )
+
+        prefix_embs = torch.cat([prefix_embs, tactile_emb], dim=1)
+        prefix_pad_masks = torch.cat([prefix_pad_masks, tactile_pad_mask], dim=1)
+        prefix_att_masks = torch.cat([prefix_att_masks, tactile_att_mask], dim=1)
+        return prefix_embs, prefix_pad_masks, prefix_att_masks
+
+    def _build_prefix_cache(
+        self, images, img_masks, lang_tokens, lang_masks, tactile_prefix=None
+    ):
         """Embed prefix tokens and compute KV cache for efficient suffix generation."""
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks
+            images, img_masks, lang_tokens, lang_masks, tactile_prefix
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
@@ -942,6 +1142,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         lang_tokens,
         lang_masks,
         state,
+        tactile_prefix,
         chains,
         denoise_inds,
         compute_values=False,
@@ -949,7 +1150,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         bsize = state.shape[0]
         batch_indices = torch.arange(bsize)
         prefix_output, prefix_pad_masks, past_key_values = self._build_prefix_cache(
-            images, img_masks, lang_tokens, lang_masks
+            images, img_masks, lang_tokens, lang_masks, tactile_prefix
         )
         chains_log_probs = []
         chains_values = []

@@ -68,6 +68,11 @@ from rlinf.models.embodiment.openpi.dataconfig.robocasa_dataconfig import (
 from rlinf.models.embodiment.openpi.dataconfig.robotwin_aloha_dataconfig import (
     LeRobotAlohaDataConfig,
 )
+from rlinf.models.embodiment.openpi.dataconfig.tabero_dataconfig import (
+    TaberoTacFieldDataConfig,
+    TaberoTacImgDataConfig,
+)
+from rlinf.models.embodiment.openpi.openpi_action_model import OpenPi0Config
 
 _CONFIGS = [
     TrainConfig(
@@ -83,6 +88,70 @@ _CONFIGS = [
             "checkpoints/jax/pi0_base/params"
         ),
         pytorch_weight_path="checkpoints/torch/pi0_base",
+    ),
+    TrainConfig(
+        name="pi0_lora_tacimg_tabero",
+        model=OpenPi0Config(
+            config_name="pi0_lora_tacimg_tabero",
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            action_dim=32,
+            action_env_dim=13,
+            effective_action_dim=13,
+            tactile_type="expert_his_c_fut",
+            tactile_dim=6,
+            tactile_dim_in=0,
+            tactile_loss_weight=0.1,
+        ),
+        data=TaberoTacImgDataConfig(
+            repo_id="NathanWu7/tabero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=True,
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            peak_lr=2.5e-5,
+            decay_lr=2.5e-6,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi0_base/params"
+        ),
+        num_train_steps=50_000,
+        ema_decay=None,
+    ),
+    TrainConfig(
+        name="pi0_lora_tacfield_tabero",
+        model=OpenPi0Config(
+            config_name="pi0_lora_tacfield_tabero",
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            action_dim=32,
+            action_env_dim=13,
+            effective_action_dim=13,
+            tactile_type="expert_his_c_fut",
+            tactile_dim=6,
+            tactile_dim_in=0,
+            tactile_prefix_dim_in=9 * 198 * 2,
+            tactile_prefix_history=8,
+            tactile_prefix_encoder_type="tcn",
+            tactile_prefix_use_reference_frame=True,
+            tactile_prefix_diff_from_reference=False,
+            tactile_streams=("tactile_prefix",),
+            tactile_loss_weight=0.1,
+        ),
+        data=TaberoTacFieldDataConfig(
+            repo_id="NathanWu7/tabero_object_25",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=True,
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            peak_lr=2.5e-5,
+            decay_lr=2.5e-6,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi0_base/params"
+        ),
+        num_train_steps=50_000,
+        ema_decay=None,
     ),
     TrainConfig(
         name="pi05_libero",
