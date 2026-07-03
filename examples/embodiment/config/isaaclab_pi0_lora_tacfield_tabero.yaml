@@ -86,22 +86,34 @@ env:
     group_size: 1
     reward_coef: 1.0
     use_fixed_reset_state_ids: True
-    max_steps_per_rollout_epoch: 450
-    max_episode_steps: 450 # max episode steps for truncation
+    max_steps_per_rollout_epoch: 320
+    max_episode_steps: 320 # max episode steps for truncation
     video_cfg:
       save_video: False
       info_on_video: True
       fps: 20
       video_base_dir: ${runner.logger.log_path}/video/train
     init_params:
-      id: "Isaac-Stack-Cube-Franka-IK-Rel-Visuomotor-Rewarded-v0"
+      id: "Isaac-Libero-Franka-Hybrid-Tactile-v0"
       num_envs: null
       max_episode_steps: ${..max_episode_steps} # max episode steps for truncation
-      task_description: "Stack the red block on the blue block, then stack the green block on the red block."
-      table_cam:
+      task_description: "put both the alphabet soup and the tomato sauce in the basket"
+      extension_path: "/data/home/sim6g/code/tabero/Tabero/source/tac_manip"
+      libero_config_dir: "/data/home/sim6g/code/tabero/Tabero/benchmarks/datasets/libero/config"
+      libero_assets_dir: "/data/home/sim6g/code/tabero/Tabero/benchmarks/datasets/libero/USD"
+      task_suite: "libero_10"
+      task_id: 0
+      use_relative_mode: False
+      marker_history_len: 8
+      combined_marker_count: 198
+      main_image_key: "agentview_rgb"
+      wrist_image_key: "eye_in_hand_rgb"
+      marker_motion_key: "gripper_marker_motion"
+      force_key: "gripper_net_force"
+      agentview_cam:
         height: 256
         width: 256
-      wrist_cam:
+      eye_in_hand_cam:
         height: 256
         width: 256
 
@@ -116,22 +128,34 @@ env:
     group_size: 1
     reward_coef: 1.0
     use_fixed_reset_state_ids: True
-    max_steps_per_rollout_epoch: 450
-    max_episode_steps: 450 # max episode steps for truncation
+    max_steps_per_rollout_epoch: 320
+    max_episode_steps: 320 # max episode steps for truncation
     video_cfg:
       save_video: True
       info_on_video: True
       fps: 20
       video_base_dir: ${runner.logger.log_path}/video/eval
     init_params:
-      id: "Isaac-Stack-Cube-Franka-IK-Rel-Visuomotor-Rewarded-v0"
+      id: "Isaac-Libero-Franka-Hybrid-Tactile-v0"
       num_envs: null
       max_episode_steps: ${..max_episode_steps} # max episode steps for truncation
-      task_description: "Stack the red block on the blue block, then stack the green block on the red block."
-      table_cam:
+      task_description: "put both the alphabet soup and the tomato sauce in the basket"
+      extension_path: "/data/home/sim6g/code/tabero/Tabero/source/tac_manip"
+      libero_config_dir: "/data/home/sim6g/code/tabero/Tabero/benchmarks/datasets/libero/config"
+      libero_assets_dir: "/data/home/sim6g/code/tabero/Tabero/benchmarks/datasets/libero/USD"
+      task_suite: "libero_10"
+      task_id: 0
+      use_relative_mode: False
+      marker_history_len: 8
+      combined_marker_count: 198
+      main_image_key: "agentview_rgb"
+      wrist_image_key: "eye_in_hand_rgb"
+      marker_motion_key: "gripper_marker_motion"
+      force_key: "gripper_net_force"
+      agentview_cam:
         height: 256
         width: 256
-      wrist_cam:
+      eye_in_hand_cam:
         height: 256
         width: 256
 

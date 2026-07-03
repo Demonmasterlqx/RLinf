@@ -13,9 +13,11 @@
 # limitations under the License.
 
 from .tasks.stack_cube import IsaaclabStackCubeEnv
+from .tasks.tabero_tacfield import IsaaclabTaberoTacFieldEnv
 
 REGISTER_ISAACLAB_ENVS = {
     "Isaac-Stack-Cube-Franka-IK-Rel-Visuomotor-Rewarded-v0": IsaaclabStackCubeEnv,
+    "Isaac-Libero-Franka-Hybrid-Tactile-v0": IsaaclabTaberoTacFieldEnv,
 }
 
 __all__ = [list(REGISTER_ISAACLAB_ENVS.keys())]
