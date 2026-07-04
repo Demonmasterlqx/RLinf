@@ -15,6 +15,7 @@
 import torch
 from omegaconf import OmegaConf
 
+from rlinf.data.embodied_io_struct import EnvOutput
 from rlinf.envs import get_env_cls
 
 from rlinf.envs.isaaclab.tasks.tabero_tacfield import (
@@ -97,3 +98,41 @@ def test_get_env_cls_resolves_tabero_tacfield_id_to_adapter():
     )
 
     assert get_env_cls("isaaclab", cfg) is IsaaclabTaberoTacFieldEnv
+
+
+def test_env_output_preserves_tabero_tactile_marker_motion_for_rollout_channel():
+    tactile = torch.zeros((2, 9, 198, 2), dtype=torch.float32)
+    custom_extra = torch.ones((2, 3), dtype=torch.float32)
+    env_output = EnvOutput(
+        obs={
+            "main_images": torch.zeros((2, 4, 4, 3), dtype=torch.uint8),
+            "wrist_images": torch.ones((2, 4, 4, 3), dtype=torch.uint8),
+            "states": torch.zeros((2, 7), dtype=torch.float32),
+            "task_descriptions": ["task a", "task b"],
+            "tactile_marker_motion": tactile,
+            "custom_extra": custom_extra,
+        },
+        final_obs={
+            "main_images": torch.zeros((2, 4, 4, 3), dtype=torch.uint8),
+            "wrist_images": torch.ones((2, 4, 4, 3), dtype=torch.uint8),
+            "states": torch.zeros((2, 7), dtype=torch.float32),
+            "task_descriptions": ["task a", "task b"],
+            "tactile_marker_motion": tactile + 1,
+            "custom_extra": custom_extra + 1,
+        },
+    )
+
+    output_dict = env_output.to_dict()
+
+    assert "tactile_marker_motion" in output_dict["obs"]
+    assert "custom_extra" in output_dict["obs"]
+    assert "tactile_marker_motion" in output_dict["final_obs"]
+    assert "custom_extra" in output_dict["final_obs"]
+    torch.testing.assert_close(output_dict["obs"]["tactile_marker_motion"], tactile)
+    torch.testing.assert_close(output_dict["obs"]["custom_extra"], custom_extra)
+    torch.testing.assert_close(
+        output_dict["final_obs"]["tactile_marker_motion"], tactile + 1
+    )
+    torch.testing.assert_close(
+        output_dict["final_obs"]["custom_extra"], custom_extra + 1
+    )

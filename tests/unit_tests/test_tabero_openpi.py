@@ -18,7 +18,10 @@ import torch
 from openpi.models import model as _model
 
 from rlinf.models.embodiment.openpi.dataconfig import get_openpi_config
-from rlinf.models.embodiment.openpi.openpi_action_model import OpenPi0Config
+from rlinf.models.embodiment.openpi.openpi_action_model import (
+    OpenPi0Config,
+    OpenPi0ForRLActionPrediction,
+)
 from rlinf.models.embodiment.openpi.policies.tabero_policy import (
     LiberoForceOutputs,
     TaberoTacFieldInputs,
@@ -114,6 +117,40 @@ def test_tabero_openpi_configs_are_registered_with_extended_config():
     assert tacfield.model.tactile_prefix_encoder_type == "tcn"
     assert tacfield.model.tactile_streams == ("tactile_prefix",)
     assert tacfield.data.repo_id == "NathanWu7/tabero_object_25"
+
+
+def test_tactile_prefix_encoder_has_own_fsdp_wrap_name():
+    model = OpenPi0ForRLActionPrediction.__new__(OpenPi0ForRLActionPrediction)
+
+    assert "tactile_prefix_encoder" in model._no_split_names
+
+
+def test_tabero_input_transform_keeps_flat_keys_without_prompt():
+    model = OpenPi0ForRLActionPrediction.__new__(OpenPi0ForRLActionPrediction)
+    tabero_transform = TaberoTacFieldInputs(model_type=_model.ModelType.PI0)
+    model._input_transform = lambda data: {
+        key: value for key, value in tabero_transform(data).items() if key != "prompt"
+    }
+    obs = {
+        "image": torch.zeros(1, 224, 224, 3, dtype=torch.uint8),
+        "wrist_image": torch.zeros(1, 224, 224, 3, dtype=torch.uint8),
+        "state": torch.zeros(1, 16),
+        "tactile_marker_motion": torch.zeros(1, 9, 198, 2),
+        "chains": torch.zeros(1, 2, 5, 32),
+        "denoise_inds": torch.zeros(1, 2, dtype=torch.long),
+        "tokenized_prompt": torch.ones(1, 8, dtype=torch.long),
+        "tokenized_prompt_mask": torch.ones(1, 8, dtype=torch.bool),
+    }
+
+    out = model.input_transform(obs, transpose=False)
+
+    assert out["tactile_prefix"].shape == (1, 9, 396)
+    assert "chains" not in out
+    assert "denoise_inds" not in out
+    torch.testing.assert_close(out["tokenized_prompt"], obs["tokenized_prompt"])
+    torch.testing.assert_close(
+        out["tokenized_prompt_mask"], obs["tokenized_prompt_mask"]
+    )
 
 
 def test_tactile_tcn_encoder_outputs_single_prefix_token():

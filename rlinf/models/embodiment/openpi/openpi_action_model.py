@@ -161,6 +161,8 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             # --pi05 only--
             "time_mlp_in",
             "time_mlp_out",
+            # --Tabero tacfield--
+            "tactile_prefix_encoder",
         ]
 
     def __init__(
@@ -388,11 +390,35 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         if first_process:
             inputs.pop("prompt")
         else:
-            inputs = {key: inputs[key] for key in inputs.keys() if "/" in key}
+            slash_key_inputs = {
+                key: inputs[key] for key in inputs.keys() if "/" in key
+            }
+            if slash_key_inputs:
+                inputs = slash_key_inputs
+            else:
+                tabero_input_keys = {
+                    "image",
+                    "wrist_image",
+                    "tactile_image",
+                    "state",
+                    "actions",
+                    "tactile_marker_motion",
+                }
+                inputs = {
+                    key: inputs[key]
+                    for key in inputs.keys()
+                    if key in tabero_input_keys
+                }
 
         # tensor -> numpy
         inputs = tree_map(_to_numpy, inputs)
-        batch_size = next(v.shape[0] for v in inputs.values() if hasattr(v, "shape"))
+        shaped_values = [v for v in inputs.values() if hasattr(v, "shape")]
+        if not shaped_values:
+            raise ValueError(
+                "input_transform received no batched observation tensors after "
+                f"filtering keys: {list(obs.keys())}"
+            )
+        batch_size = shaped_values[0].shape[0]
         # split
         batch_samples = []
         for i in range(batch_size):

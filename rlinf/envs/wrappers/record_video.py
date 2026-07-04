@@ -74,6 +74,19 @@ class RecordVideo(gym.Wrapper):
 
         self.video_cfg = video_cfg
         self.render_images: list[np.ndarray] = []
+        self._view_image_keys = self._get_cfg_list("image_keys")
+        self._view_image_names = self._get_cfg_list("image_names")
+        if self._view_image_keys:
+            if not self._view_image_names:
+                self._view_image_names = list(self._view_image_keys)
+            if len(self._view_image_names) != len(self._view_image_keys):
+                raise ValueError(
+                    "video_cfg.image_names must have the same length as "
+                    "video_cfg.image_keys."
+                )
+        self.render_images_by_view: dict[str, list[np.ndarray]] = {
+            name: [] for name in self._view_image_names
+        }
         self.video_cnt = 0
         self._num_envs = getattr(env, "num_envs", 1)
         self._executor = ThreadPoolExecutor(max_workers=1)
@@ -83,6 +96,18 @@ class RecordVideo(gym.Wrapper):
             self._fps = fps
         else:
             self._fps = self._get_fps_from_env(env)
+
+    def _get_cfg_list(self, name: str) -> list[str]:
+        """Read an optional string/list field from video_cfg."""
+        if hasattr(self.video_cfg, "get"):
+            value = self.video_cfg.get(name, None)
+        else:
+            value = getattr(self.video_cfg, name, None)
+        if value is None:
+            return []
+        if isinstance(value, str):
+            return [value]
+        return [str(item) for item in value]
 
     @property
     def is_start(self):
@@ -158,6 +183,34 @@ class RecordVideo(gym.Wrapper):
             return self._split_image_source(obs)
         if isinstance(obs, np.ndarray):
             return self._split_image_source(obs)
+        return []
+
+    def _extract_frame_batches_for_key(
+        self, obs: Any, image_key: str
+    ) -> list[list[np.ndarray]]:
+        """Extract frame batches from a specific observation image key."""
+        if obs is None:
+            return []
+
+        if isinstance(obs, dict):
+            image_src = obs.get(image_key, None)
+            if image_src is None:
+                return []
+            return self._split_image_source(image_src)
+
+        if isinstance(obs, (list, tuple)):
+            frames = []
+            for item in obs:
+                if not isinstance(item, dict):
+                    return []
+                image_src = item.get(image_key, None)
+                if image_src is None:
+                    continue
+                batches = self._split_image_source(image_src)
+                if batches:
+                    frames.append(batches[0])
+            return frames
+
         return []
 
     def _split_image_source(self, image_src: Any) -> list[list[np.ndarray]]:
@@ -310,6 +363,7 @@ class RecordVideo(gym.Wrapper):
         rewards: Optional[Any],
         terminations: Optional[Any],
         time_idx: Optional[int] = None,
+        target: Optional[list[np.ndarray]] = None,
     ) -> None:
         """Overlay info (optional) and append a tiled frame."""
         if not images:
@@ -327,9 +381,28 @@ class RecordVideo(gym.Wrapper):
         if len(images) > 1:
             nrows = int(np.sqrt(len(images)))
             full_image = tile_images(images, nrows=nrows)
-            self.render_images.append(full_image)
+            (target if target is not None else self.render_images).append(full_image)
         else:
-            self.render_images.append(images[0])
+            (target if target is not None else self.render_images).append(images[0])
+
+    def _append_frame_batches(
+        self,
+        frames: list[list[np.ndarray]],
+        infos: Optional[Any],
+        rewards: Optional[Any],
+        terminations: Optional[Any],
+        target: Optional[list[np.ndarray]] = None,
+    ) -> None:
+        if isinstance(infos, (list, tuple)):
+            for time_idx, images in enumerate(frames):
+                step_info = infos[time_idx] if len(infos) > time_idx else None
+                self._append_frame(
+                    images, step_info, rewards, terminations, time_idx, target
+                )
+            return
+
+        for time_idx, images in enumerate(frames):
+            self._append_frame(images, infos, rewards, terminations, time_idx, target)
 
     def add_new_frames(
         self,
@@ -339,6 +412,30 @@ class RecordVideo(gym.Wrapper):
         terminations: Optional[Any] = None,
     ):
         """Extract frames from obs and append to the buffer."""
+        if self._view_image_keys:
+            recorded_any = False
+            for image_key, view_name in zip(
+                self._view_image_keys, self._view_image_names
+            ):
+                frames = self._extract_frame_batches_for_key(obs, image_key)
+                if not frames:
+                    continue
+                recorded_any = True
+                self._append_frame_batches(
+                    frames,
+                    infos,
+                    rewards,
+                    terminations,
+                    self.render_images_by_view[view_name],
+                )
+            if not recorded_any:
+                warnings.warn(
+                    "Failed to extract configured video views from obs, "
+                    f"image_keys: {self._view_image_keys}, obs type: {type(obs)}, "
+                    f"obs keys: {list(obs.keys()) if isinstance(obs, dict) else 'N/A'}"
+                )
+            return
+
         frames = self._extract_frame_batches(obs)
         if not frames:
             warnings.warn(
@@ -347,14 +444,7 @@ class RecordVideo(gym.Wrapper):
             )
             return
 
-        if isinstance(infos, (list, tuple)):
-            for time_idx, images in enumerate(frames):
-                step_info = infos[time_idx] if len(infos) > time_idx else None
-                self._append_frame(images, step_info, rewards, terminations, time_idx)
-            return
-
-        for time_idx, images in enumerate(frames):
-            self._append_frame(images, infos, rewards, terminations, time_idx)
+        self._append_frame_batches(frames, infos, rewards, terminations)
 
     def reset(self, *args, **kwargs):
         """Reset env and record the initial frame."""
@@ -446,6 +536,32 @@ class RecordVideo(gym.Wrapper):
         handler is run under Ray actor shutdown either). Without this wait,
         eval videos end at ``mdat`` and no player can open them.
         """
+        if self._view_image_keys:
+            if not any(self.render_images_by_view.values()):
+                return
+
+            output_dir = os.path.join(
+                self.video_cfg.video_base_dir, f"seed_{self.env.seed}"
+            )
+            if video_sub_dir is not None:
+                output_dir = os.path.join(output_dir, f"{video_sub_dir}")
+
+            video_idx = self.video_cnt
+            futures = []
+            for view_name in self._view_image_names:
+                frames = self.render_images_by_view[view_name]
+                if not frames:
+                    continue
+                view_output_dir = os.path.join(output_dir, view_name)
+                os.makedirs(view_output_dir, exist_ok=True)
+                mp4_path = os.path.join(view_output_dir, f"{video_idx}.mp4")
+                self.render_images_by_view[view_name] = []
+                futures.append(self._submit_save(list(frames), mp4_path))
+            self.video_cnt += 1
+            for future in futures:
+                future.result()
+            return
+
         if not self.render_images:
             return
 
