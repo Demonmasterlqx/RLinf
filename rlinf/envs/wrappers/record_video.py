@@ -28,6 +28,9 @@ except ImportError:
     torch = None
 
 from rlinf.envs.utils import put_info_on_image, tile_images
+from rlinf.envs.wrappers.tactile_heatmap import (
+    render_tactile_marker_motion_heatmap,
+)
 
 
 class RecordVideo(gym.Wrapper):
@@ -84,9 +87,23 @@ class RecordVideo(gym.Wrapper):
                     "video_cfg.image_names must have the same length as "
                     "video_cfg.image_keys."
                 )
+        self._tactile_heatmap_cfg = self._get_cfg_value(
+            self.video_cfg, "tactile_heatmap", None
+        )
+        self._tactile_heatmap_enabled = self._is_tactile_heatmap_enabled()
+        self._tactile_heatmap_name = self._get_tactile_heatmap_name()
+        self._named_view_names = list(self._view_image_names)
+        if self._tactile_heatmap_enabled:
+            self._named_view_names.append(self._tactile_heatmap_name)
+        if len(set(self._named_view_names)) != len(self._named_view_names):
+            raise ValueError("video view names must be unique.")
         self.render_images_by_view: dict[str, list[np.ndarray]] = {
-            name: [] for name in self._view_image_names
+            name: [] for name in self._named_view_names
         }
+        self._composite_views = self._get_cfg_list("composite_views")
+        self._composite_name = str(
+            self._get_cfg_value(self.video_cfg, "composite_name", "combined")
+        )
         self.video_cnt = 0
         self._num_envs = getattr(env, "num_envs", 1)
         self._executor = ThreadPoolExecutor(max_workers=1)
@@ -97,17 +114,46 @@ class RecordVideo(gym.Wrapper):
         else:
             self._fps = self._get_fps_from_env(env)
 
+    def _get_cfg_value(self, cfg: Any, name: str, default: Any = None) -> Any:
+        """Read an optional field from a dict/OmegaConf/object config."""
+        if cfg is None:
+            return default
+        if hasattr(cfg, "get"):
+            return cfg.get(name, default)
+        return getattr(cfg, name, default)
+
     def _get_cfg_list(self, name: str) -> list[str]:
         """Read an optional string/list field from video_cfg."""
-        if hasattr(self.video_cfg, "get"):
-            value = self.video_cfg.get(name, None)
-        else:
-            value = getattr(self.video_cfg, name, None)
+        value = self._get_cfg_value(self.video_cfg, name, None)
         if value is None:
             return []
         if isinstance(value, str):
             return [value]
         return [str(item) for item in value]
+
+    def _get_cfg_sequence(
+        self, cfg: Any, name: str, default: tuple[int, ...]
+    ) -> list[Any]:
+        value = self._get_cfg_value(cfg, name, None)
+        if value is None:
+            return list(default)
+        if isinstance(value, str):
+            return [value]
+        return list(value)
+
+    def _is_tactile_heatmap_enabled(self) -> bool:
+        if self._tactile_heatmap_cfg is None:
+            return False
+        return bool(self._get_cfg_value(self._tactile_heatmap_cfg, "enabled", True))
+
+    def _get_tactile_heatmap_name(self) -> str:
+        if self._tactile_heatmap_cfg is None:
+            return "tactile_heatmap"
+        return str(
+            self._get_cfg_value(
+                self._tactile_heatmap_cfg, "name", "tactile_heatmap"
+            )
+        )
 
     @property
     def is_start(self):
@@ -209,6 +255,76 @@ class RecordVideo(gym.Wrapper):
                 batches = self._split_image_source(image_src)
                 if batches:
                     frames.append(batches[0])
+            return frames
+
+        return []
+
+    def _extract_tactile_heatmap_batches(self, obs: Any) -> list[list[np.ndarray]]:
+        """Render tactile marker-motion observations into frame batches."""
+        if not self._tactile_heatmap_enabled:
+            return []
+
+        cfg = self._tactile_heatmap_cfg
+        source_key = str(
+            self._get_cfg_value(cfg, "source_key", "tactile_marker_motion")
+        )
+
+        def render(source: Any) -> list[np.ndarray]:
+            try:
+                return render_tactile_marker_motion_heatmap(
+                    source,
+                    history_index=int(self._get_cfg_value(cfg, "history_index", -1)),
+                    marker_grid=[
+                        int(item)
+                        for item in self._get_cfg_sequence(
+                            cfg, "marker_grid", (9, 11)
+                        )
+                    ],
+                    sensor_count=int(self._get_cfg_value(cfg, "sensor_count", 2)),
+                    output_size=[
+                        int(item)
+                        for item in self._get_cfg_sequence(
+                            cfg, "output_size", (256, 256)
+                        )
+                    ],
+                    clip_quantile=float(
+                        self._get_cfg_value(cfg, "clip_quantile", 0.99)
+                    ),
+                )
+            except Exception as exc:
+                warnings.warn(
+                    f"Failed to render tactile heatmap from key '{source_key}': {exc}"
+                )
+                return []
+
+        if isinstance(obs, dict):
+            source = obs.get(source_key, None)
+            if source is None:
+                warnings.warn(
+                    f"tactile heatmap source key '{source_key}' missing from obs."
+                )
+                return []
+            frames = render(source)
+            return [frames] if frames else []
+
+        if isinstance(obs, (list, tuple)):
+            frames = []
+            missing_any = False
+            for item in obs:
+                if not isinstance(item, dict):
+                    return []
+                source = item.get(source_key, None)
+                if source is None:
+                    missing_any = True
+                    continue
+                rendered = render(source)
+                if rendered:
+                    frames.append(rendered)
+            if missing_any:
+                warnings.warn(
+                    f"tactile heatmap source key '{source_key}' missing from one "
+                    "or more obs entries."
+                )
             return frames
 
         return []
@@ -412,7 +528,7 @@ class RecordVideo(gym.Wrapper):
         terminations: Optional[Any] = None,
     ):
         """Extract frames from obs and append to the buffer."""
-        if self._view_image_keys:
+        if self._named_view_names:
             recorded_any = False
             for image_key, view_name in zip(
                 self._view_image_keys, self._view_image_names
@@ -428,6 +544,17 @@ class RecordVideo(gym.Wrapper):
                     terminations,
                     self.render_images_by_view[view_name],
                 )
+            if self._tactile_heatmap_enabled:
+                frames = self._extract_tactile_heatmap_batches(obs)
+                if frames:
+                    recorded_any = True
+                    self._append_frame_batches(
+                        frames,
+                        infos,
+                        rewards,
+                        terminations,
+                        self.render_images_by_view[self._tactile_heatmap_name],
+                    )
             if not recorded_any:
                 warnings.warn(
                     "Failed to extract configured video views from obs, "
@@ -519,6 +646,38 @@ class RecordVideo(gym.Wrapper):
             else:
                 self.add_new_frames(obs_list, infos_list, rewards, terminations)
 
+    def _build_composite_frames(
+        self, frames_by_view: dict[str, list[np.ndarray]]
+    ) -> list[np.ndarray]:
+        """Build horizontally concatenated frames from configured named views."""
+        if not self._composite_views:
+            return []
+        missing_views = [
+            view
+            for view in self._composite_views
+            if view not in frames_by_view or not frames_by_view[view]
+        ]
+        if missing_views:
+            warnings.warn(
+                "Cannot build composite video because these views are missing: "
+                f"{missing_views}."
+            )
+            return []
+
+        frame_count = min(len(frames_by_view[view]) for view in self._composite_views)
+        composite_frames = []
+        for frame_idx in range(frame_count):
+            parts = [frames_by_view[view][frame_idx] for view in self._composite_views]
+            heights = {part.shape[0] for part in parts}
+            if len(heights) != 1:
+                warnings.warn(
+                    "Cannot build composite video because view frame heights differ: "
+                    f"{sorted(heights)}."
+                )
+                return []
+            composite_frames.append(np.concatenate(parts, axis=1))
+        return composite_frames
+
     def chunk_step(self, *args, **kwargs):
         """Step a chunk and record all frames from the chunk."""
         result = self.env.chunk_step(*args, **kwargs)
@@ -536,7 +695,7 @@ class RecordVideo(gym.Wrapper):
         handler is run under Ray actor shutdown either). Without this wait,
         eval videos end at ``mdat`` and no player can open them.
         """
-        if self._view_image_keys:
+        if self._named_view_names:
             if not any(self.render_images_by_view.values()):
                 return
 
@@ -547,9 +706,13 @@ class RecordVideo(gym.Wrapper):
                 output_dir = os.path.join(output_dir, f"{video_sub_dir}")
 
             video_idx = self.video_cnt
+            frames_by_view = {
+                view_name: list(frames)
+                for view_name, frames in self.render_images_by_view.items()
+            }
             futures = []
-            for view_name in self._view_image_names:
-                frames = self.render_images_by_view[view_name]
+            for view_name in self._named_view_names:
+                frames = frames_by_view[view_name]
                 if not frames:
                     continue
                 view_output_dir = os.path.join(output_dir, view_name)
@@ -557,6 +720,16 @@ class RecordVideo(gym.Wrapper):
                 mp4_path = os.path.join(view_output_dir, f"{video_idx}.mp4")
                 self.render_images_by_view[view_name] = []
                 futures.append(self._submit_save(list(frames), mp4_path))
+            composite_frames = self._build_composite_frames(frames_by_view)
+            if composite_frames:
+                composite_output_dir = os.path.join(output_dir, self._composite_name)
+                os.makedirs(composite_output_dir, exist_ok=True)
+                composite_mp4_path = os.path.join(
+                    composite_output_dir, f"{video_idx}.mp4"
+                )
+                futures.append(
+                    self._submit_save(list(composite_frames), composite_mp4_path)
+                )
             self.video_cnt += 1
             for future in futures:
                 future.result()
