@@ -35,6 +35,43 @@ def _camera_rgb_observation(env, camera_name: str) -> torch.Tensor:
     return camera.data.output["rgb"]
 
 
+def _success_terminal_reward(
+    env,
+    success_func: Any,
+    success_params: dict[str, Any] | None = None,
+) -> torch.Tensor:
+    success = success_func(env, **(success_params or {}))
+    return success.to(dtype=torch.float32) / float(env.step_dt)
+
+
+def _install_success_reward(
+    isaac_env_cfg: Any,
+    reward_term_cls: Any,
+    reward_coef: float,
+) -> None:
+    terminations_cfg = getattr(isaac_env_cfg, "terminations", None)
+    success_term = getattr(terminations_cfg, "success", None)
+    success_func = getattr(success_term, "func", None)
+    if success_func is None:
+        return
+
+    success_reward = reward_term_cls(
+        func=_success_terminal_reward,
+        weight=float(reward_coef),
+        params={
+            "success_func": success_func,
+            "success_params": dict(getattr(success_term, "params", {}) or {}),
+        },
+    )
+    rewards_cfg = getattr(isaac_env_cfg, "rewards", None)
+    if rewards_cfg is None:
+        isaac_env_cfg.rewards = {"success": success_reward}
+    elif isinstance(rewards_cfg, dict):
+        rewards_cfg["success"] = success_reward
+    else:
+        setattr(rewards_cfg, "success", success_reward)
+
+
 def _set_camera_resolution(scene, camera_name: str, camera_cfg: Any) -> None:
     if camera_cfg is None or not hasattr(scene, camera_name):
         return
@@ -261,6 +298,7 @@ class IsaaclabTaberoTacFieldEnv(IsaaclabBaseEnv):
 
             import tac_manip  # noqa: F401
             from isaaclab.managers import ObservationTermCfg as ObsTerm
+            from isaaclab.managers import RewardTermCfg as RewTerm
             from isaaclab_tasks.utils import load_cfg_from_registry
 
             isaac_env_cfg = load_cfg_from_registry(
@@ -287,6 +325,11 @@ class IsaaclabTaberoTacFieldEnv(IsaaclabBaseEnv):
             isaac_env_cfg.observations.policy.eye_in_hand_rgb = ObsTerm(
                 func=_camera_rgb_observation,
                 params={"camera_name": "eye_in_hand_cam"},
+            )
+            _install_success_reward(
+                isaac_env_cfg,
+                RewTerm,
+                float(self.cfg.reward_coef),
             )
 
             env = gym.make(

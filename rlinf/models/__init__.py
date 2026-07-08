@@ -238,6 +238,91 @@ def _register_builtin_models():
 _register_builtin_models()
 
 
+def _build_default_lora_config(cfg):
+    from peft import LoraConfig
+
+    return LoraConfig(
+        r=cfg.lora_rank,
+        lora_alpha=cfg.lora_rank,
+        lora_dropout=0.0,
+        target_modules=[
+            "proj",
+            "qkv",
+            "fc1",
+            "fc2",  # vision
+            "q",
+            "kv",
+            "fc3",
+            "out_proj",  # project
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+            "lm_head",  # llm
+        ],
+        init_lora_weights="gaussian",
+    )
+
+
+def _get_openpi_lora_target_module(model, lora_target: str):
+    if lora_target == "paligemma":
+        return (
+            model.paligemma_with_expert.paligemma,
+            lambda module: setattr(model.paligemma_with_expert, "paligemma", module),
+        )
+    if lora_target == "action_expert":
+        return (
+            model.paligemma_with_expert.gemma_expert.model,
+            lambda module: setattr(
+                model.paligemma_with_expert.gemma_expert, "model", module
+            ),
+        )
+    raise ValueError(
+        "Unsupported OpenPI lora_target "
+        f"{lora_target!r}; expected 'paligemma' or 'action_expert'."
+    )
+
+
+def _freeze_all_parameters(model) -> None:
+    for param in model.parameters():
+        param.requires_grad = False
+
+
+def _enable_value_head_if_present(model) -> None:
+    if hasattr(model, "value_head"):
+        for param in model.value_head.parameters():
+            param.requires_grad = True
+
+
+def _apply_openpi_lora(model, cfg):
+    from peft import PeftModel, get_peft_model
+
+    lora_target = cfg.get("lora_target", "paligemma")
+    freeze_non_lora = cfg.get("freeze_non_lora", lora_target == "action_expert")
+    target_module, assign_target_module = _get_openpi_lora_target_module(
+        model, lora_target
+    )
+
+    if freeze_non_lora:
+        _freeze_all_parameters(model)
+
+    if not hasattr(cfg, "lora_path") or cfg.lora_path is None:
+        target_module = get_peft_model(target_module, _build_default_lora_config(cfg))
+    else:
+        target_module = PeftModel.from_pretrained(
+            target_module, cfg.lora_path, is_trainable=True
+        )
+    assign_target_module(target_module)
+
+    tag_vlm_subtree(model, False)
+    tag_vlm_subtree(target_module, True)
+    _enable_value_head_if_present(model)
+    return model
+
+
 def get_model(cfg: DictConfig):
     model_type = str(cfg.model_type)
     model_builder = _MODEL_REGISTRY.get(model_type)
@@ -255,50 +340,28 @@ def get_model(cfg: DictConfig):
         model = model.to(Worker.torch_device_type)
 
     if cfg.is_lora:
-        from peft import LoraConfig, PeftModel, get_peft_model
+        from peft import PeftModel, get_peft_model
 
         if not hasattr(cfg, "lora_path") or cfg.lora_path is None:
-            lora_config = LoraConfig(
-                r=cfg.lora_rank,
-                lora_alpha=cfg.lora_rank,
-                lora_dropout=0.0,
-                target_modules=[
-                    "proj",
-                    "qkv",
-                    "fc1",
-                    "fc2",  # vision
-                    "q",
-                    "kv",
-                    "fc3",
-                    "out_proj",  # project
-                    "q_proj",
-                    "k_proj",
-                    "v_proj",
-                    "o_proj",
-                    "gate_proj",
-                    "up_proj",
-                    "down_proj",
-                    "lm_head",  # llm
-                ],
-                init_lora_weights="gaussian",
-            )
             if SupportedModel(model_type) in (
                 SupportedModel.OPENPI,
                 SupportedModel.CFG_MODEL,
             ):
-                module_to_lora = model.paligemma_with_expert.paligemma
-                module_to_lora = get_peft_model(module_to_lora, lora_config)
-                tag_vlm_subtree(model, False)
-                tag_vlm_subtree(module_to_lora, True)
-                model.paligemma_with_expert.paligemma = module_to_lora
+                model = _apply_openpi_lora(model, cfg)
             else:
-                model = get_peft_model(model, lora_config)
+                model = get_peft_model(model, _build_default_lora_config(cfg))
         else:
-            model = PeftModel.from_pretrained(model, cfg.lora_path, is_trainable=True)
+            if SupportedModel(model_type) in (
+                SupportedModel.OPENPI,
+                SupportedModel.CFG_MODEL,
+            ):
+                model = _apply_openpi_lora(model, cfg)
+            else:
+                model = PeftModel.from_pretrained(
+                    model, cfg.lora_path, is_trainable=True
+                )
 
-        if hasattr(model, "value_head"):
-            for param in model.value_head.parameters():
-                param.requires_grad = True
+        _enable_value_head_if_present(model)
 
     return model
 

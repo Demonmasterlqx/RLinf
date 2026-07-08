@@ -327,6 +327,78 @@ class FSDPModelManager:
         )
         return state_dict
 
+    @staticmethod
+    def _normalize_fsdp_param_name(name: str) -> str:
+        for prefix in ("_orig_mod.", "module.", "_fsdp_wrapped_module."):
+            while name.startswith(prefix):
+                name = name[len(prefix) :]
+        return name.replace("._fsdp_wrapped_module.", ".")
+
+    def _save_trainable_model_weights(self, save_path: str, step: int) -> None:
+        """Save LoRA/expert trainable tensors without optimizer state."""
+        if not self._cfg.fsdp_config.get("save_trainable_model_weights", False):
+            return
+
+        rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
+        trainable_param_names = {
+            self._normalize_fsdp_param_name(name)
+            for name, param in self.model.named_parameters()
+            if param.requires_grad and "_flat_param" not in name
+        }
+        if not trainable_param_names:
+            raise RuntimeError(
+                "save_trainable_model_weights=True but no trainable parameters were found."
+            )
+
+        if isinstance(self.model, FSDP) and world_size > 1:
+            full_state_dict = self.get_model_state_dict(
+                cpu_offload=True, full_state_dict=True
+            )
+            if rank == 0:
+                state_dict = {
+                    self._normalize_fsdp_param_name(name): value.detach()
+                    .cpu()
+                    .contiguous()
+                    .clone()
+                    for name, value in full_state_dict.items()
+                    if self._normalize_fsdp_param_name(name) in trainable_param_names
+                }
+        elif rank == 0:
+            state_dict = {}
+            for name, param in self.model.named_parameters():
+                if not param.requires_grad or "_flat_param" in name:
+                    continue
+                name = self._normalize_fsdp_param_name(name)
+                value = param
+                if isinstance(value, DTensor):
+                    value = value.full_tensor()
+                state_dict[name] = value.detach().cpu().contiguous().clone()
+        else:
+            state_dict = None
+
+        if rank == 0:
+            sd_save_path = os.path.join(save_path, "model_state_dict")
+            os.makedirs(sd_save_path, exist_ok=True)
+            torch.save(
+                {
+                    "model": state_dict,
+                    "metadata": {
+                        "step": step,
+                        "rank": rank,
+                        "world_size": world_size,
+                        "format": "trainable_weights",
+                        "parameter_count": len(state_dict),
+                    },
+                },
+                os.path.join(sd_save_path, "trainable_weights.pt"),
+            )
+            self._logger.info(
+                f"[FSDP] Saved {len(state_dict)} trainable tensors to "
+                f"{os.path.join(sd_save_path, 'trainable_weights.pt')}"
+            )
+        torch.distributed.barrier()
+
     def load_checkpoint(self, load_path: str) -> None:
         """
         Load checkpoint from local path.
@@ -369,7 +441,9 @@ class FSDPModelManager:
             save_full_model_weights=self._cfg.fsdp_config.get(
                 "save_full_model_weights", True
             ),
+            checkpoint_format=self._cfg.fsdp_config.get("checkpoint_format", "dcp"),
         )
+        self._save_trainable_model_weights(save_path, step)
 
         if restore_weight_offload:
             self.offload_param_and_grad()
