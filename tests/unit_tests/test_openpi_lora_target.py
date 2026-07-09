@@ -106,6 +106,33 @@ def test_apply_openpi_action_expert_lora_freezes_non_lora_params():
     )
 
 
+def test_apply_openpi_both_lora_wraps_vlm_and_action_expert_only():
+    model = DummyOpenPI()
+
+    _apply_openpi_lora(model, _cfg("both"))
+
+    trainable = [
+        name for name, param in model.named_parameters() if param.requires_grad
+    ]
+    assert trainable
+    assert any(
+        name.startswith("paligemma_with_expert.paligemma") and "lora_" in name
+        for name in trainable
+    )
+    assert any(
+        name.startswith("paligemma_with_expert.gemma_expert.model")
+        and "lora_" in name
+        for name in trainable
+    )
+    assert all("lora_" in name or name.startswith("value_head.") for name in trainable)
+    assert all(
+        name.startswith("paligemma_with_expert.paligemma")
+        or name.startswith("paligemma_with_expert.gemma_expert.model")
+        or name.startswith("value_head.")
+        for name in trainable
+    )
+
+
 def test_tabero_peft_config_uses_action_expert_lora_only():
     path = Path(
         "/data/home/sim6g/code/tabero/RLinf/examples/embodiment/config/"
@@ -138,3 +165,56 @@ def test_tabero_multitask_peft_config_reads_subset_and_disables_force_key():
     assert cfg.env.train.init_params.force_key is None
     assert cfg.env.train.init_params.require_all_tasks_active is True
     assert cfg.actor.model.openpi.tactile_loss_weight == 0.0
+
+
+def test_tabero_multitask_both_lora_config_reads_subset_and_trains_dual_adapters():
+    path = Path(
+        "/data/home/sim6g/code/tabero/RLinf/examples/embodiment/config/"
+        "isaaclab_pi0_peft_lora_both_tacfield_tabero_multitask.yaml"
+    )
+    cfg = OmegaConf.load(path)
+
+    assert cfg.rollout.pipeline_stage_num == 9
+    assert cfg.env.train.total_num_envs == 9
+    assert cfg.env.train.init_params.tabero_task_subset_path.endswith(
+        "Tabero/benchmarks/datasets/tabero/config/tabero_tasks.json"
+    )
+    assert cfg.env.train.init_params.force_key is None
+    assert cfg.env.train.init_params.require_all_tasks_active is True
+    assert cfg.actor.model.is_lora is True
+    assert cfg.actor.model.lora_target == "both"
+    assert cfg.actor.model.freeze_non_lora is True
+    assert cfg.actor.model.openpi.train_expert_only is True
+    assert cfg.actor.model.openpi.tactile_loss_weight == 0.0
+    assert cfg.actor.fsdp_config.use_orig_params is False
+    assert cfg.actor.fsdp_config.save_trainable_model_weights is True
+
+
+def test_tabero_multitask_both_lora_smoke_config_enables_two_task_video_smoke():
+    path = Path(
+        "/data/home/sim6g/code/tabero/RLinf/examples/embodiment/config/"
+        "isaaclab_pi0_peft_lora_both_tacfield_tabero_multitask_smoke.yaml"
+    )
+    cfg = OmegaConf.load(path)
+
+    assert cfg.cluster.component_placement.actor == 0
+    assert cfg.cluster.component_placement.rollout == 1
+    assert cfg.cluster.component_placement.env == 2
+    assert cfg.rollout.pipeline_stage_num == 2
+    assert cfg.env.train.total_num_envs == 2
+    assert len(cfg.env.train.init_params.tasks) == 2
+    assert cfg.env.train.video_cfg.save_video is True
+    assert cfg.env.train.video_cfg.image_keys == ["main_images", "wrist_images"]
+    assert cfg.env.train.video_cfg.image_names == ["agentview", "eye_in_hand"]
+    assert cfg.env.train.video_cfg.tactile_heatmap.enabled is True
+    assert cfg.env.train.video_cfg.composite_views == [
+        "agentview",
+        "eye_in_hand",
+        "tactile_heatmap",
+    ]
+    assert cfg.env.train.video_cfg.composite_name == "combined"
+    assert cfg.actor.model.is_lora is True
+    assert cfg.actor.model.lora_target == "both"
+    assert cfg.actor.model.freeze_non_lora is True
+    assert cfg.actor.fsdp_config.use_orig_params is False
+    assert cfg.actor.model.openpi.train_expert_only is True

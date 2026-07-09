@@ -282,8 +282,17 @@ def _get_openpi_lora_target_module(model, lora_target: str):
         )
     raise ValueError(
         "Unsupported OpenPI lora_target "
-        f"{lora_target!r}; expected 'paligemma' or 'action_expert'."
+        f"{lora_target!r}; expected 'paligemma', 'action_expert', or 'both'."
     )
+
+
+def _get_openpi_lora_target_modules(model, lora_target: str):
+    if lora_target == "both":
+        return [
+            _get_openpi_lora_target_module(model, "paligemma"),
+            _get_openpi_lora_target_module(model, "action_expert"),
+        ]
+    return [_get_openpi_lora_target_module(model, lora_target)]
 
 
 def _freeze_all_parameters(model) -> None:
@@ -301,24 +310,33 @@ def _apply_openpi_lora(model, cfg):
     from peft import PeftModel, get_peft_model
 
     lora_target = cfg.get("lora_target", "paligemma")
-    freeze_non_lora = cfg.get("freeze_non_lora", lora_target == "action_expert")
-    target_module, assign_target_module = _get_openpi_lora_target_module(
-        model, lora_target
+    freeze_non_lora = cfg.get(
+        "freeze_non_lora", lora_target in ("action_expert", "both")
     )
+    target_modules = _get_openpi_lora_target_modules(model, lora_target)
 
     if freeze_non_lora:
         _freeze_all_parameters(model)
 
-    if not hasattr(cfg, "lora_path") or cfg.lora_path is None:
-        target_module = get_peft_model(target_module, _build_default_lora_config(cfg))
-    else:
-        target_module = PeftModel.from_pretrained(
-            target_module, cfg.lora_path, is_trainable=True
-        )
-    assign_target_module(target_module)
-
     tag_vlm_subtree(model, False)
-    tag_vlm_subtree(target_module, True)
+    for target_module, assign_target_module in target_modules:
+        if not hasattr(cfg, "lora_path") or cfg.lora_path is None:
+            target_module = get_peft_model(
+                target_module, _build_default_lora_config(cfg)
+            )
+        else:
+            if lora_target == "both":
+                raise ValueError(
+                    "OpenPI lora_target='both' currently expects lora_path=null; "
+                    "load separate adapters explicitly before using pretrained "
+                    "dual-target LoRA."
+                )
+            target_module = PeftModel.from_pretrained(
+                target_module, cfg.lora_path, is_trainable=True
+            )
+        assign_target_module(target_module)
+        tag_vlm_subtree(target_module, True)
+
     _enable_value_head_if_present(model)
     return model
 
