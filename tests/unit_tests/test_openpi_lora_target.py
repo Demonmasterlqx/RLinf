@@ -15,7 +15,6 @@
 from pathlib import Path
 
 from omegaconf import OmegaConf
-import torch
 from torch import nn
 
 from rlinf.models import (
@@ -93,13 +92,13 @@ def test_apply_openpi_action_expert_lora_freezes_non_lora_params():
 
     _apply_openpi_lora(model, _cfg("action_expert"))
 
-    trainable = [name for name, param in model.named_parameters() if param.requires_grad]
+    trainable = [
+        name for name, param in model.named_parameters() if param.requires_grad
+    ]
     assert trainable
     assert any("lora_" in name for name in trainable)
     assert all("paligemma_with_expert.paligemma" not in name for name in trainable)
-    assert all(
-        "lora_" in name or name.startswith("value_head.") for name in trainable
-    )
+    assert all("lora_" in name or name.startswith("value_head.") for name in trainable)
     assert all(
         "paligemma_with_expert.gemma_expert.model" in name
         or name.startswith("value_head.")
@@ -120,3 +119,22 @@ def test_tabero_peft_config_uses_action_expert_lora_only():
     assert cfg.actor.model.openpi.train_expert_only is True
     assert cfg.actor.fsdp_config.save_trainable_model_weights is True
     assert cfg.actor.fsdp_config.checkpoint_format == "none"
+
+
+def test_tabero_multitask_peft_config_reads_subset_and_disables_force_key():
+    path = Path(
+        "/data/home/sim6g/code/tabero/RLinf/examples/embodiment/config/"
+        "isaaclab_pi0_peft_lora_tacfield_tabero_multitask.yaml"
+    )
+    cfg = OmegaConf.load(path)
+
+    assert cfg.cluster.component_placement["actor,rollout"] == "all"
+    assert cfg.cluster.component_placement.env == 0
+    assert cfg.rollout.pipeline_stage_num == 9
+    assert cfg.env.train.total_num_envs == 9
+    assert cfg.env.train.init_params.tabero_task_subset_path.endswith(
+        "Tabero/benchmarks/datasets/tabero/config/tabero_tasks.json"
+    )
+    assert cfg.env.train.init_params.force_key is None
+    assert cfg.env.train.init_params.require_all_tasks_active is True
+    assert cfg.actor.model.openpi.tactile_loss_weight == 0.0

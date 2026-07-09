@@ -14,12 +14,17 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
+import warnings
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import gymnasium as gym
 import torch
+from omegaconf import open_dict
 
 from rlinf.envs.isaaclab.utils import quat2axisangle_torch
 
@@ -28,6 +33,158 @@ from ..isaaclab_env import IsaaclabBaseEnv
 
 def _cfg_get(cfg: Any, name: str, default: Any = None) -> Any:
     return getattr(cfg, name, default) if cfg is not None else default
+
+
+@dataclass(frozen=True)
+class TaberoTaskSpec:
+    task_suite: str
+    task_id: int
+    task_description: str
+
+
+def _plain_container(value: Any) -> Any:
+    if hasattr(value, "items"):
+        return {key: _plain_container(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain_container(item) for item in value]
+    return value
+
+
+def _load_libero_instruction(
+    libero_config_dir: str | None,
+    task_suite: str,
+    task_id: int,
+) -> str | None:
+    if not libero_config_dir:
+        return None
+
+    config_path = Path(str(libero_config_dir)).expanduser() / f"{task_suite}.json"
+    if not config_path.exists():
+        return None
+
+    with config_path.open("r", encoding="utf-8") as file:
+        config = json.load(file)
+    for task in config.get("tasks", []):
+        if int(task.get("task_id", -1)) == int(task_id):
+            instruction = task.get("language_instruction")
+            return str(instruction) if instruction is not None else None
+    return None
+
+
+def _build_tabero_task(
+    raw_task: dict[str, Any],
+    libero_config_dir: str | None,
+    fallback_description: str | None = None,
+) -> TaberoTaskSpec:
+    task_suite = str(raw_task.get("task_suite", raw_task.get("suite", "libero_10")))
+    task_id = int(raw_task.get("task_id", raw_task.get("id", 0)))
+    task_description = raw_task.get("task_description")
+    if task_description is None:
+        task_description = raw_task.get("language_instruction")
+    if task_description is None:
+        task_description = _load_libero_instruction(
+            libero_config_dir, task_suite, task_id
+        )
+    if task_description is None:
+        task_description = fallback_description
+    if task_description is None:
+        task_description = f"Task {task_id}"
+
+    return TaberoTaskSpec(
+        task_suite=task_suite,
+        task_id=task_id,
+        task_description=str(task_description),
+    )
+
+
+def _load_tabero_subset_tasks(
+    subset_path: str | os.PathLike[str],
+) -> list[dict[str, Any]]:
+    path = Path(str(subset_path)).expanduser()
+    with path.open("r", encoding="utf-8") as file:
+        subset = json.load(file)
+
+    raw_tasks: list[dict[str, Any]] = []
+    if not isinstance(subset, dict):
+        raise ValueError(f"Tabero task subset must be a JSON object: {path}")
+    for task_suite, task_ids in subset.items():
+        if task_ids is None:
+            continue
+        for task_id in task_ids:
+            raw_tasks.append({"task_suite": str(task_suite), "task_id": int(task_id)})
+    return raw_tasks
+
+
+def resolve_tabero_tasks(init_params: Any) -> list[TaberoTaskSpec]:
+    """Resolve single-task or multi-task Tabero config into concrete task specs."""
+
+    libero_config_dir = _cfg_get(init_params, "libero_config_dir")
+    fallback_description = _cfg_get(init_params, "task_description")
+    explicit_tasks = _cfg_get(init_params, "tasks", None)
+    subset_path = _cfg_get(init_params, "tabero_task_subset_path", None)
+
+    if explicit_tasks is not None:
+        raw_tasks = _plain_container(explicit_tasks)
+        if len(raw_tasks) == 0:
+            raise ValueError("Tabero multitask config must contain at least one task.")
+    elif subset_path is not None:
+        raw_tasks = _load_tabero_subset_tasks(subset_path)
+        if len(raw_tasks) == 0:
+            raise ValueError("Tabero task subset must contain at least one task.")
+    else:
+        raw_tasks = [
+            {
+                "task_suite": _cfg_get(init_params, "task_suite", "libero_10"),
+                "task_id": _cfg_get(init_params, "task_id", 0),
+                "task_description": fallback_description,
+            }
+        ]
+
+    return [
+        _build_tabero_task(
+            raw_task,
+            libero_config_dir=str(libero_config_dir) if libero_config_dir else None,
+            fallback_description=str(fallback_description)
+            if fallback_description is not None
+            else None,
+        )
+        for raw_task in raw_tasks
+    ]
+
+
+def assign_tabero_task(tasks: list[TaberoTaskSpec], seed_offset: int) -> TaberoTaskSpec:
+    if len(tasks) == 0:
+        raise ValueError("Tabero multitask config must contain at least one task.")
+    return tasks[int(seed_offset) % len(tasks)]
+
+
+def ensure_tabero_root_task_description(cfg: Any, task: TaberoTaskSpec) -> None:
+    if _cfg_get(cfg.init_params, "task_description", None) is not None:
+        return
+
+    try:
+        with open_dict(cfg):
+            cfg.init_params.task_description = task.task_description
+    except Exception:
+        cfg.init_params.task_description = task.task_description
+
+
+def validate_tabero_task_assignment(
+    tasks: list[TaberoTaskSpec],
+    total_num_processes: int,
+    require_all_tasks_active: bool = False,
+) -> None:
+    if len(tasks) <= int(total_num_processes):
+        return
+
+    message = (
+        f"Tabero multitask config has {len(tasks)} tasks but only "
+        f"{total_num_processes} logical env processes; only the first "
+        f"{total_num_processes} task(s) are active in this run."
+    )
+    if require_all_tasks_active:
+        raise ValueError(message)
+    warnings.warn(message, stacklevel=2)
 
 
 def _camera_rgb_observation(env, camera_name: str) -> torch.Tensor:
@@ -111,7 +268,9 @@ def build_tabero_state(policy_obs: dict[str, torch.Tensor]) -> torch.Tensor:
         quat = policy_obs["eef_quat"]
         quat_xyzw = quat[:, [1, 2, 3, 0]]
     else:
-        raise KeyError("Tabero TacField env expects 'eef_pose' or 'eef_pos'/'eef_quat'.")
+        raise KeyError(
+            "Tabero TacField env expects 'eef_pose' or 'eef_pos'/'eef_quat'."
+        )
 
     if "gripper_pos" not in policy_obs:
         raise KeyError("Tabero TacField env expects 'gripper_pos'.")
@@ -254,6 +413,17 @@ class IsaaclabTaberoTacFieldEnv(IsaaclabBaseEnv):
             init_params, "marker_motion_key", "gripper_marker_motion"
         )
         self._force_key = _cfg_get(init_params, "force_key", "gripper_net_force")
+        self._tabero_tasks = resolve_tabero_tasks(init_params)
+        validate_tabero_task_assignment(
+            self._tabero_tasks,
+            total_num_processes=total_num_processes,
+            require_all_tasks_active=bool(
+                _cfg_get(init_params, "require_all_tasks_active", False)
+            ),
+        )
+        self._tabero_task = assign_tabero_task(self._tabero_tasks, seed_offset)
+        self._tabero_task_shard_id = int(seed_offset)
+        ensure_tabero_root_task_description(cfg, self._tabero_task)
         history_len = int(_cfg_get(init_params, "marker_history_len", 8))
         expected_markers = int(_cfg_get(init_params, "combined_marker_count", 198))
         self._marker_history = TacManipMarkerMotionHistory(
@@ -269,6 +439,7 @@ class IsaaclabTaberoTacFieldEnv(IsaaclabBaseEnv):
             total_num_processes,
             worker_info,
         )
+        self.task_description = self._tabero_task.task_description
 
     def _make_env_function(self):
         def make_env_isaaclab():
@@ -277,8 +448,8 @@ class IsaaclabTaberoTacFieldEnv(IsaaclabBaseEnv):
             init_params = self.cfg.init_params
             _prepend_python_path(_cfg_get(init_params, "extension_path"))
 
-            task_suite = str(_cfg_get(init_params, "task_suite", "libero_10"))
-            task_id = str(_cfg_get(init_params, "task_id", "0"))
+            task_suite = self._tabero_task.task_suite
+            task_id = str(self._tabero_task.task_id)
             os.environ["TASK_SUITE"] = task_suite
             os.environ["TASK_ID"] = task_id
             os.environ["USE_RELATIVE_MODE"] = str(
@@ -310,12 +481,16 @@ class IsaaclabTaberoTacFieldEnv(IsaaclabBaseEnv):
             _set_camera_resolution(
                 isaac_env_cfg.scene,
                 "agentview_cam",
-                _cfg_get(init_params, "agentview_cam", _cfg_get(init_params, "table_cam")),
+                _cfg_get(
+                    init_params, "agentview_cam", _cfg_get(init_params, "table_cam")
+                ),
             )
             _set_camera_resolution(
                 isaac_env_cfg.scene,
                 "eye_in_hand_cam",
-                _cfg_get(init_params, "eye_in_hand_cam", _cfg_get(init_params, "wrist_cam")),
+                _cfg_get(
+                    init_params, "eye_in_hand_cam", _cfg_get(init_params, "wrist_cam")
+                ),
             )
 
             isaac_env_cfg.observations.policy.agentview_rgb = ObsTerm(
@@ -343,6 +518,23 @@ class IsaaclabTaberoTacFieldEnv(IsaaclabBaseEnv):
         self._marker_history.reset(env_ids)
         return super().reset(seed=seed, env_ids=env_ids)
 
+    def _record_metrics(self, step_reward, terminations, infos):
+        infos = super()._record_metrics(step_reward, terminations, infos)
+        episode_info = infos["episode"]
+        episode_info["task_id"] = torch.full(
+            (self.num_envs,),
+            float(self._tabero_task.task_id),
+            dtype=torch.float32,
+            device=step_reward.device,
+        )
+        episode_info["task_shard_id"] = torch.full(
+            (self.num_envs,),
+            float(self._tabero_task_shard_id),
+            dtype=torch.float32,
+            device=step_reward.device,
+        )
+        return infos
+
     def _wrap_obs(self, obs):
         policy_obs = obs["policy"]
         state = build_tabero_state(policy_obs)
@@ -357,6 +549,6 @@ class IsaaclabTaberoTacFieldEnv(IsaaclabBaseEnv):
             "task_descriptions": [self.task_description] * self.num_envs,
             "tactile_marker_motion": tactile_marker_motion,
         }
-        if self._force_key in policy_obs:
+        if self._force_key is not None and self._force_key in policy_obs:
             env_obs["tactile_gripper_force"] = policy_obs[self._force_key]
         return env_obs
