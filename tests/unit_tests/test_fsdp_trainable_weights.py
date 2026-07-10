@@ -18,6 +18,7 @@ import pytest
 import torch
 from torch import nn
 
+import rlinf.hybrid_engines.fsdp.fsdp_model_manager as fsdp_model_manager
 from rlinf.hybrid_engines.fsdp.fsdp_model_manager import FSDPModelManager
 
 
@@ -55,3 +56,68 @@ def test_save_trainable_model_weights_fails_when_no_trainable_params(
 
     with pytest.raises(RuntimeError, match="no trainable parameters"):
         manager._save_trainable_model_weights(str(tmp_path), step=0)
+
+
+class _FlatParamWrappedModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self._flat_param = nn.Parameter(torch.ones(4))
+
+
+def test_save_trainable_model_weights_uses_pre_wrap_trainable_names_for_fsdp_flat_params(
+    monkeypatch, tmp_path
+):
+    model = _FlatParamWrappedModel()
+
+    manager = FSDPModelManager.__new__(FSDPModelManager)
+    manager.model = model
+    manager._cfg = SimpleNamespace(
+        fsdp_config={"save_trainable_model_weights": True}
+    )
+    manager._logger = _Logger()
+    manager.trainable_param_names = [
+        "paligemma.adapter.lora_A.weight",
+        "gemma_expert.adapter.lora_B.weight",
+    ]
+
+    def fake_full_state_dict(*_args, **_kwargs):
+        return {
+            "_fsdp_wrapped_module.paligemma.adapter.lora_A.weight": torch.tensor(
+                [[1.0, 2.0]]
+            ),
+            "_fsdp_wrapped_module.gemma_expert.adapter.lora_B.weight": torch.tensor(
+                [[3.0], [4.0]]
+            ),
+            "_fsdp_wrapped_module.frozen.weight": torch.tensor([5.0]),
+            "_fsdp_wrapped_module.persistent_buffer": torch.tensor([6.0]),
+        }
+
+    manager.get_model_state_dict = fake_full_state_dict
+
+    monkeypatch.setattr(fsdp_model_manager, "FSDP", _FlatParamWrappedModel)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 1)
+    monkeypatch.setattr(torch.distributed, "barrier", lambda: None)
+
+    manager._save_trainable_model_weights(str(tmp_path), step=7)
+
+    checkpoint = torch.load(
+        tmp_path / "model_state_dict" / "trainable_weights.pt",
+        map_location="cpu",
+        weights_only=False,
+    )
+
+    assert checkpoint["metadata"]["step"] == 7
+    assert checkpoint["metadata"]["parameter_count"] == 2
+    assert list(checkpoint["model"].keys()) == [
+        "paligemma.adapter.lora_A.weight",
+        "gemma_expert.adapter.lora_B.weight",
+    ]
+    torch.testing.assert_close(
+        checkpoint["model"]["paligemma.adapter.lora_A.weight"],
+        torch.tensor([[1.0, 2.0]]),
+    )
+    torch.testing.assert_close(
+        checkpoint["model"]["gemma_expert.adapter.lora_B.weight"],
+        torch.tensor([[3.0], [4.0]]),
+    )

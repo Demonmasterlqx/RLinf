@@ -28,16 +28,15 @@ import argparse
 import dataclasses
 import json
 import os
-from collections.abc import Mapping
-from pathlib import Path
 import shutil
+from collections.abc import Callable, Mapping
+from pathlib import Path
 
 import safetensors.torch
 import torch
 from omegaconf import DictConfig, ListConfig, OmegaConf
 
 from rlinf.models import get_model
-
 
 RL_ONLY_PREFIXES = (
     "value_head.",
@@ -56,15 +55,11 @@ DROP_EXACT_KEYS = {
     "paligemma_with_expert.paligemma.model.language_model.embed_tokens.weight",
 }
 
-ACTION_EXPERT_OVERLAY_PREFIXES = (
-    "paligemma_with_expert.gemma_expert.",
-    "action_in_proj.",
-    "action_out_proj.",
-    "state_proj.",
-    "action_time_mlp",
-    "time_mlp_",
-    "tactile_prefix_encoder.",
-)
+@dataclasses.dataclass(frozen=True)
+class LoraModuleSpec:
+    module: torch.nn.Module
+    assign_module: Callable[[torch.nn.Module], None]
+    adapter_dir_name: str
 
 
 def _load_model_cfg(train_config_path: str) -> DictConfig:
@@ -179,25 +174,15 @@ def _save_filtered_safetensors(model: torch.nn.Module, output_path: str) -> None
     safetensors.torch.save_file(state_dict, output_path)
 
 
-def _filter_action_expert_overlay_state_dict(
-    state_dict: Mapping[str, torch.Tensor],
-) -> dict[str, torch.Tensor]:
-    return {
-        key: value.detach().cpu().contiguous().clone()
-        for key, value in state_dict.items()
-        if torch.is_tensor(value) and key.startswith(ACTION_EXPERT_OVERLAY_PREFIXES)
-    }
-
-
-def _get_lora_module(model: torch.nn.Module, lora_target: str):
+def _get_lora_module(model: torch.nn.Module, lora_target: str) -> LoraModuleSpec:
     if lora_target == "paligemma":
-        return (
+        return LoraModuleSpec(
             model.paligemma_with_expert.paligemma,
             lambda module: setattr(model.paligemma_with_expert, "paligemma", module),
             "lora_adapter",
         )
     if lora_target == "action_expert":
-        return (
+        return LoraModuleSpec(
             model.paligemma_with_expert.gemma_expert.model,
             lambda module: setattr(
                 model.paligemma_with_expert.gemma_expert, "model", module
@@ -206,8 +191,17 @@ def _get_lora_module(model: torch.nn.Module, lora_target: str):
         )
     raise ValueError(
         "Unsupported OpenPI lora_target "
-        f"{lora_target!r}; expected 'paligemma' or 'action_expert'."
+        f"{lora_target!r}; expected 'paligemma', 'action_expert', or 'both'."
     )
+
+
+def _get_lora_modules(model: torch.nn.Module, lora_target: str) -> list[LoraModuleSpec]:
+    if lora_target == "both":
+        return [
+            _get_lora_module(model, "paligemma"),
+            _get_lora_module(model, "action_expert"),
+        ]
+    return [_get_lora_module(model, lora_target)]
 
 
 def export_checkpoint(
@@ -241,29 +235,29 @@ def export_checkpoint(
         raise RuntimeError("Unexpected checkpoint keys were not loaded.")
 
     lora_target = str(model_cfg.get("lora_target", "paligemma"))
-    lora_module, assign_lora_module, adapter_dir_name = _get_lora_module(
-        model, lora_target
-    )
-    if not hasattr(lora_module, "merge_and_unload"):
-        raise TypeError(
-            f"OpenPI {lora_target} submodule is not a PEFT LoRA model."
-        )
+    lora_specs = _get_lora_modules(model, lora_target)
+    for lora_spec in lora_specs:
+        if not hasattr(lora_spec.module, "merge_and_unload"):
+            raise TypeError(
+                f"OpenPI {lora_target} submodule "
+                f"{lora_spec.adapter_dir_name} is not a PEFT LoRA model."
+            )
 
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
+    adapter_dir_names = []
     if save_adapter:
-        adapter_dir = output_path / adapter_dir_name
-        lora_module.save_pretrained(str(adapter_dir))
-        print(f"Saved LoRA adapter to {adapter_dir}")
+        for lora_spec in lora_specs:
+            adapter_dir = output_path / lora_spec.adapter_dir_name
+            lora_spec.module.save_pretrained(str(adapter_dir))
+            adapter_dir_names.append(lora_spec.adapter_dir_name)
+            print(f"Saved LoRA adapter to {adapter_dir}")
 
-    assign_lora_module(lora_module.merge_and_unload())
+    for lora_spec in lora_specs:
+        lora_spec.assign_module(lora_spec.module.merge_and_unload())
     model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
     _save_filtered_safetensors(model, str(output_path / "model.safetensors"))
-    safetensors.torch.save_file(
-        _filter_action_expert_overlay_state_dict(model.state_dict()),
-        str(output_path / "action_expert_merged.safetensors"),
-    )
     _copy_assets(str(model_cfg.model_path), str(output_path))
 
     model_config = getattr(model, "config", None)
@@ -280,8 +274,12 @@ def export_checkpoint(
                 "source_ckpt_metadata": dict(checkpoint_meta),
                 "format": "t2vla_openpi_pytorch_merged_lora",
                 "lora_target": lora_target,
-                "adapter_dir": adapter_dir_name if save_adapter else None,
-                "action_expert_overlay": "action_expert_merged.safetensors",
+                "adapter_dir": (
+                    adapter_dir_names[0]
+                    if save_adapter and len(adapter_dir_names) == 1
+                    else (adapter_dir_names if save_adapter else None)
+                ),
+                "adapter_dirs": adapter_dir_names if save_adapter else [],
             },
             f,
             indent=2,

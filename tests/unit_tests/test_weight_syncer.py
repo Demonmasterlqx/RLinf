@@ -1030,6 +1030,38 @@ def test_bucket_weight_syncer_roundtrip_load_instant_false():
     )
 
 
+def test_bucket_weight_syncer_preserves_param_order_for_collectives():
+    model = _TinyWeightSyncModel()
+    syncer = BucketWeightSyncer(
+        bucket_size=32,
+        bucket_dtype=None,
+        bucket_device="cpu",
+        load_instant=True,
+    )
+    param_names = [
+        "linear.bias",
+        "tensor3d",
+        "linear.weight",
+        "linear.bias",
+        "scalar_buf",
+    ]
+
+    asyncio.run(
+        _init_bucket_syncer(
+            syncer,
+            model,
+            param_names_need_sync=param_names,
+        )
+    )
+
+    assert syncer.param_names_need_sync == [
+        "linear.bias",
+        "tensor3d",
+        "linear.weight",
+        "scalar_buf",
+    ]
+
+
 def test_bucket_weight_syncer_preserves_original_dtypes_when_bucket_dtype_none():
     sender_model = _make_bucket_dtype_model()
     receiver_model = copy.deepcopy(sender_model)

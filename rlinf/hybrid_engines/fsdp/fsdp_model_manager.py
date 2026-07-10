@@ -83,6 +83,7 @@ class FSDPModelManager:
         ) and self._cfg.model.get("add_value_head", False):
             self.critic_warmup_steps = self._cfg.optim.critic_warmup_steps
         self.store_requires_grad_param_name = []
+        self.trainable_param_names = []
 
         if cfg.get("tokenizer", {}).get("tokenizer_model", None) is not None:
             self.tokenizer = hf_tokenizer(cfg.tokenizer.tokenizer_model)
@@ -283,6 +284,7 @@ class FSDPModelManager:
 
         # here record the original trainable parameters' names before FSDP wrapping
         # persist buffers' names are also recorded, which will be used for weight syncing.
+        self.trainable_param_names = self._collect_trainable_param_names(module)
         self.param_names_need_sync = collect_param_names_need_sync(module)
 
         # build model, optimizer, lr_scheduler, grad_scaler
@@ -334,6 +336,33 @@ class FSDPModelManager:
                 name = name[len(prefix) :]
         return name.replace("._fsdp_wrapped_module.", ".")
 
+    @classmethod
+    def _collect_trainable_param_names(cls, module: nn.Module) -> list[str]:
+        return list(
+            dict.fromkeys(
+                cls._normalize_fsdp_param_name(name)
+                for name, param in module.named_parameters(remove_duplicate=False)
+                if param.requires_grad
+            )
+        )
+
+    def _checkpoint_trainable_param_names(self) -> list[str]:
+        trainable_param_names = getattr(self, "trainable_param_names", None)
+        if trainable_param_names:
+            return list(
+                dict.fromkeys(
+                    self._normalize_fsdp_param_name(name)
+                    for name in trainable_param_names
+                )
+            )
+        return list(
+            dict.fromkeys(
+                self._normalize_fsdp_param_name(name)
+                for name, param in self.model.named_parameters()
+                if param.requires_grad and "_flat_param" not in name
+            )
+        )
+
     def _save_trainable_model_weights(self, save_path: str, step: int) -> None:
         """Save LoRA/expert trainable tensors without optimizer state."""
         if not self._cfg.fsdp_config.get("save_trainable_model_weights", False):
@@ -341,28 +370,32 @@ class FSDPModelManager:
 
         rank = torch.distributed.get_rank()
         world_size = torch.distributed.get_world_size()
-        trainable_param_names = {
-            self._normalize_fsdp_param_name(name)
-            for name, param in self.model.named_parameters()
-            if param.requires_grad and "_flat_param" not in name
-        }
+        trainable_param_names = self._checkpoint_trainable_param_names()
+        trainable_param_name_set = set(trainable_param_names)
         if not trainable_param_names:
             raise RuntimeError(
                 "save_trainable_model_weights=True but no trainable parameters were found."
             )
 
-        if isinstance(self.model, FSDP) and world_size > 1:
+        if isinstance(self.model, FSDP):
             full_state_dict = self.get_model_state_dict(
                 cpu_offload=True, full_state_dict=True
             )
             if rank == 0:
+                normalized_full_state_dict = {}
+                for name, value in full_state_dict.items():
+                    normalized_name = self._normalize_fsdp_param_name(name)
+                    if normalized_name not in trainable_param_name_set:
+                        continue
+                    if isinstance(value, DTensor):
+                        value = value.full_tensor()
+                    normalized_full_state_dict[normalized_name] = (
+                        value.detach().cpu().contiguous().clone()
+                    )
                 state_dict = {
-                    self._normalize_fsdp_param_name(name): value.detach()
-                    .cpu()
-                    .contiguous()
-                    .clone()
-                    for name, value in full_state_dict.items()
-                    if self._normalize_fsdp_param_name(name) in trainable_param_names
+                    name: normalized_full_state_dict[name]
+                    for name in trainable_param_names
+                    if name in normalized_full_state_dict
                 }
         elif rank == 0:
             state_dict = {}
@@ -370,6 +403,8 @@ class FSDPModelManager:
                 if not param.requires_grad or "_flat_param" in name:
                     continue
                 name = self._normalize_fsdp_param_name(name)
+                if name not in trainable_param_name_set:
+                    continue
                 value = param
                 if isinstance(value, DTensor):
                     value = value.full_tensor()
@@ -378,6 +413,11 @@ class FSDPModelManager:
             state_dict = None
 
         if rank == 0:
+            if not state_dict:
+                raise RuntimeError(
+                    "save_trainable_model_weights=True but trainable parameters "
+                    "were not found in the model state dict."
+                )
             sd_save_path = os.path.join(save_path, "model_state_dict")
             os.makedirs(sd_save_path, exist_ok=True)
             torch.save(

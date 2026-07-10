@@ -248,7 +248,9 @@ class BucketWeightSyncer(WeightSyncer):
         """
 
         del state_dict, send, recv
-        self.param_names_need_sync = set(param_names_need_sync)
+        # Keep the sender parameter order stable across ranks. DTensor.full_tensor()
+        # is collective, so different iteration orders can deadlock multi-rank FSDP.
+        self.param_names_need_sync = list(dict.fromkeys(param_names_need_sync))
         if not self.param_names_need_sync:
             raise ValueError("param_names_need_sync must not be empty")
         self._sender_initialized = True

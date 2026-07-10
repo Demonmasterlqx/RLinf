@@ -17,6 +17,7 @@ cluster:
   num_nodes: 1
   component_placement:
     actor,env,rollout: all
+
 runner:
   task_type: embodied
   logger:
@@ -95,7 +96,7 @@ rollout:
   pipeline_stage_num: 1
 
   model:
-    model_path: "/data/home/sim6g/code/tabero/models/RLinf-pi05-SFT-Stack-cube"
+    model_path: "/path/to/model/RLinf-Pi05-SFT"
     precision: ${actor.model.precision}
 
 actor:
@@ -104,10 +105,10 @@ actor:
   micro_batch_size: 32
   global_batch_size: 256
   seed: 42
-  enable_offload: True
+  enable_offload: False
 
   model:
-    model_path: "/data/home/sim6g/code/tabero/models/RLinf-pi05-SFT-Stack-cube"
+    model_path: "/path/to/model/RLinf-Pi05-SFT"
     model_type: "openpi"
     action_dim: 7
     num_action_chunks: 5
@@ -135,7 +136,7 @@ actor:
 
   fsdp_config:
     strategy: "fsdp"
-    sharding_strategy: "full_shard"
+    sharding_strategy: "no_shard"
     gradient_checkpointing: False # for openpi, gradient checkpointing is not supported, please do not change this value
     mixed_precision:
       param_dtype: ${actor.model.precision}

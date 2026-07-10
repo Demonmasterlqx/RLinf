@@ -12,28 +12,38 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import torch
+from torch import nn
 
 from rlinf.utils.ckpt_convertor.export_openpi_lora_for_t2vla import (
-    _filter_action_expert_overlay_state_dict,
+    _get_lora_modules,
 )
 
 
-def test_filter_action_expert_overlay_keeps_only_expert_and_tactile_weights():
-    state = {
-        "paligemma_with_expert.gemma_expert.model.layers.0.self_attn.q_proj.weight": torch.ones(
-            1
-        ),
-        "tactile_prefix_encoder.out_proj.weight": torch.ones(1),
-        "paligemma_with_expert.paligemma.model.language_model.layers.0.self_attn.q_proj.weight": torch.ones(
-            1
-        ),
-        "value_head.net.0.weight": torch.ones(1),
-    }
+class _DummyOpenPI(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.paligemma_with_expert = nn.Module()
+        self.paligemma_with_expert.paligemma = nn.Linear(1, 1)
+        self.paligemma_with_expert.gemma_expert = nn.Module()
+        self.paligemma_with_expert.gemma_expert.model = nn.Linear(1, 1)
 
-    out = _filter_action_expert_overlay_state_dict(state)
 
-    assert sorted(out) == [
-        "paligemma_with_expert.gemma_expert.model.layers.0.self_attn.q_proj.weight",
-        "tactile_prefix_encoder.out_proj.weight",
+def test_get_lora_modules_supports_dual_openpi_export_targets():
+    model = _DummyOpenPI()
+
+    modules = _get_lora_modules(model, "both")
+
+    assert len(modules) == 2
+    assert [item.adapter_dir_name for item in modules] == [
+        "lora_adapter",
+        "action_expert_lora_adapter",
     ]
+    assert modules[0].module is model.paligemma_with_expert.paligemma
+    assert modules[1].module is model.paligemma_with_expert.gemma_expert.model
+
+    replacement_vlm = nn.Linear(1, 1)
+    replacement_expert = nn.Linear(1, 1)
+    modules[0].assign_module(replacement_vlm)
+    modules[1].assign_module(replacement_expert)
+    assert model.paligemma_with_expert.paligemma is replacement_vlm
+    assert model.paligemma_with_expert.gemma_expert.model is replacement_expert

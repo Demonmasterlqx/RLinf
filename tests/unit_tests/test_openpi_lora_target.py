@@ -22,6 +22,10 @@ from rlinf.models import (
     _get_openpi_lora_target_module,
 )
 
+CONFIG_DIR = (
+    Path(__file__).resolve().parents[2] / "examples" / "embodiment" / "config"
+)
+
 
 class DummyActionExpert(nn.Module):
     def __init__(self):
@@ -134,10 +138,7 @@ def test_apply_openpi_both_lora_wraps_vlm_and_action_expert_only():
 
 
 def test_tabero_peft_config_uses_action_expert_lora_only():
-    path = Path(
-        "/data/home/sim6g/code/tabero/RLinf/examples/embodiment/config/"
-        "isaaclab_pi0_peft_lora_tacfield_tabero.yaml"
-    )
+    path = CONFIG_DIR / "isaaclab_pi0_peft_lora_tacfield_tabero.yaml"
     cfg = OmegaConf.load(path)
 
     assert cfg.actor.model.is_lora is True
@@ -149,10 +150,7 @@ def test_tabero_peft_config_uses_action_expert_lora_only():
 
 
 def test_tabero_multitask_peft_config_reads_subset_and_disables_force_key():
-    path = Path(
-        "/data/home/sim6g/code/tabero/RLinf/examples/embodiment/config/"
-        "isaaclab_pi0_peft_lora_tacfield_tabero_multitask.yaml"
-    )
+    path = CONFIG_DIR / "isaaclab_pi0_peft_lora_tacfield_tabero_multitask.yaml"
     cfg = OmegaConf.load(path)
 
     assert cfg.cluster.component_placement["actor,rollout"] == "all"
@@ -165,13 +163,19 @@ def test_tabero_multitask_peft_config_reads_subset_and_disables_force_key():
     assert cfg.env.train.init_params.force_key is None
     assert cfg.env.train.init_params.require_all_tasks_active is True
     assert cfg.actor.model.openpi.tactile_loss_weight == 0.0
+    total_rollout_samples = (
+        cfg.env.train.total_num_envs
+        * cfg.env.train.rollout_epoch
+        * (
+            cfg.env.train.max_steps_per_rollout_epoch
+            // cfg.actor.model.num_action_chunks
+        )
+    )
+    assert total_rollout_samples % cfg.actor.global_batch_size == 0
 
 
 def test_tabero_multitask_both_lora_config_reads_subset_and_trains_dual_adapters():
-    path = Path(
-        "/data/home/sim6g/code/tabero/RLinf/examples/embodiment/config/"
-        "isaaclab_pi0_peft_lora_both_tacfield_tabero_multitask.yaml"
-    )
+    path = CONFIG_DIR / "isaaclab_pi0_peft_lora_both_tacfield_tabero_multitask.yaml"
     cfg = OmegaConf.load(path)
 
     assert cfg.rollout.pipeline_stage_num == 9
@@ -188,12 +192,21 @@ def test_tabero_multitask_both_lora_config_reads_subset_and_trains_dual_adapters
     assert cfg.actor.model.openpi.tactile_loss_weight == 0.0
     assert cfg.actor.fsdp_config.use_orig_params is False
     assert cfg.actor.fsdp_config.save_trainable_model_weights is True
+    total_rollout_samples = (
+        cfg.env.train.total_num_envs
+        * cfg.env.train.rollout_epoch
+        * (
+            cfg.env.train.max_steps_per_rollout_epoch
+            // cfg.actor.model.num_action_chunks
+        )
+    )
+    assert total_rollout_samples % cfg.actor.global_batch_size == 0
 
 
 def test_tabero_multitask_both_lora_smoke_config_enables_two_task_video_smoke():
-    path = Path(
-        "/data/home/sim6g/code/tabero/RLinf/examples/embodiment/config/"
-        "isaaclab_pi0_peft_lora_both_tacfield_tabero_multitask_smoke.yaml"
+    path = (
+        CONFIG_DIR
+        / "isaaclab_pi0_peft_lora_both_tacfield_tabero_multitask_smoke.yaml"
     )
     cfg = OmegaConf.load(path)
 
