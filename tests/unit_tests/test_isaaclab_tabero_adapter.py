@@ -18,6 +18,7 @@ from omegaconf import OmegaConf
 
 from rlinf.data.embodied_io_struct import EnvOutput
 from rlinf.envs import get_env_cls
+from rlinf.envs.isaaclab.tasks import tabero_tacfield
 from rlinf.envs.isaaclab.tasks.tabero_tacfield import (
     IsaaclabTaberoTacFieldEnv,
     TacManipMarkerMotionHistory,
@@ -396,3 +397,333 @@ def test_tabero_wrap_obs_omits_force_observation_when_force_key_is_null():
     )
 
     assert "tactile_gripper_force" not in wrapped
+
+
+def test_consecutive_success_tracker_triggers_only_on_eighth_success():
+    tracker_cls = getattr(tabero_tacfield, "ConsecutiveSuccessTracker")
+    tracker = tracker_cls(num_envs=1, required_steps=8, device="cpu")
+
+    outputs = [tracker.update(torch.tensor([True])).item() for _ in range(8)]
+
+    assert outputs == [False] * 7 + [True]
+    assert tracker.streak.tolist() == [8]
+
+
+def test_consecutive_success_tracker_keeps_legacy_single_step_default():
+    tracker_cls = getattr(tabero_tacfield, "ConsecutiveSuccessTracker")
+    tracker = tracker_cls(num_envs=1, device="cpu")
+
+    stable = tracker.update(torch.tensor([True]))
+
+    assert stable.tolist() == [True]
+    assert tracker.streak.tolist() == [1]
+
+
+def test_consecutive_success_tracker_resets_failed_and_selected_envs():
+    tracker_cls = getattr(tabero_tacfield, "ConsecutiveSuccessTracker")
+    tracker = tracker_cls(num_envs=3, required_steps=3, device="cpu")
+
+    tracker.update(torch.tensor([True, True, True]))
+    tracker.update(torch.tensor([True, False, True]))
+    tracker.reset(torch.tensor([2]))
+    stable = tracker.update(torch.tensor([True, True, True]))
+
+    assert stable.tolist() == [True, False, False]
+    assert tracker.streak.tolist() == [3, 1, 1]
+
+
+class _FakeTerminationManager:
+    def __init__(self, terms, time_outs):
+        self._terms = terms
+        self.time_outs = time_outs
+
+    def get_term(self, name):
+        return self._terms[name]
+
+
+def test_stable_success_reward_rejects_failure_and_timeout_on_same_step():
+    reward_fn = getattr(tabero_tacfield, "_stable_success_terminal_reward")
+    env = type("FakeEnv", (), {})()
+    env.step_dt = 0.05
+    env.termination_manager = _FakeTerminationManager(
+        terms={
+            "success": torch.tensor([True, True, True, False]),
+            "object_dropped": torch.tensor([False, True, False, False]),
+        },
+        time_outs=torch.tensor([False, False, True, False]),
+    )
+
+    reward = reward_fn(
+        env,
+        success_term_name="success",
+        failure_term_names=("object_dropped",),
+    )
+
+    torch.testing.assert_close(reward, torch.tensor([20.0, 0.0, 0.0, 0.0]))
+
+
+def test_stable_success_reward_applies_per_env_condition_multipliers():
+    reward_fn = getattr(tabero_tacfield, "_stable_success_terminal_reward")
+    env = type("FakeEnv", (), {})()
+    env.step_dt = 0.05
+    env.termination_manager = _FakeTerminationManager(
+        terms={
+            "success": torch.tensor([True, True, True, True]),
+            "object_dropped": torch.tensor([False, False, True, False]),
+        },
+        time_outs=torch.tensor([False, False, False, True]),
+    )
+
+    reward = reward_fn(
+        env,
+        success_term_name="success",
+        failure_term_names=("object_dropped",),
+        env_reward_multipliers=(1.0, 3.0, 1.0, 3.0),
+    )
+
+    torch.testing.assert_close(reward, torch.tensor([20.0, 60.0, 0.0, 0.0]))
+
+
+def test_install_success_reward_wraps_raw_success_and_lists_failure_terms():
+    install_fn = getattr(tabero_tacfield, "_install_success_reward")
+
+    class FakeManagerTermBase:
+        def __init__(self, cfg, env):
+            self.cfg = cfg
+            self.env = env
+
+    class FakeTerm:
+        def __init__(self, func, params=None, time_out=False):
+            self.func = func
+            self.params = params or {}
+            self.time_out = time_out
+
+    class FakeRewardTerm:
+        def __init__(self, func, weight, params):
+            self.func = func
+            self.weight = weight
+            self.params = params
+
+    def raw_success(env, threshold):
+        return env.raw >= threshold
+
+    terminations = type("Terminations", (), {})()
+    terminations.success = FakeTerm(raw_success, {"threshold": 1.0})
+    terminations.object_dropped = FakeTerm(lambda env: env.dropped)
+    terminations.time_out = FakeTerm(lambda env: env.timed_out, time_out=True)
+    env_cfg = type("EnvCfg", (), {"terminations": terminations, "rewards": None})()
+
+    install_fn(
+        env_cfg,
+        FakeRewardTerm,
+        reward_coef=2.0,
+        manager_term_base_cls=FakeManagerTermBase,
+        required_steps=8,
+    )
+
+    assert env_cfg.terminations.success.func is not raw_success
+    assert env_cfg.terminations.success.params["success_func"] is raw_success
+    assert env_cfg.terminations.success.params["success_params"] == {"threshold": 1.0}
+    assert env_cfg.terminations.success.params["required_steps"] == 8
+    assert env_cfg.rewards["success"].weight == 2.0
+    assert (
+        env_cfg.rewards["success"].func
+        is tabero_tacfield._stable_success_terminal_reward
+    )
+    assert env_cfg.rewards["success"].params == {
+        "success_term_name": "success",
+        "failure_term_names": ("object_dropped",),
+    }
+
+
+def test_install_success_reward_forwards_condition_multipliers():
+    install_fn = getattr(tabero_tacfield, "_install_success_reward")
+
+    class FakeManagerTermBase:
+        def __init__(self, cfg, env):
+            self.cfg = cfg
+            self.env = env
+
+    class FakeTerm:
+        def __init__(self, func, params=None, time_out=False):
+            self.func = func
+            self.params = params or {}
+            self.time_out = time_out
+
+    class FakeRewardTerm:
+        def __init__(self, func, weight, params):
+            self.func = func
+            self.weight = weight
+            self.params = params
+
+    terminations = type("Terminations", (), {})()
+    terminations.success = FakeTerm(lambda env: env.raw)
+    env_cfg = type("EnvCfg", (), {"terminations": terminations, "rewards": None})()
+
+    install_fn(
+        env_cfg,
+        FakeRewardTerm,
+        reward_coef=1.0,
+        manager_term_base_cls=FakeManagerTermBase,
+        env_reward_multipliers=(1.0, 3.0),
+    )
+
+    assert env_cfg.rewards["success"].params["env_reward_multipliers"] == (
+        1.0,
+        3.0,
+    )
+
+
+def test_dynamic_consecutive_success_term_resets_through_manager_contract():
+    make_term = getattr(tabero_tacfield, "_make_consecutive_success_term")
+
+    class FakeManagerTermBase:
+        def __init__(self, cfg, env):
+            self.cfg = cfg
+            self.env = env
+
+    env = type("FakeEnv", (), {})()
+    env.num_envs = 2
+    env.device = torch.device("cpu")
+    env.raw = torch.tensor([True, True])
+    cfg = type(
+        "Cfg",
+        (),
+        {
+            "params": {
+                "success_func": lambda current_env: current_env.raw,
+                "success_params": {},
+                "required_steps": 2,
+            }
+        },
+    )()
+    term = make_term(FakeManagerTermBase)(cfg, env)
+
+    assert term(env, **cfg.params).tolist() == [False, False]
+    term.reset(env_ids=torch.tensor([1]))
+    assert term(env, **cfg.params).tolist() == [True, False]
+
+
+def test_prompt_conditions_pair_firm_and_gentle_and_rotate_deterministically():
+    build_prompts = getattr(tabero_tacfield, "build_tabero_conditioned_prompts")
+    prompt_cfg = OmegaConf.create(
+        {
+            "enabled": True,
+            "assignment": "paired",
+            "firm_adverbs": ["firmly", "tightly"],
+            "gentle_adverbs": ["gently", "softly"],
+            "prompt_seed": 0,
+        }
+    )
+
+    first_prompts, condition_ids = build_prompts(
+        instruction="pick up the soup",
+        task_suite="libero_object",
+        task_id=0,
+        num_envs=2,
+        prompt_cfg=prompt_cfg,
+        rollout_round=0,
+    )
+    repeated_prompts, repeated_ids = build_prompts(
+        instruction="pick up the soup",
+        task_suite="libero_object",
+        task_id=0,
+        num_envs=2,
+        prompt_cfg=prompt_cfg,
+        rollout_round=0,
+    )
+    next_prompts, _ = build_prompts(
+        instruction="pick up the soup",
+        task_suite="libero_object",
+        task_id=0,
+        num_envs=2,
+        prompt_cfg=prompt_cfg,
+        rollout_round=1,
+    )
+
+    assert condition_ids == [0, 1]
+    assert repeated_ids == condition_ids
+    assert repeated_prompts == first_prompts
+    assert any(word in first_prompts[0].lower() for word in ("firmly", "tightly"))
+    assert any(word in first_prompts[1].lower() for word in ("gently", "softly"))
+    assert next_prompts != first_prompts
+
+
+def test_prompt_conditions_require_firm_gentle_pairs():
+    build_prompts = getattr(tabero_tacfield, "build_tabero_conditioned_prompts")
+    prompt_cfg = OmegaConf.create(
+        {
+            "enabled": True,
+            "assignment": "paired",
+            "firm_adverbs": ["firmly"],
+            "gentle_adverbs": ["gently"],
+            "prompt_seed": 0,
+        }
+    )
+
+    with pytest.raises(ValueError, match="even number"):
+        build_prompts(
+            instruction="pick up the soup",
+            task_suite="libero_object",
+            task_id=0,
+            num_envs=3,
+            prompt_cfg=prompt_cfg,
+            rollout_round=0,
+        )
+
+
+def test_predicted_squeeze_uses_tabero_13d_force_indices():
+    squeeze_fn = getattr(tabero_tacfield, "compute_tabero_predicted_squeeze")
+    actions = torch.zeros((2, 13), dtype=torch.float32)
+    actions[0, 9] = -3.0
+    actions[0, 12] = 5.0
+    actions[1, 9] = 7.0
+    actions[1, 12] = -2.0
+
+    squeeze = squeeze_fn(actions)
+
+    torch.testing.assert_close(squeeze, torch.tensor([6.0, 4.0]))
+
+
+def test_tabero_condition_metrics_report_each_condition_without_half_scaling():
+    env = object.__new__(IsaaclabTaberoTacFieldEnv)
+    env.num_envs = 2
+    env.device = torch.device("cpu")
+    env.returns = torch.zeros(2)
+    env.success_once = torch.zeros(2, dtype=torch.bool)
+    env._elapsed_steps = torch.ones(2, dtype=torch.int32)
+    env._tabero_task = resolve_tabero_tasks(
+        OmegaConf.create(
+            {
+                "tasks": [
+                    {
+                        "task_suite": "libero_object",
+                        "task_id": 0,
+                        "task_description": "pick soup",
+                    }
+                ]
+            }
+        )
+    )[0]
+    env._tabero_task_shard_id = 0
+    env._prompt_condition_ids = (0, 1)
+    env._condition_squeeze_sum = torch.tensor([30.0, 4.0])
+    env._condition_squeeze_count = torch.tensor([3.0, 2.0])
+
+    infos = env._record_metrics(
+        torch.tensor([1.0, 0.0]),
+        torch.tensor([True, False]),
+        {},
+    )
+
+    episode = infos["episode"]
+    torch.testing.assert_close(episode["firm_success_once"], torch.ones(2))
+    torch.testing.assert_close(episode["gentle_success_once"], torch.zeros(2))
+    torch.testing.assert_close(episode["firm_return"], torch.ones(2))
+    torch.testing.assert_close(episode["gentle_return"], torch.zeros(2))
+    torch.testing.assert_close(
+        episode["firm_squeeze_pred_mean"], torch.full((2,), 10.0)
+    )
+    torch.testing.assert_close(
+        episode["gentle_squeeze_pred_mean"], torch.full((2,), 2.0)
+    )

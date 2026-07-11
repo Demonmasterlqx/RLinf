@@ -14,7 +14,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 import os
 import sys
 import warnings
@@ -29,6 +31,8 @@ from omegaconf import open_dict
 from rlinf.envs.isaaclab.utils import quat2axisangle_torch
 
 from ..isaaclab_env import IsaaclabBaseEnv
+
+logger = logging.getLogger(__name__)
 
 
 def _cfg_get(cfg: Any, name: str, default: Any = None) -> Any:
@@ -192,19 +196,121 @@ def _camera_rgb_observation(env, camera_name: str) -> torch.Tensor:
     return camera.data.output["rgb"]
 
 
-def _success_terminal_reward(
+class ConsecutiveSuccessTracker:
+    """Track independent consecutive-success streaks for vector environments."""
+
+    def __init__(
+        self,
+        num_envs: int,
+        required_steps: int = 1,
+        device: torch.device | str = "cpu",
+    ) -> None:
+        if required_steps <= 0:
+            raise ValueError("required_steps must be positive.")
+        self.required_steps = int(required_steps)
+        self.streak = torch.zeros(
+            int(num_envs), dtype=torch.int64, device=torch.device(device)
+        )
+
+    def update(self, raw_success: torch.Tensor) -> torch.Tensor:
+        raw_success = raw_success.to(device=self.streak.device, dtype=torch.bool)
+        if raw_success.shape != self.streak.shape:
+            raise ValueError(
+                "raw_success must have shape "
+                f"{tuple(self.streak.shape)}, got {tuple(raw_success.shape)}."
+            )
+        self.streak = torch.where(raw_success, self.streak + 1, 0)
+        return self.streak >= self.required_steps
+
+    def reset(self, env_ids: torch.Tensor | list[int] | slice | None = None) -> None:
+        if env_ids is None:
+            self.streak.zero_()
+            return
+        if isinstance(env_ids, slice):
+            self.streak[env_ids] = 0
+            return
+        env_ids = torch.as_tensor(env_ids, device=self.streak.device, dtype=torch.long)
+        self.streak[env_ids] = 0
+
+
+def _make_consecutive_success_term(manager_term_base_cls: type) -> type:
+    class ConsecutiveSuccessTerm(manager_term_base_cls):
+        def __init__(self, cfg, env) -> None:
+            super().__init__(cfg, env)
+            required_steps = int(cfg.params.get("required_steps", 1))
+            self._tracker = ConsecutiveSuccessTracker(
+                num_envs=env.num_envs,
+                required_steps=required_steps,
+                device=env.device,
+            )
+
+        def reset(self, env_ids=None) -> None:
+            self._tracker.reset(env_ids)
+
+        def __call__(
+            self,
+            env,
+            success_func: Any,
+            success_params: dict[str, Any] | None = None,
+            required_steps: int = 1,
+        ) -> torch.Tensor:
+            if int(required_steps) != self._tracker.required_steps:
+                raise ValueError(
+                    "Consecutive success required_steps changed after initialization."
+                )
+            raw_success = success_func(env, **(success_params or {}))
+            return self._tracker.update(raw_success)
+
+    ConsecutiveSuccessTerm.__name__ = "ConsecutiveSuccessTerm"
+    return ConsecutiveSuccessTerm
+
+
+def _stable_success_terminal_reward(
     env,
-    success_func: Any,
-    success_params: dict[str, Any] | None = None,
+    success_term_name: str = "success",
+    failure_term_names: tuple[str, ...] = (),
+    env_reward_multipliers: tuple[float, ...] | None = None,
 ) -> torch.Tensor:
-    success = success_func(env, **(success_params or {}))
-    return success.to(dtype=torch.float32) / float(env.step_dt)
+    # IsaacLab computes this before its internal auto-reset, then resets both
+    # manager terms for the finished env ids, so this emits once per episode.
+    success = env.termination_manager.get_term(success_term_name).to(dtype=torch.bool)
+    invalid = env.termination_manager.time_outs.to(dtype=torch.bool).clone()
+    for term_name in failure_term_names:
+        invalid |= env.termination_manager.get_term(term_name).to(dtype=torch.bool)
+    reward = (success & ~invalid).to(dtype=torch.float32) / float(env.step_dt)
+    if env_reward_multipliers is not None:
+        multipliers = torch.as_tensor(
+            env_reward_multipliers,
+            dtype=reward.dtype,
+            device=reward.device,
+        )
+        if multipliers.shape != reward.shape:
+            raise ValueError(
+                "env_reward_multipliers must match the vector env reward shape; "
+                f"got {tuple(multipliers.shape)} for {tuple(reward.shape)}."
+            )
+        reward = reward * multipliers
+    return reward
+
+
+def _termination_term_items(terminations_cfg: Any) -> list[tuple[str, Any]]:
+    terms: list[tuple[str, Any]] = []
+    for name in dir(terminations_cfg):
+        if name.startswith("_"):
+            continue
+        term = getattr(terminations_cfg, name, None)
+        if term is not None and hasattr(term, "func"):
+            terms.append((name, term))
+    return terms
 
 
 def _install_success_reward(
     isaac_env_cfg: Any,
     reward_term_cls: Any,
     reward_coef: float,
+    manager_term_base_cls: type,
+    required_steps: int = 1,
+    env_reward_multipliers: tuple[float, ...] | None = None,
 ) -> None:
     terminations_cfg = getattr(isaac_env_cfg, "terminations", None)
     success_term = getattr(terminations_cfg, "success", None)
@@ -212,13 +318,28 @@ def _install_success_reward(
     if success_func is None:
         return
 
+    success_params = dict(getattr(success_term, "params", {}) or {})
+    success_term.func = _make_consecutive_success_term(manager_term_base_cls)
+    success_term.params = {
+        "success_func": success_func,
+        "success_params": success_params,
+        "required_steps": int(required_steps),
+    }
+    failure_term_names = tuple(
+        name
+        for name, term in _termination_term_items(terminations_cfg)
+        if name != "success" and not bool(getattr(term, "time_out", False))
+    )
+    reward_params = {
+        "success_term_name": "success",
+        "failure_term_names": failure_term_names,
+    }
+    if env_reward_multipliers is not None:
+        reward_params["env_reward_multipliers"] = tuple(env_reward_multipliers)
     success_reward = reward_term_cls(
-        func=_success_terminal_reward,
+        func=_stable_success_terminal_reward,
         weight=float(reward_coef),
-        params={
-            "success_func": success_func,
-            "success_params": dict(getattr(success_term, "params", {}) or {}),
-        },
+        params=reward_params,
     )
     rewards_cfg = getattr(isaac_env_cfg, "rewards", None)
     if rewards_cfg is None:
@@ -227,6 +348,116 @@ def _install_success_reward(
         rewards_cfg["success"] = success_reward
     else:
         setattr(rewards_cfg, "success", success_reward)
+
+
+def _choose_prompt_option(seed: int, key: str, options: list[str]) -> str:
+    if not options:
+        raise ValueError("Prompt adverb lists must not be empty.")
+    digest = hashlib.blake2b(
+        f"{int(seed)}:{key}".encode("utf-8"), digest_size=8
+    ).digest()
+    base_index = int.from_bytes(digest, "big") % len(options)
+    return str(options[base_index])
+
+
+def _rewrite_tabero_instruction(
+    instruction: str,
+    adverb: str,
+    seed: int,
+    key: str,
+) -> str:
+    instruction = instruction.strip()
+    adverb = adverb.strip()
+    if not adverb:
+        return instruction
+    if not instruction:
+        return adverb
+
+    lower = instruction.lower()
+    if lower.startswith(f"{adverb.lower()} ") or lower.endswith(f" {adverb.lower()}"):
+        return instruction
+    style = _choose_prompt_option(seed, f"{key}:style", ["prefix", "suffix"])
+    if style == "suffix":
+        return f"{instruction} {adverb}"
+    return f"{adverb} {instruction}"
+
+
+def build_tabero_conditioned_prompts(
+    instruction: str,
+    task_suite: str,
+    task_id: int,
+    num_envs: int,
+    prompt_cfg: Any,
+    rollout_round: int,
+) -> tuple[list[str], list[int]]:
+    if not bool(_cfg_get(prompt_cfg, "enabled", False)):
+        return [instruction] * int(num_envs), []
+    assignment = str(_cfg_get(prompt_cfg, "assignment", "paired"))
+    if assignment != "paired":
+        raise ValueError(
+            f"Unsupported Tabero prompt assignment {assignment!r}; expected 'paired'."
+        )
+    if int(num_envs) % 2 != 0:
+        raise ValueError(
+            "Paired firm/gentle prompts require an even number of vector envs."
+        )
+
+    firm_adverbs = [str(x) for x in _cfg_get(prompt_cfg, "firm_adverbs", [])]
+    gentle_adverbs = [str(x) for x in _cfg_get(prompt_cfg, "gentle_adverbs", [])]
+    prompt_seed = int(_cfg_get(prompt_cfg, "prompt_seed", 0))
+    condition_ids = [env_id % 2 for env_id in range(int(num_envs))]
+    prompts: list[str] = []
+    for env_id, condition_id in enumerate(condition_ids):
+        condition = "firm" if condition_id == 0 else "gentle"
+        adverbs = firm_adverbs if condition_id == 0 else gentle_adverbs
+        base_key = f"{task_suite}:{int(task_id)}:{env_id}:{condition}"
+        hashed_adverb = _choose_prompt_option(prompt_seed, base_key, adverbs)
+        base_index = adverbs.index(hashed_adverb)
+        adverb = adverbs[(base_index + int(rollout_round)) % len(adverbs)]
+        prompts.append(
+            _rewrite_tabero_instruction(
+                instruction,
+                adverb,
+                seed=prompt_seed,
+                key=f"{base_key}:{int(rollout_round)}",
+            )
+        )
+    return prompts, condition_ids
+
+
+def build_condition_reward_multipliers(
+    condition_ids: list[int] | tuple[int, ...],
+    success_cfg: Any,
+) -> tuple[float, ...] | None:
+    multiplier_cfg = _cfg_get(success_cfg, "condition_reward_multipliers", None)
+    if not condition_ids or multiplier_cfg is None:
+        return None
+
+    firm = float(_cfg_get(multiplier_cfg, "firm", 1.0))
+    gentle = float(_cfg_get(multiplier_cfg, "gentle", 1.0))
+    if firm <= 0 or gentle <= 0:
+        raise ValueError("Condition reward multipliers must be positive.")
+    return tuple(firm if int(condition_id) == 0 else gentle for condition_id in condition_ids)
+
+
+def compute_tabero_predicted_squeeze(actions: torch.Tensor) -> torch.Tensor:
+    if actions.ndim != 2 or actions.shape[-1] < 13:
+        raise ValueError(
+            "Tabero predicted squeeze expects actions with shape (N, >=13); "
+            f"got {tuple(actions.shape)}."
+        )
+    return 2.0 * torch.minimum(actions[:, 9].abs(), actions[:, 12].abs())
+
+
+def _broadcast_condition_mean(
+    values: torch.Tensor,
+    condition_mask: torch.Tensor,
+    output_like: torch.Tensor,
+) -> torch.Tensor:
+    if not condition_mask.any():
+        return torch.full_like(output_like, float("nan"), dtype=torch.float32)
+    mean = values[condition_mask].to(dtype=torch.float32).mean()
+    return torch.full_like(output_like, mean.item(), dtype=torch.float32)
 
 
 def _set_camera_resolution(scene, camera_name: str, camera_cfg: Any) -> None:
@@ -413,6 +644,8 @@ class IsaaclabTaberoTacFieldEnv(IsaaclabBaseEnv):
             init_params, "marker_motion_key", "gripper_marker_motion"
         )
         self._force_key = _cfg_get(init_params, "force_key", "gripper_net_force")
+        self._success_cfg = _cfg_get(init_params, "success", None)
+        self._prompt_cfg = _cfg_get(init_params, "prompt_conditions", None)
         self._tabero_tasks = resolve_tabero_tasks(init_params)
         validate_tabero_task_assignment(
             self._tabero_tasks,
@@ -431,6 +664,24 @@ class IsaaclabTaberoTacFieldEnv(IsaaclabBaseEnv):
             history_len=history_len,
             expected_combined_markers=expected_markers,
         )
+        self._prompt_rollout_round = -1
+        self._conditioned_prompts, condition_ids = build_tabero_conditioned_prompts(
+            instruction=self._tabero_task.task_description,
+            task_suite=self._tabero_task.task_suite,
+            task_id=self._tabero_task.task_id,
+            num_envs=num_envs,
+            prompt_cfg=self._prompt_cfg,
+            rollout_round=0,
+        )
+        self._prompt_condition_ids = tuple(condition_ids)
+        logger.info(
+            "Assigned Tabero task shard=%d/%d suite=%s task_id=%d num_envs=%d",
+            self._tabero_task_shard_id,
+            int(total_num_processes),
+            self._tabero_task.task_suite,
+            self._tabero_task.task_id,
+            int(num_envs),
+        )
 
         super().__init__(
             cfg,
@@ -440,6 +691,12 @@ class IsaaclabTaberoTacFieldEnv(IsaaclabBaseEnv):
             worker_info,
         )
         self.task_description = self._tabero_task.task_description
+        self._condition_squeeze_sum = torch.zeros(
+            self.num_envs, dtype=torch.float32, device=self.device
+        )
+        self._condition_squeeze_count = torch.zeros(
+            self.num_envs, dtype=torch.float32, device=self.device
+        )
 
     def _make_env_function(self):
         def make_env_isaaclab():
@@ -468,6 +725,7 @@ class IsaaclabTaberoTacFieldEnv(IsaaclabBaseEnv):
             sim_app = AppLauncher(headless=True, enable_cameras=True).app
 
             import tac_manip  # noqa: F401
+            from isaaclab.managers import ManagerTermBase
             from isaaclab.managers import ObservationTermCfg as ObsTerm
             from isaaclab.managers import RewardTermCfg as RewTerm
             from isaaclab_tasks.utils import load_cfg_from_registry
@@ -504,7 +762,16 @@ class IsaaclabTaberoTacFieldEnv(IsaaclabBaseEnv):
             _install_success_reward(
                 isaac_env_cfg,
                 RewTerm,
-                float(self.cfg.reward_coef),
+                float(self.cfg.reward_coef)
+                * float(_cfg_get(self._success_cfg, "terminal_reward", 1.0)),
+                ManagerTermBase,
+                required_steps=int(
+                    _cfg_get(self._success_cfg, "required_consecutive_steps", 1)
+                ),
+                env_reward_multipliers=build_condition_reward_multipliers(
+                    self._prompt_condition_ids,
+                    self._success_cfg,
+                ),
             )
 
             env = gym.make(
@@ -516,7 +783,40 @@ class IsaaclabTaberoTacFieldEnv(IsaaclabBaseEnv):
 
     def reset(self, seed=None, env_ids: torch.Tensor | None = None):
         self._marker_history.reset(env_ids)
+        if getattr(self, "_prompt_condition_ids", ()):
+            self._prompt_rollout_round += 1
+            self._conditioned_prompts, condition_ids = build_tabero_conditioned_prompts(
+                instruction=self._tabero_task.task_description,
+                task_suite=self._tabero_task.task_suite,
+                task_id=self._tabero_task.task_id,
+                num_envs=self.num_envs,
+                prompt_cfg=self._prompt_cfg,
+                rollout_round=self._prompt_rollout_round,
+            )
+            self._prompt_condition_ids = tuple(condition_ids)
+            logger.info(
+                "Tabero prompts shard=%d round=%d prompts=%s",
+                self._tabero_task_shard_id,
+                self._prompt_rollout_round,
+                self._conditioned_prompts,
+            )
+        if hasattr(self, "_condition_squeeze_sum"):
+            if env_ids is None:
+                self._condition_squeeze_sum.zero_()
+                self._condition_squeeze_count.zero_()
+            else:
+                env_ids = env_ids.to(device=self.device, dtype=torch.long)
+                self._condition_squeeze_sum[env_ids] = 0
+                self._condition_squeeze_count[env_ids] = 0
         return super().reset(seed=seed, env_ids=env_ids)
+
+    def step(self, actions=None, auto_reset=True):
+        if getattr(self, "_prompt_condition_ids", ()) and actions is not None:
+            actions_tensor = torch.as_tensor(actions, device=self.device)
+            squeeze = compute_tabero_predicted_squeeze(actions_tensor)
+            self._condition_squeeze_sum += squeeze.to(dtype=torch.float32)
+            self._condition_squeeze_count += 1
+        return super().step(actions=actions, auto_reset=auto_reset)
 
     def _record_metrics(self, step_reward, terminations, infos):
         infos = super()._record_metrics(step_reward, terminations, infos)
@@ -533,6 +833,35 @@ class IsaaclabTaberoTacFieldEnv(IsaaclabBaseEnv):
             dtype=torch.float32,
             device=step_reward.device,
         )
+        if getattr(self, "_prompt_condition_ids", ()):
+            condition_ids = torch.tensor(
+                self._prompt_condition_ids,
+                dtype=torch.int64,
+                device=step_reward.device,
+            )
+            firm_mask = condition_ids == 0
+            gentle_mask = condition_ids == 1
+            squeeze_mean = (
+                self._condition_squeeze_sum / self._condition_squeeze_count.clamp(min=1)
+            )
+            episode_info["firm_success_once"] = _broadcast_condition_mean(
+                self.success_once.to(dtype=torch.float32), firm_mask, step_reward
+            )
+            episode_info["gentle_success_once"] = _broadcast_condition_mean(
+                self.success_once.to(dtype=torch.float32), gentle_mask, step_reward
+            )
+            episode_info["firm_return"] = _broadcast_condition_mean(
+                self.returns, firm_mask, step_reward
+            )
+            episode_info["gentle_return"] = _broadcast_condition_mean(
+                self.returns, gentle_mask, step_reward
+            )
+            episode_info["firm_squeeze_pred_mean"] = _broadcast_condition_mean(
+                squeeze_mean, firm_mask, step_reward
+            )
+            episode_info["gentle_squeeze_pred_mean"] = _broadcast_condition_mean(
+                squeeze_mean, gentle_mask, step_reward
+            )
         return infos
 
     def _wrap_obs(self, obs):
@@ -546,7 +875,11 @@ class IsaaclabTaberoTacFieldEnv(IsaaclabBaseEnv):
             "main_images": policy_obs[self._main_image_key],
             "wrist_images": policy_obs[self._wrist_image_key],
             "states": state,
-            "task_descriptions": [self.task_description] * self.num_envs,
+            "task_descriptions": (
+                list(self._conditioned_prompts)
+                if getattr(self, "_prompt_condition_ids", ())
+                else [self.task_description] * self.num_envs
+            ),
             "tactile_marker_motion": tactile_marker_motion,
         }
         if self._force_key is not None and self._force_key in policy_obs:
