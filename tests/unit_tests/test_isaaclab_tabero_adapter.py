@@ -672,6 +672,60 @@ def test_prompt_conditions_require_firm_gentle_pairs():
         )
 
 
+def test_prompt_conditions_support_cyclic_one_firm_three_gentle_assignment():
+    build_prompts = getattr(tabero_tacfield, "build_tabero_conditioned_prompts")
+    prompt_cfg = OmegaConf.create(
+        {
+            "enabled": True,
+            "assignment": "cyclic",
+            "condition_cycle": ["firm", "gentle", "gentle", "gentle"],
+            "firm_adverbs": ["firmly", "tightly"],
+            "gentle_adverbs": ["gently", "softly"],
+            "prompt_seed": 0,
+        }
+    )
+
+    prompts, condition_ids = build_prompts(
+        instruction="pick up the soup",
+        task_suite="libero_object",
+        task_id=0,
+        num_envs=4,
+        prompt_cfg=prompt_cfg,
+        rollout_round=0,
+    )
+
+    assert condition_ids == [0, 1, 1, 1]
+    assert any(word in prompts[0].lower() for word in ("firmly", "tightly"))
+    assert all(
+        any(word in prompt.lower() for word in ("gently", "softly"))
+        for prompt in prompts[1:]
+    )
+
+
+def test_prompt_conditions_require_complete_cyclic_assignments():
+    build_prompts = getattr(tabero_tacfield, "build_tabero_conditioned_prompts")
+    prompt_cfg = OmegaConf.create(
+        {
+            "enabled": True,
+            "assignment": "cyclic",
+            "condition_cycle": ["firm", "gentle", "gentle", "gentle"],
+            "firm_adverbs": ["firmly"],
+            "gentle_adverbs": ["gently"],
+            "prompt_seed": 0,
+        }
+    )
+
+    with pytest.raises(ValueError, match="divisible by condition cycle length"):
+        build_prompts(
+            instruction="pick up the soup",
+            task_suite="libero_object",
+            task_id=0,
+            num_envs=6,
+            prompt_cfg=prompt_cfg,
+            rollout_round=0,
+        )
+
+
 def test_predicted_squeeze_uses_tabero_13d_force_indices():
     squeeze_fn = getattr(tabero_tacfield, "compute_tabero_predicted_squeeze")
     actions = torch.zeros((2, 13), dtype=torch.float32)

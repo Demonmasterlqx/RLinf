@@ -393,19 +393,42 @@ def build_tabero_conditioned_prompts(
     if not bool(_cfg_get(prompt_cfg, "enabled", False)):
         return [instruction] * int(num_envs), []
     assignment = str(_cfg_get(prompt_cfg, "assignment", "paired"))
-    if assignment != "paired":
+    if assignment == "paired":
+        condition_cycle = ["firm", "gentle"]
+    elif assignment == "cyclic":
+        condition_cycle = [
+            str(condition).lower()
+            for condition in _cfg_get(prompt_cfg, "condition_cycle", [])
+        ]
+        if not condition_cycle or any(
+            condition not in {"firm", "gentle"} for condition in condition_cycle
+        ):
+            raise ValueError(
+                "Cyclic prompt assignment requires a non-empty condition_cycle "
+                "containing only 'firm' and 'gentle'."
+            )
+    else:
         raise ValueError(
-            f"Unsupported Tabero prompt assignment {assignment!r}; expected 'paired'."
+            f"Unsupported Tabero prompt assignment {assignment!r}; "
+            "expected 'paired' or 'cyclic'."
         )
-    if int(num_envs) % 2 != 0:
+    if int(num_envs) % len(condition_cycle) != 0:
+        if assignment == "paired":
+            raise ValueError(
+                "Paired firm/gentle prompts require an even number of vector envs."
+            )
         raise ValueError(
-            "Paired firm/gentle prompts require an even number of vector envs."
+            f"The number of vector envs ({int(num_envs)}) must be divisible by "
+            f"condition cycle length ({len(condition_cycle)})."
         )
 
     firm_adverbs = [str(x) for x in _cfg_get(prompt_cfg, "firm_adverbs", [])]
     gentle_adverbs = [str(x) for x in _cfg_get(prompt_cfg, "gentle_adverbs", [])]
     prompt_seed = int(_cfg_get(prompt_cfg, "prompt_seed", 0))
-    condition_ids = [env_id % 2 for env_id in range(int(num_envs))]
+    cycle_ids = [0 if condition == "firm" else 1 for condition in condition_cycle]
+    condition_ids = [
+        cycle_ids[env_id % len(cycle_ids)] for env_id in range(int(num_envs))
+    ]
     prompts: list[str] = []
     for env_id, condition_id in enumerate(condition_ids):
         condition = "firm" if condition_id == 0 else "gentle"
@@ -437,7 +460,9 @@ def build_condition_reward_multipliers(
     gentle = float(_cfg_get(multiplier_cfg, "gentle", 1.0))
     if firm <= 0 or gentle <= 0:
         raise ValueError("Condition reward multipliers must be positive.")
-    return tuple(firm if int(condition_id) == 0 else gentle for condition_id in condition_ids)
+    return tuple(
+        firm if int(condition_id) == 0 else gentle for condition_id in condition_ids
+    )
 
 
 def compute_tabero_predicted_squeeze(actions: torch.Tensor) -> torch.Tensor:
