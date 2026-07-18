@@ -162,6 +162,133 @@ def assign_tabero_task(tasks: list[TaberoTaskSpec], seed_offset: int) -> TaberoT
     return tasks[int(seed_offset) % len(tasks)]
 
 
+def assign_tabero_reset_episode_names(
+    episode_names: list[str],
+    *,
+    num_envs: int,
+    shard_id: int,
+    total_shards: int,
+    rollout_round: int,
+    env_ids: torch.Tensor | list[int] | None = None,
+) -> list[str]:
+    """Assign deterministic cyclic dataset episodes across env workers."""
+
+    if not episode_names:
+        raise ValueError("Tabero HDF5 reset requires at least one episode.")
+    if num_envs <= 0 or total_shards <= 0:
+        raise ValueError("num_envs and total_shards must be positive.")
+
+    if env_ids is None:
+        local_env_ids = list(range(int(num_envs)))
+    else:
+        local_env_ids = torch.as_tensor(env_ids, dtype=torch.long).cpu().tolist()
+
+    global_round_size = int(num_envs) * int(total_shards)
+    global_start = int(rollout_round) * global_round_size + int(shard_id) * int(
+        num_envs
+    )
+    return [
+        episode_names[(global_start + int(env_id)) % len(episode_names)]
+        for env_id in local_env_ids
+    ]
+
+
+def stack_tabero_initial_states(states: list[Any]) -> Any:
+    """Concatenate IsaacLab nested initial-state dictionaries by env batch."""
+
+    if not states:
+        raise ValueError("Cannot stack an empty list of Tabero initial states.")
+    first = states[0]
+    if isinstance(first, dict):
+        expected_keys = set(first)
+        if any(set(state) != expected_keys for state in states):
+            raise ValueError("Tabero initial states must have matching keys.")
+        return {
+            key: stack_tabero_initial_states([state[key] for state in states])
+            for key in first
+        }
+    if isinstance(first, torch.Tensor):
+        return torch.cat(states, dim=0)
+    raise TypeError(f"Unsupported Tabero initial-state value: {type(first)!r}.")
+
+
+class TaberoHdf5ResetWrapper:
+    """Apply HDF5 demo initial states after the simulator bootstrap reset."""
+
+    def __init__(
+        self,
+        env: Any,
+        *,
+        dataset_handler: Any,
+        episode_names: list[str],
+        shard_id: int,
+        total_shards: int,
+    ) -> None:
+        self._env = env
+        self._dataset_handler = dataset_handler
+        self._episode_names = list(episode_names)
+        self._shard_id = int(shard_id)
+        self._total_shards = int(total_shards)
+        self._bootstrap_reset_done = False
+        self._rollout_round = 0
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._env, name)
+
+    def reset(
+        self,
+        seed: int | None = None,
+        env_ids: torch.Tensor | None = None,
+    ):
+        reset_result = self._env.reset(seed=seed, env_ids=env_ids)
+        if not self._bootstrap_reset_done:
+            self._bootstrap_reset_done = True
+            return reset_result
+
+        target_env_ids = (
+            torch.arange(self._env.num_envs, device=self._env.device)
+            if env_ids is None
+            else torch.as_tensor(env_ids, device=self._env.device, dtype=torch.long)
+        )
+        assigned_names = assign_tabero_reset_episode_names(
+            self._episode_names,
+            num_envs=self._env.num_envs,
+            shard_id=self._shard_id,
+            total_shards=self._total_shards,
+            rollout_round=self._rollout_round,
+            env_ids=target_env_ids,
+        )
+        initial_states = []
+        for episode_name in assigned_names:
+            episode = self._dataset_handler.load_episode(episode_name, self._env.device)
+            if episode is None or "initial_state" not in episode.data:
+                raise ValueError(
+                    f"Tabero HDF5 episode {episode_name!r} has no initial_state."
+                )
+            initial_states.append(episode.get_initial_state())
+
+        state = stack_tabero_initial_states(initial_states)
+        reset_result = self._env.reset_to(
+            state,
+            target_env_ids,
+            is_relative=True,
+        )
+        print(
+            "Tabero HDF5 reset "
+            f"shard={self._shard_id} round={self._rollout_round} "
+            f"episodes={assigned_names}",
+            flush=True,
+        )
+        self._rollout_round += 1
+        return reset_result
+
+    def close(self) -> None:
+        try:
+            self._dataset_handler.close()
+        finally:
+            self._env.close()
+
+
 def ensure_tabero_root_task_description(cfg: Any, task: TaberoTaskSpec) -> None:
     if _cfg_get(cfg.init_params, "task_description", None) is not None:
         return
@@ -671,6 +798,23 @@ class IsaaclabTaberoTacFieldEnv(IsaaclabBaseEnv):
         self._force_key = _cfg_get(init_params, "force_key", "gripper_net_force")
         self._success_cfg = _cfg_get(init_params, "success", None)
         self._prompt_cfg = _cfg_get(init_params, "prompt_conditions", None)
+        self._hdf5_initial_states_path = _cfg_get(
+            init_params, "hdf5_initial_states_path", None
+        )
+        self._hdf5_reset_assignment = str(
+            _cfg_get(init_params, "hdf5_reset_assignment", "cyclic")
+        )
+        if self._hdf5_initial_states_path is not None:
+            hdf5_path = Path(str(self._hdf5_initial_states_path)).expanduser()
+            if not hdf5_path.is_file():
+                raise FileNotFoundError(
+                    f"Tabero HDF5 initial-state file not found: {hdf5_path}"
+                )
+            if self._hdf5_reset_assignment != "cyclic":
+                raise ValueError(
+                    "Tabero hdf5_reset_assignment currently supports only 'cyclic'."
+                )
+            self._hdf5_initial_states_path = str(hdf5_path)
         self._tabero_tasks = resolve_tabero_tasks(init_params)
         validate_tabero_task_assignment(
             self._tabero_tasks,
@@ -802,6 +946,31 @@ class IsaaclabTaberoTacFieldEnv(IsaaclabBaseEnv):
             env = gym.make(
                 self.isaaclab_env_id, cfg=isaac_env_cfg, render_mode="rgb_array"
             ).unwrapped
+            if self._hdf5_initial_states_path is not None:
+                from isaaclab.utils.datasets import HDF5DatasetFileHandler
+
+                dataset_handler = HDF5DatasetFileHandler()
+                dataset_handler.open(self._hdf5_initial_states_path)
+
+                def episode_sort_key(name: str) -> tuple[int, str]:
+                    suffix = str(name).removeprefix("demo_")
+                    return (
+                        (int(suffix), str(name))
+                        if suffix.isdigit()
+                        else (sys.maxsize, str(name))
+                    )
+
+                episode_names = sorted(
+                    (str(name) for name in dataset_handler.get_episode_names()),
+                    key=episode_sort_key,
+                )
+                env = TaberoHdf5ResetWrapper(
+                    env,
+                    dataset_handler=dataset_handler,
+                    episode_names=episode_names,
+                    shard_id=self._tabero_task_shard_id,
+                    total_shards=self.total_num_processes,
+                )
             return env, sim_app
 
         return make_env_isaaclab

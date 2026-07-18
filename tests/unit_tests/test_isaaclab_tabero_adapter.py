@@ -21,11 +21,14 @@ from rlinf.envs import get_env_cls
 from rlinf.envs.isaaclab.tasks import tabero_tacfield
 from rlinf.envs.isaaclab.tasks.tabero_tacfield import (
     IsaaclabTaberoTacFieldEnv,
+    TaberoHdf5ResetWrapper,
     TacManipMarkerMotionHistory,
+    assign_tabero_reset_episode_names,
     assign_tabero_task,
     build_tabero_state,
     ensure_tabero_root_task_description,
     resolve_tabero_tasks,
+    stack_tabero_initial_states,
     validate_tabero_task_assignment,
 )
 
@@ -290,6 +293,130 @@ def test_assign_tabero_task_round_robins_by_logical_shard_id():
     assigned = [assign_tabero_task(tasks, seed_offset=i).task_id for i in range(8)]
 
     assert assigned == [0, 1, 2, 0, 1, 2, 0, 1]
+
+
+def test_hdf5_reset_episode_assignment_covers_workers_without_overlap():
+    episode_names = [f"demo_{index}" for index in range(50)]
+
+    shard_zero = assign_tabero_reset_episode_names(
+        episode_names,
+        num_envs=28,
+        shard_id=0,
+        total_shards=2,
+        rollout_round=0,
+    )
+    shard_one = assign_tabero_reset_episode_names(
+        episode_names,
+        num_envs=28,
+        shard_id=1,
+        total_shards=2,
+        rollout_round=0,
+    )
+    next_round = assign_tabero_reset_episode_names(
+        episode_names,
+        num_envs=28,
+        shard_id=0,
+        total_shards=2,
+        rollout_round=1,
+    )
+
+    assert shard_zero == [f"demo_{index}" for index in range(28)]
+    assert shard_one[:22] == [f"demo_{index}" for index in range(28, 50)]
+    assert shard_one[22:] == [f"demo_{index}" for index in range(6)]
+    assert next_round[0] == "demo_6"
+
+
+def test_stack_tabero_initial_states_concatenates_nested_tensor_batches():
+    states = [
+        {
+            "articulation": {
+                "robot": {"joint_position": torch.tensor([[float(index), index + 0.5]])}
+            },
+            "rigid_object": {
+                "object": {"root_pose": torch.tensor([[float(index), 0.0, 1.0]])}
+            },
+        }
+        for index in range(3)
+    ]
+
+    stacked = stack_tabero_initial_states(states)
+
+    torch.testing.assert_close(
+        stacked["articulation"]["robot"]["joint_position"],
+        torch.tensor([[0.0, 0.5], [1.0, 1.5], [2.0, 2.5]]),
+    )
+    assert stacked["rigid_object"]["object"]["root_pose"].shape == (3, 3)
+
+
+def test_hdf5_reset_wrapper_skips_bootstrap_then_applies_cyclic_states():
+    class FakeEpisode:
+        def __init__(self, value):
+            self.data = {"initial_state": {}}
+            self._value = value
+
+        def get_initial_state(self):
+            return {
+                "rigid_object": {
+                    "object": {"root_pose": torch.tensor([[float(self._value), 0.0]])}
+                }
+            }
+
+    class FakeHandler:
+        def __init__(self):
+            self.closed = False
+
+        def load_episode(self, episode_name, device):
+            return FakeEpisode(int(episode_name.removeprefix("demo_")))
+
+        def close(self):
+            self.closed = True
+
+    class FakeEnv:
+        num_envs = 2
+        device = torch.device("cpu")
+
+        def __init__(self):
+            self.reset_calls = []
+            self.reset_to_calls = []
+
+        def reset(self, seed=None, env_ids=None):
+            self.reset_calls.append((seed, env_ids))
+            return {"policy": "random"}, {"source": "random"}
+
+        def reset_to(self, state, env_ids, is_relative=False):
+            self.reset_to_calls.append((state, env_ids.clone(), is_relative))
+            return {"policy": "dataset"}, {"source": "dataset"}
+
+        def close(self):
+            pass
+
+    env = FakeEnv()
+    handler = FakeHandler()
+    wrapped = TaberoHdf5ResetWrapper(
+        env,
+        dataset_handler=handler,
+        episode_names=["demo_0", "demo_1", "demo_2"],
+        shard_id=0,
+        total_shards=1,
+    )
+
+    bootstrap_obs, _ = wrapped.reset(seed=42)
+    rollout_obs, _ = wrapped.reset(seed=43)
+
+    assert bootstrap_obs["policy"] == "random"
+    assert rollout_obs["policy"] == "dataset"
+    assert len(env.reset_calls) == 2
+    assert len(env.reset_to_calls) == 1
+    state, env_ids, is_relative = env.reset_to_calls[0]
+    torch.testing.assert_close(env_ids, torch.tensor([0, 1]))
+    torch.testing.assert_close(
+        state["rigid_object"]["object"]["root_pose"],
+        torch.tensor([[0.0, 0.0], [1.0, 0.0]]),
+    )
+    assert is_relative is True
+
+    wrapped.close()
+    assert handler.closed is True
 
 
 def test_ensure_tabero_root_task_description_backfills_assigned_prompt():
@@ -647,6 +774,23 @@ def test_prompt_conditions_pair_firm_and_gentle_and_rotate_deterministically():
     assert any(word in first_prompts[0].lower() for word in ("firmly", "tightly"))
     assert any(word in first_prompts[1].lower() for word in ("gently", "softly"))
     assert next_prompts != first_prompts
+
+
+def test_disabled_prompt_conditions_keep_original_instruction():
+    build_prompts = getattr(tabero_tacfield, "build_tabero_conditioned_prompts")
+    instruction = "pick up the butter and place it in the basket"
+
+    prompts, condition_ids = build_prompts(
+        instruction=instruction,
+        task_suite="libero_object",
+        task_id=6,
+        num_envs=4,
+        prompt_cfg=OmegaConf.create({"enabled": False}),
+        rollout_round=0,
+    )
+
+    assert prompts == [instruction] * 4
+    assert condition_ids == []
 
 
 def test_prompt_conditions_require_firm_gentle_pairs():

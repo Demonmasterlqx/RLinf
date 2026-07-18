@@ -14,6 +14,7 @@
 
 from pathlib import Path
 
+import pytest
 from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 from torch import nn
@@ -356,3 +357,169 @@ def test_tabero_full_lora_stable_success_smoke_composes_for_two_tasks(monkeypatc
         "gentle": 3.0,
     }
     assert cfg.env.train.video_cfg.save_video is True
+
+
+@pytest.mark.parametrize("num_envs", [36, 72, 126])
+def test_tabero_task6_full_lora_config_scales_global_batch(monkeypatch, num_envs):
+    config_dir = Path(__file__).parents[2] / "examples" / "embodiment" / "config"
+    monkeypatch.setenv("EMBODIED_PATH", str(config_dir.parent))
+
+    with initialize_config_dir(config_dir=str(config_dir), version_base=None):
+        cfg = compose(
+            config_name="isaaclab_pi0_peft_lora_both_tacfield_tabero_task6_stable_success",
+            overrides=[
+                f"env.train.total_num_envs={num_envs}",
+                f"actor.global_batch_size={num_envs}",
+            ],
+        )
+
+    assert cfg.actor.model.lora_target == "both"
+    assert cfg.actor.global_batch_size == num_envs
+    assert cfg.env.train.total_num_envs == num_envs
+    assert cfg.env.train.init_params.prompt_conditions.enabled is False
+    assert OmegaConf.to_container(cfg.env.train.init_params.tasks) == [
+        {"task_suite": "libero_object", "task_id": 6}
+    ]
+
+
+def test_tabero_task8_gentle_full_lora_config_scales_rollout_batch(monkeypatch):
+    config_dir = Path(__file__).parents[2] / "examples" / "embodiment" / "config"
+    monkeypatch.setenv("EMBODIED_PATH", str(config_dir.parent))
+
+    with initialize_config_dir(config_dir=str(config_dir), version_base=None):
+        cfg = compose(
+            config_name=(
+                "isaaclab_pi0_peft_lora_both_tacfield_tabero_"
+                "task8_gentle_stable_success"
+            )
+        )
+
+    assert cfg.actor.model.lora_target == "both"
+    assert OmegaConf.to_container(cfg.cluster.component_placement) == {
+        "actor": "2-3",
+        "rollout": "0-1",
+        "env": "0-1",
+    }
+    assert cfg.env.train.total_num_envs == 56
+    assert cfg.env.train.rollout_epoch == 2
+    assert cfg.actor.global_batch_size == 112
+    assert cfg.actor.micro_batch_size == 2
+    assert cfg.actor.enable_offload is False
+    assert cfg.actor.fsdp_config.sharding_strategy == "no_shard"
+    assert cfg.env.train.init_params.task_id == 8
+    assert OmegaConf.to_container(cfg.env.train.init_params.tasks) == [
+        {"task_suite": "libero_object", "task_id": 8}
+    ]
+    assert cfg.env.train.init_params.success.required_consecutive_steps == 8
+    assert cfg.env.train.init_params.success.condition_reward_multipliers is None
+    prompt_cfg = cfg.env.train.init_params.prompt_conditions
+    assert prompt_cfg.enabled is True
+    assert prompt_cfg.assignment == "cyclic"
+    assert list(prompt_cfg.condition_cycle) == ["gentle"]
+    assert list(prompt_cfg.gentle_adverbs) == ["gently", "softly"]
+    assert list(cfg.runner.logger.logger_backends) == ["tensorboard", "wandb"]
+    assert cfg.actor.model.openpi.tactile_loss_weight == 0.0
+
+
+def test_tabero_task8_gentle_smoke_config_composes_as_primary(monkeypatch):
+    config_dir = Path(__file__).parents[2] / "examples" / "embodiment" / "config"
+    monkeypatch.setenv("EMBODIED_PATH", str(config_dir.parent))
+
+    with initialize_config_dir(config_dir=str(config_dir), version_base=None):
+        cfg = compose(
+            config_name=(
+                "isaaclab_pi0_peft_lora_both_tacfield_tabero_"
+                "task8_gentle_stable_success_smoke"
+            )
+        )
+
+    assert OmegaConf.to_container(cfg.cluster.component_placement) == {
+        "actor": 3,
+        "rollout": "0-1",
+        "env": "0-1",
+    }
+    assert cfg.env.train.total_num_envs == 4
+    assert cfg.env.train.rollout_epoch == 1
+    assert cfg.env.train.max_steps_per_rollout_epoch == 10
+    assert cfg.actor.global_batch_size == 4
+    assert cfg.algorithm.normalize_advantages is False
+    assert cfg.env.train.video_cfg.save_video is True
+    assert list(cfg.env.train.init_params.prompt_conditions.condition_cycle) == [
+        "gentle"
+    ]
+
+
+def test_tabero_task5_firm_long_config_composes_for_168_trajectories(monkeypatch):
+    config_dir = Path(__file__).parents[2] / "examples" / "embodiment" / "config"
+    monkeypatch.setenv("EMBODIED_PATH", str(config_dir.parent))
+
+    with initialize_config_dir(config_dir=str(config_dir), version_base=None):
+        cfg = compose(
+            config_name=("isaaclab_pi0_peft_lora_both_tacfield_tabero_task5_firm_long")
+        )
+
+    assert OmegaConf.to_container(cfg.cluster.component_placement) == {
+        "actor": "2-3",
+        "rollout": "0-1",
+        "env": "0-1",
+    }
+    assert cfg.runner.max_epochs == 100
+    assert cfg.runner.save_interval == 5
+    assert list(cfg.runner.logger.logger_backends) == ["tensorboard", "wandb"]
+    assert cfg.env.train.total_num_envs == 42
+    assert cfg.env.train.rollout_epoch == 4
+    assert cfg.env.train.max_episode_steps == 360
+    assert cfg.env.train.max_steps_per_rollout_epoch == 360
+    assert cfg.actor.global_batch_size == 168
+    assert cfg.actor.micro_batch_size == 2
+    assert cfg.algorithm.update_epoch == 1
+    assert cfg.algorithm.normalize_advantages is True
+    assert cfg.actor.model.lora_target == "both"
+    assert cfg.actor.fsdp_config.sharding_strategy == "no_shard"
+    assert cfg.actor.fsdp_config.checkpoint_format == "dcp"
+    assert cfg.actor.fsdp_config.save_trainable_model_weights is True
+    assert cfg.env.train.init_params.task_id == 5
+    assert OmegaConf.to_container(cfg.env.train.init_params.tasks) == [
+        {"task_suite": "libero_object", "task_id": 5}
+    ]
+    assert str(cfg.env.train.init_params.hdf5_initial_states_path).endswith(
+        "libero_object_task5_pick_up_the_tomato_sauce_and_place_it_in_the_basket_demo.hdf5"
+    )
+    prompt_cfg = cfg.env.train.init_params.prompt_conditions
+    assert prompt_cfg.enabled is True
+    assert prompt_cfg.assignment == "cyclic"
+    assert list(prompt_cfg.condition_cycle) == ["firm"]
+    assert list(prompt_cfg.firm_adverbs) == ["firmly", "tightly"]
+    assert cfg.env.train.video_cfg.save_video is False
+    assert cfg.env.eval.video_cfg.save_video is False
+
+
+def test_tabero_task5_firm_long_smoke_config_composes(monkeypatch):
+    config_dir = Path(__file__).parents[2] / "examples" / "embodiment" / "config"
+    monkeypatch.setenv("EMBODIED_PATH", str(config_dir.parent))
+
+    with initialize_config_dir(config_dir=str(config_dir), version_base=None):
+        cfg = compose(
+            config_name=(
+                "isaaclab_pi0_peft_lora_both_tacfield_tabero_task5_firm_long_smoke"
+            )
+        )
+
+    assert OmegaConf.to_container(cfg.cluster.component_placement) == {
+        "actor": 3,
+        "rollout": "0-1",
+        "env": "0-1",
+    }
+    assert cfg.runner.max_epochs == 1
+    assert cfg.runner.save_interval == 1
+    assert list(cfg.runner.logger.logger_backends) == ["tensorboard", "wandb"]
+    assert cfg.env.train.total_num_envs == 4
+    assert cfg.env.train.rollout_epoch == 1
+    assert cfg.env.train.max_episode_steps == 20
+    assert cfg.env.train.max_steps_per_rollout_epoch == 20
+    assert cfg.actor.global_batch_size == 4
+    assert cfg.actor.micro_batch_size == 1
+    assert cfg.algorithm.normalize_advantages is False
+    assert cfg.env.train.init_params.task_id == 5
+    assert list(cfg.env.train.init_params.prompt_conditions.condition_cycle) == ["firm"]
+    assert cfg.env.train.video_cfg.save_video is False
