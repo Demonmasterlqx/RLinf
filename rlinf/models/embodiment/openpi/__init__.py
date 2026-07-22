@@ -87,6 +87,9 @@ def get_model(cfg: DictConfig, torch_dtype=None):
             all_state_dict.update(state_dict)
         model.load_state_dict(all_state_dict, strict=False)
 
+    if actor_model_config.rlt_train_module_only:
+        model.freeze_non_rlt_parameters()
+
     model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
     # fsdp replace
     # model.paligemma_with_expert.replace_gemma_decoder_layers()

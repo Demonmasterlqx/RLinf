@@ -115,6 +115,7 @@ class OpenPi0Config(Pi0Config):
 
     # ===== RLT SFT parameters =====
     use_rlt: bool = False
+    rlt_train_module_only: bool = False
     rlt_alpha: float = 1.0
     rlt_input_dim: int = 2048
     rlt_embed_dim: int = 2048
@@ -129,6 +130,8 @@ class OpenPi0Config(Pi0Config):
 
     def __post_init__(self):
         super().__post_init__()
+        if self.rlt_train_module_only and not self.use_rlt:
+            raise ValueError("rlt_train_module_only=True requires use_rlt=True.")
         if self.tactile_dim_in is None:
             object.__setattr__(self, "tactile_dim_in", self.tactile_dim)
         if self.effective_action_dim is None:
@@ -314,6 +317,13 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             setattr(module, "_fsdp_wrap_name", path_parts[-1] if path_parts else name)
 
         self.torch_compile_enabled = False
+
+    def freeze_non_rlt_parameters(self):
+        """Freeze the VLA backbone and keep only the Stage 1 RLT module trainable."""
+        if not hasattr(self, "rlt_module"):
+            raise ValueError("RLT-only training requires an initialized rlt_module.")
+        for name, parameter in self.named_parameters():
+            parameter.requires_grad = name.startswith("rlt_module.")
 
     def _replace_projection_layers_for_config(self):
         """Align PyTorch projection layers with checkpoint action dimension."""
@@ -529,6 +539,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             actions = data["actions"]
 
         device = next(self.parameters()).device
+        tactile_prefix = getattr(observation, "tactile_prefix", None)
         register_pytree_dataclasses(observation)
         observation = tree_map(
             lambda x: (
@@ -538,6 +549,25 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             ),
             observation,
         )
+        if tactile_prefix is not None:
+            object.__setattr__(
+                observation,
+                "tactile_prefix",
+                torch.as_tensor(tactile_prefix, device=device).contiguous().clone(),
+            )
+
+        if self.config.use_rlt and self.config.rlt_train_module_only:
+            prefix_output, prefix_mask = self._extract_rlt_prefix_embeddings(
+                observation, train=True
+            )
+            rlt_param = next(self.rlt_module.parameters())
+            prefix_output = prefix_output.to(
+                device=rlt_param.device, dtype=rlt_param.dtype
+            )
+            rlt_mask = prefix_mask if self.config.rlt_use_mask else None
+            rlt_loss, _ = self.rlt_module(prefix_output, rlt_mask)
+            return {"loss": rlt_loss, "rlt_loss": rlt_loss}
+
         if not isinstance(actions, torch.Tensor):
             actions = torch.as_tensor(actions, device=device)
         else:
@@ -569,8 +599,8 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         }
 
     def _sft_forward_with_rlt_prefix(self, observation, actions):
-        images, img_masks, lang_tokens, lang_masks, state = (
-            self._preprocess_observation(observation, train=True)
+        images, img_masks, lang_tokens, lang_masks, state, tactile_prefix = (
+            self._preprocess_observation_with_tactile(observation, train=True)
         )
 
         noise = self.sample_noise(actions.shape, actions.device)
@@ -581,7 +611,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         u_t = noise - actions
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks
+            images, img_masks, lang_tokens, lang_masks, tactile_prefix
         )
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = (
             self.embed_suffix(state, x_t, time)
@@ -632,13 +662,19 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         loss = F.mse_loss(u_t, v_t, reduction="none")
 
         prefix_output, prefix_pad_masks = self._select_rlt_prefix_embeddings(
-            prefix_output.detach(), prefix_pad_masks, lang_tokens
+            prefix_output.detach(),
+            prefix_pad_masks,
+            lang_tokens,
+            tactile_token_count=int(
+                self.tactile_prefix_encoder is not None
+                and tactile_prefix is not None
+            ),
         )
         return loss, prefix_output, prefix_pad_masks
 
     def _build_rlt_prefix_cache(self, observation, *, train: bool):
-        images, img_masks, lang_tokens, lang_masks, state = (
-            self._preprocess_observation(observation, train=train)
+        images, img_masks, lang_tokens, lang_masks, state, tactile_prefix = (
+            self._preprocess_observation_with_tactile(observation, train=train)
         )
         device = next(self.parameters()).device
         images = [img.to(device) for img in images]
@@ -648,29 +684,70 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         if lang_masks is not None:
             lang_masks = lang_masks.to(device)
         state = state.to(device)
+        if tactile_prefix is not None:
+            tactile_prefix = tactile_prefix.to(device)
 
         prefix_output, prefix_pad_masks, past_key_values = self._build_prefix_cache(
-            images, img_masks, lang_tokens, lang_masks
+            images, img_masks, lang_tokens, lang_masks, tactile_prefix
         )
-        return prefix_output, prefix_pad_masks, past_key_values, lang_tokens, state
+        tactile_token_count = int(
+            getattr(self, "tactile_prefix_encoder", None) is not None
+            and tactile_prefix is not None
+        )
+        return (
+            prefix_output,
+            prefix_pad_masks,
+            past_key_values,
+            lang_tokens,
+            state,
+            tactile_token_count,
+        )
 
     def _select_rlt_prefix_embeddings(
-        self, prefix_output, prefix_pad_masks, lang_tokens
+        self,
+        prefix_output,
+        prefix_pad_masks,
+        lang_tokens,
+        tactile_token_count: int = 0,
     ):
         if self.config.rlt_image_only and lang_tokens is not None:
-            num_image_tokens = prefix_output.shape[1] - lang_tokens.shape[1]
-            prefix_output = prefix_output[:, :num_image_tokens]
-            prefix_pad_masks = prefix_pad_masks[:, :num_image_tokens]
+            num_image_tokens = (
+                prefix_output.shape[1]
+                - lang_tokens.shape[1]
+                - tactile_token_count
+            )
+            image_output = prefix_output[:, :num_image_tokens]
+            image_masks = prefix_pad_masks[:, :num_image_tokens]
+            if tactile_token_count:
+                prefix_output = torch.cat(
+                    [image_output, prefix_output[:, -tactile_token_count:]], dim=1
+                )
+                prefix_pad_masks = torch.cat(
+                    [image_masks, prefix_pad_masks[:, -tactile_token_count:]], dim=1
+                )
+            else:
+                prefix_output = image_output
+                prefix_pad_masks = image_masks
         return prefix_output, prefix_pad_masks
 
     def _extract_rlt_prefix_embeddings(self, observation, *, train: bool):
         with torch.no_grad():
-            prefix_output, prefix_pad_masks, _, lang_tokens, _ = (
+            (
+                prefix_output,
+                prefix_pad_masks,
+                _,
+                lang_tokens,
+                _,
+                tactile_token_count,
+            ) = (
                 self._build_rlt_prefix_cache(observation, train=train)
             )
 
         return self._select_rlt_prefix_embeddings(
-            prefix_output, prefix_pad_masks, lang_tokens
+            prefix_output,
+            prefix_pad_masks,
+            lang_tokens,
+            tactile_token_count=tactile_token_count,
         )
 
     def _select_configured_state(self, states):
@@ -706,13 +783,21 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         to_process_obs = self.obs_processor(env_obs)
         processed_obs = self.input_transform(to_process_obs, transpose=False)
         processed_obs = self.precision_processor(processed_obs)
-        observation = _model.Observation.from_dict(processed_obs)
+        observation = self._observation_from_dict(processed_obs)
 
-        prefix_output, prefix_pad_masks, past_key_values, lang_tokens, state = (
-            self._build_rlt_prefix_cache(observation, train=False)
-        )
+        (
+            prefix_output,
+            prefix_pad_masks,
+            past_key_values,
+            lang_tokens,
+            state,
+            tactile_token_count,
+        ) = self._build_rlt_prefix_cache(observation, train=False)
         rlt_prefix_output, rlt_prefix_mask = self._select_rlt_prefix_embeddings(
-            prefix_output, prefix_pad_masks, lang_tokens
+            prefix_output,
+            prefix_pad_masks,
+            lang_tokens,
+            tactile_token_count=tactile_token_count,
         )
         rlt_param = next(self.rlt_module.parameters())
         rlt_prefix_output = rlt_prefix_output.to(

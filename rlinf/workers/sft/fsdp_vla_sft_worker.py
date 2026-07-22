@@ -25,6 +25,28 @@ from rlinf.utils.utils import get_rng_state, set_rng_state
 from rlinf.workers.sft.fsdp_sft_worker import FSDPSftWorker
 
 
+class _OpenPiTactileDataLoader:
+    """Preserve RLinf-local tactile fields dropped by OpenPI Observation."""
+
+    def __init__(self, delegate):
+        self._delegate = delegate
+        self._data_loader = delegate._data_loader
+
+    def data_config(self):
+        return self._delegate.data_config()
+
+    def __iter__(self):
+        from openpi.models import model as _model
+
+        for batch in self._data_loader:
+            observation = _model.Observation.from_dict(batch)
+            if "tactile_prefix" in batch:
+                object.__setattr__(
+                    observation, "tactile_prefix", batch["tactile_prefix"]
+                )
+            yield observation, batch["actions"]
+
+
 class FSDPVlaSftWorker(FSDPSftWorker):
     def __init__(self, cfg: DictConfig):
         super().__init__(cfg)
@@ -52,6 +74,7 @@ class FSDPVlaSftWorker(FSDPSftWorker):
             data_loader = openpi_data_loader.create_data_loader(
                 config, framework="pytorch", shuffle=True
             )
+            data_loader = _OpenPiTactileDataLoader(data_loader)
             return data_loader, data_loader.data_config()
         elif SupportedModel(self.cfg.actor.model.model_type) in [
             SupportedModel.LINGBOTVLA
