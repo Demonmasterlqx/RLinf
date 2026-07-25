@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import queue
 
 import torch
@@ -492,13 +493,68 @@ class RLTACReplayMixin:
         bsz = int(trajectory.actions.shape[1])
         num_rows = int(actions.shape[0])
         auto_reset = bool(self.cfg.env.train.get("auto_reset", False))
+        bootstrap_fields = (
+            trajectory.rewards,
+            trajectory.dones,
+            trajectory.terminations,
+            trajectory.truncations,
+        )
+        extra_slots = {
+            int(value.shape[0]) - traj_len
+            for value in bootstrap_fields
+            if isinstance(value, torch.Tensor) and value.shape[0] > traj_len
+        }
+        if len(extra_slots) > 1:
+            raise ValueError(
+                "RLT reward and terminal fields disagree on the number of "
+                f"rollout bootstrap slots: {sorted(extra_slots)}."
+            )
+        epoch_count = extra_slots.pop() if extra_slots else 1
+        if traj_len % epoch_count != 0:
+            raise ValueError(
+                f"RLT trajectory length {traj_len} is not divisible by "
+                f"rollout epoch count {epoch_count}."
+            )
+        epoch_len = traj_len // epoch_count
+
+        def aligned_field_step(value: torch.Tensor, action_step: int) -> int:
+            if value.shape[0] == traj_len:
+                return action_step
+            if value.shape[0] == traj_len + epoch_count:
+                return action_step + action_step // epoch_len + 1
+            raise ValueError(
+                f"RLT tensor has unsupported time length {value.shape[0]}; "
+                f"expected {traj_len} action-aligned steps or "
+                f"{traj_len + epoch_count} steps including one bootstrap "
+                "slot per rollout epoch."
+            )
 
         for env_idx in range(bsz):
+            episode_done = False
             for t in range(traj_len):
+                if t % epoch_len == 0:
+                    episode_done = False
+                if episode_done:
+                    continue
                 idx = t * bsz + env_idx
                 if idx >= num_rows:
                     break
+                done_value = trajectory.dones
+                step_done = False
+                if isinstance(done_value, torch.Tensor):
+                    done_step = aligned_field_step(done_value, t)
+                    step_done = bool(
+                        done_value[done_step, env_idx]
+                        .detach()
+                        .to(torch.bool)
+                        .reshape(-1)
+                        .any()
+                    )
                 if not self._flat_record_transition(flat, idx):
+                    if step_done:
+                        completed_episodes += 1
+                        if not auto_reset:
+                            episode_done = True
                     continue
 
                 transition = Trajectory(
@@ -506,9 +562,15 @@ class RLTACReplayMixin:
                     model_weights_id=trajectory.model_weights_id,
                 )
                 for field_name in tensor_fields:
-                    value = flat.get(field_name)
-                    if isinstance(value, torch.Tensor) and idx < value.shape[0]:
-                        setattr(transition, field_name, self._row_tensor(value, idx))
+                    value = getattr(trajectory, field_name, None)
+                    if not isinstance(value, torch.Tensor):
+                        continue
+                    field_step = aligned_field_step(value, t)
+                    setattr(
+                        transition,
+                        field_name,
+                        self._step_env_tensor(value, field_step, env_idx),
+                    )
                 for field_name in dict_fields:
                     value = flat.get(field_name)
                     if isinstance(value, dict):
@@ -525,34 +587,7 @@ class RLTACReplayMixin:
                     )
                 transition.curr_obs = curr_obs
 
-                # Dones have one extra initial slot, so transition t reads
-                # terminal flags from t+1. Rewards are already action-aligned
-                # by EmbodiedRolloutResult because the initial empty reward is
-                # skipped and the final reward is appended after rollout.
-                done_idx = min(
-                    t + 1,
-                    int(trajectory.dones.shape[0]) - 1
-                    if isinstance(trajectory.dones, torch.Tensor)
-                    else traj_len - 1,
-                )
-                for done_field in ("dones", "terminations", "truncations"):
-                    done_value = getattr(trajectory, done_field, None)
-                    if (
-                        isinstance(done_value, torch.Tensor)
-                        and done_idx < done_value.shape[0]
-                        and env_idx < done_value.shape[1]
-                    ):
-                        setattr(
-                            transition,
-                            done_field,
-                            self._step_env_tensor(done_value, done_idx, env_idx),
-                        )
-
-                is_done = (
-                    isinstance(transition.dones, torch.Tensor)
-                    and transition.dones.reshape(-1).to(torch.bool).any()
-                )
-                if is_done:
+                if step_done:
                     next_obs = curr_obs
                 else:
                     next_obs = self._rlt_obs_from_flat_dict(flat, "next_obs", idx)
@@ -566,29 +601,78 @@ class RLTACReplayMixin:
                     )
 
                 replay_trajectories.append(transition)
-                if is_done:
+                if step_done:
                     completed_episodes += 1
                     if not auto_reset:
-                        break
+                        episode_done = True
 
         return replay_trajectories, completed_episodes
 
     def _transition_replay_metrics(
         self,
         replay_trajectories: list[Trajectory],
+        *,
+        reduce_metrics: bool = True,
     ) -> dict[str, float]:
-        metrics = {"replay/transition_count": float(len(replay_trajectories))}
+        sum_stats = {
+            "transition_count": float(len(replay_trajectories)),
+            "action_count": 0.0,
+            "action_saturation_count": 0.0,
+            "reward_count": 0.0,
+            "reward_sum": 0.0,
+            "reward_positive_count": 0.0,
+            "done_count": 0.0,
+            "done_true_count": 0.0,
+        }
+        max_stats = {
+            "normalized_action_abs_max": 0.0,
+            "physical_force_abs_max": 0.0,
+        }
+        action_tensors = [
+            traj.actions.detach().float().reshape(-1)
+            for traj in replay_trajectories
+            if isinstance(traj.actions, torch.Tensor) and traj.actions.numel() > 0
+        ]
+        if action_tensors:
+            actions = torch.cat(action_tensors)
+            action_bound = float(
+                self.cfg.actor.model.get("normalized_action_bound", 1.0)
+            )
+            max_stats["normalized_action_abs_max"] = float(
+                actions.abs().max().item()
+            )
+            sum_stats["action_count"] = float(actions.numel())
+            sum_stats["action_saturation_count"] = float(
+                (actions.abs() >= 0.99 * action_bound).sum().item()
+            )
+
+        action_dim = int(self.cfg.actor.model.get("action_dim", 13))
+        physical_force_tensors = []
+        for traj in replay_trajectories:
+            environment_action = traj.forward_inputs.get("environment_action")
+            if not isinstance(environment_action, torch.Tensor):
+                continue
+            physical_actions = environment_action.detach().float().reshape(
+                -1, action_dim
+            )
+            if action_dim > 7:
+                physical_force_tensors.append(physical_actions[:, 7:])
+        if physical_force_tensors:
+            physical_forces = torch.cat(physical_force_tensors)
+            max_stats["physical_force_abs_max"] = float(
+                physical_forces.abs().max().item()
+            )
+
         reward_values = [
             reward
             for traj in replay_trajectories
             if (reward := self._transition_reward_value(traj)) is not None
         ]
         if reward_values:
-            metrics["replay/reward_mean"] = float(
-                sum(reward_values) / len(reward_values)
-            )
-            metrics["replay/reward_positive_rate"] = float(
-                sum(reward > 0.0 for reward in reward_values) / len(reward_values)
+            sum_stats["reward_count"] = float(len(reward_values))
+            sum_stats["reward_sum"] = float(sum(reward_values))
+            sum_stats["reward_positive_count"] = float(
+                sum(reward > 0.0 for reward in reward_values)
             )
         done_values = [
             done
@@ -596,14 +680,51 @@ class RLTACReplayMixin:
             if (done := self._transition_done_value(traj)) is not None
         ]
         if done_values:
-            metrics["replay/done_rate"] = float(
-                sum(bool(done) for done in done_values) / len(done_values)
+            sum_stats["done_count"] = float(len(done_values))
+            sum_stats["done_true_count"] = float(
+                sum(bool(done) for done in done_values)
+            )
+
+        if (
+            reduce_metrics
+            and torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+        ):
+            sum_stats = all_reduce_dict(
+                sum_stats, op=torch.distributed.ReduceOp.SUM
+            )
+            max_stats = all_reduce_dict(
+                max_stats, op=torch.distributed.ReduceOp.MAX
+            )
+        metrics = {
+            "replay/transition_count": sum_stats["transition_count"],
+            "replay/normalized_action_abs_max": max_stats[
+                "normalized_action_abs_max"
+            ],
+            "replay/physical_force_abs_max": max_stats["physical_force_abs_max"],
+        }
+        if sum_stats["action_count"] > 0:
+            metrics["replay/normalized_action_saturation_ratio"] = (
+                sum_stats["action_saturation_count"] / sum_stats["action_count"]
+            )
+        if sum_stats["reward_count"] > 0:
+            metrics["replay/reward_mean"] = (
+                sum_stats["reward_sum"] / sum_stats["reward_count"]
+            )
+            metrics["replay/reward_positive_rate"] = (
+                sum_stats["reward_positive_count"] / sum_stats["reward_count"]
+            )
+        if sum_stats["done_count"] > 0:
+            metrics["replay/done_rate"] = (
+                sum_stats["done_true_count"] / sum_stats["done_count"]
             )
         return metrics
 
     def _ingest_rollout_trajectories(
         self,
         recv_list: list[Trajectory],
+        *,
+        reduce_metrics: bool = True,
     ) -> tuple[int, int]:
         self._last_replay_metrics = {}
 
@@ -618,8 +739,13 @@ class RLTACReplayMixin:
                 replay_list.extend(transition_trajs)
                 completed += completed_count
             self._last_replay_metrics = {
-                **self._transition_replay_metrics(replay_list),
-                **collect_trajectory_replay_metrics(recv_list, reducer=all_reduce_dict),
+                **self._transition_replay_metrics(
+                    replay_list, reduce_metrics=reduce_metrics
+                ),
+                **collect_trajectory_replay_metrics(
+                    recv_list,
+                    reducer=all_reduce_dict if reduce_metrics else None,
+                ),
             }
             self.replay_buffer.add_trajectories(replay_list)
 
@@ -650,7 +776,8 @@ class RLTACReplayMixin:
         added = sum(self._trajectory_transition_count(traj) for traj in recv_list)
         completed = sum(self._trajectory_completed_episodes(traj) for traj in recv_list)
         self._last_replay_metrics = collect_trajectory_replay_metrics(
-            recv_list, reducer=all_reduce_dict
+            recv_list,
+            reducer=all_reduce_dict if reduce_metrics else None,
         )
         return added, completed
 
@@ -665,11 +792,21 @@ class RLTACReplayMixin:
         self.total_episodes_added += completed
 
 
-class RLTACFSDPPolicy(RLTACLossMixin, RLTACReplayMixin, EmbodiedSACFSDPPolicy):
-    """Synchronous RLT AC worker with transition replay and warmup scheduling."""
+class RLTACScheduleCheckpointMixin:
+    """Persist Python-side RLT routing and learner schedule state per rank."""
 
-    def __init__(self, cfg):
-        super().__init__(cfg)
+    _RLT_CHECKPOINT_FIELDS = (
+        "update_step",
+        "transitions_since_train",
+        "episodes_since_train",
+        "total_transitions_added",
+        "total_episodes_added",
+        "_warmup_ready_total_transitions",
+        "_warmup_ready_total_episodes",
+        "pending_update_budget",
+    )
+
+    def _init_rlt_schedule_state(self, cfg) -> None:
         self.rlt_schedule_cfg = cfg.algorithm.get("rlt_schedule", {}) or {}
         self.use_rlt_schedule = bool(self.rlt_schedule_cfg.get("enable", False))
         self.transitions_since_train = 0
@@ -679,6 +816,131 @@ class RLTACFSDPPolicy(RLTACLossMixin, RLTACReplayMixin, EmbodiedSACFSDPPolicy):
         self._warmup_ready_total_transitions: int | None = None
         self._warmup_ready_total_episodes: int | None = None
         self.pending_update_budget = 0
+
+    def _rlt_checkpoint_path(self, base_path: str) -> str:
+        return os.path.join(
+            base_path,
+            "sac_components",
+            "rlt_schedule",
+            f"checkpoint_rank_{self._rank}.pt",
+        )
+
+    def save_checkpoint(self, save_base_path, step):
+        super().save_checkpoint(save_base_path, step)
+        state_path = self._rlt_checkpoint_path(save_base_path)
+        os.makedirs(os.path.dirname(state_path), exist_ok=True)
+        state = {
+            field: getattr(self, field) for field in self._RLT_CHECKPOINT_FIELDS
+        }
+        state["global_step"] = int(step)
+        torch.save(state, state_path)
+
+    def load_checkpoint(self, load_base_path):
+        super().load_checkpoint(load_base_path)
+        if not self.use_rlt_schedule:
+            return
+        state_path = self._rlt_checkpoint_path(load_base_path)
+        state = None
+        local_error: Exception | None = None
+        try:
+            if not os.path.isfile(state_path):
+                raise FileNotFoundError(
+                    "RLT schedule state is required to resume actor routing and "
+                    f"learner schedules, but it is missing: {state_path}"
+                )
+            state = torch.load(state_path, map_location="cpu", weights_only=True)
+            required_fields = (*self._RLT_CHECKPOINT_FIELDS, "global_step")
+            missing = [field for field in required_fields if field not in state]
+            if missing:
+                raise ValueError(
+                    f"RLT checkpoint {state_path} is missing fields: {missing}."
+                )
+            checkpoint_dir = os.path.basename(
+                os.path.dirname(os.path.normpath(load_base_path))
+            )
+            if checkpoint_dir.startswith("global_step_"):
+                expected_global_step = int(
+                    checkpoint_dir.removeprefix("global_step_")
+                )
+                if int(state["global_step"]) != expected_global_step:
+                    raise ValueError(
+                        "RLT checkpoint global step mismatch: sidecar contains "
+                        f"{state['global_step']}, path requires "
+                        f"{expected_global_step}."
+                    )
+        # Every rank must reach the error gather even when one sidecar is
+        # unreadable or malformed, otherwise peers can hang in a collective.
+        except Exception as error:  # noqa: BLE001
+            local_error = error
+
+        distributed = (
+            torch.distributed.is_available() and torch.distributed.is_initialized()
+        )
+        if distributed:
+            gathered_errors: list[str | None] = [
+                None
+            ] * torch.distributed.get_world_size()
+            torch.distributed.all_gather_object(
+                gathered_errors,
+                None if local_error is None else str(local_error),
+            )
+            rank_errors = [
+                f"rank {rank}: {error}"
+                for rank, error in enumerate(gathered_errors)
+                if error is not None
+            ]
+            if rank_errors:
+                raise ValueError(
+                    "RLT checkpoint sidecar validation failed across actor ranks: "
+                    + "; ".join(rank_errors)
+                )
+        elif local_error is not None:
+            raise local_error
+
+        assert state is not None
+        if distributed:
+            consistency_fields = (
+                "global_step",
+                "update_step",
+                "_warmup_ready_total_transitions",
+                "_warmup_ready_total_episodes",
+                "pending_update_budget",
+            )
+            encoded = {
+                field: -1 if state[field] is None else int(state[field])
+                for field in consistency_fields
+            }
+            minimums = all_reduce_dict(
+                encoded, dtype=torch.int64, op=torch.distributed.ReduceOp.MIN
+            )
+            maximums = all_reduce_dict(
+                encoded, dtype=torch.int64, op=torch.distributed.ReduceOp.MAX
+            )
+            divergent = [
+                field
+                for field in consistency_fields
+                if int(minimums[field]) != int(maximums[field])
+            ]
+            if divergent:
+                raise ValueError(
+                    "RLT checkpoint cross-rank schedule state mismatch for "
+                    f"fields: {divergent}."
+                )
+        for field in self._RLT_CHECKPOINT_FIELDS:
+            setattr(self, field, state[field])
+
+
+class RLTACFSDPPolicy(
+    RLTACScheduleCheckpointMixin,
+    RLTACLossMixin,
+    RLTACReplayMixin,
+    EmbodiedSACFSDPPolicy,
+):
+    """Synchronous RLT AC worker with transition replay and warmup scheduling."""
+
+    def __init__(self, cfg):
+        super().__init__(cfg)
+        self._init_rlt_schedule_state(cfg)
 
     def setup_sac_components(self):
         """Initialize replay components and let RLT schedule own readiness."""
@@ -876,6 +1138,11 @@ class RLTACFSDPPolicy(RLTACLossMixin, RLTACReplayMixin, EmbodiedSACFSDPPolicy):
         )
         append_to_dict(metrics, schedule_metrics)
         mean_metric_dict = self.process_train_metrics(metrics)
+        mean_metric_dict["rlt/update_step"] = float(self.update_step)
+        mean_metric_dict["rlt/ready_for_online"] = float(
+            int(self.update_step)
+            >= int(self.rlt_schedule_cfg.get("warmup_post_collect_updates", 0))
+        )
         self.transitions_since_train = 0
         self.episodes_since_train = 0
 
@@ -886,12 +1153,14 @@ class RLTACFSDPPolicy(RLTACLossMixin, RLTACReplayMixin, EmbodiedSACFSDPPolicy):
 
 
 class AsyncRLTACFSDPPolicy(
-    RLTACLossMixin, RLTACReplayMixin, AsyncEmbodiedSACFSDPPolicy
+    RLTACScheduleCheckpointMixin,
+    RLTACLossMixin,
+    RLTACReplayMixin,
+    AsyncEmbodiedSACFSDPPolicy,
 ):
     def __init__(self, cfg):
         super().__init__(cfg)
-        self.rlt_schedule_cfg = cfg.algorithm.get("rlt_schedule", {}) or {}
-        self.use_rlt_schedule = bool(self.rlt_schedule_cfg.get("enable", False))
+        self._init_rlt_schedule_state(cfg)
 
     def _drain_received_trajectories(self, max_trajectories: int | None = None):
         if getattr(self, "_recv_queue", None) is None:
@@ -909,7 +1178,9 @@ class AsyncRLTACFSDPPolicy(
         if not recv_list:
             return
 
-        added, completed = self._ingest_rollout_trajectories(recv_list)
+        added, completed = self._ingest_rollout_trajectories(
+            recv_list, reduce_metrics=False
+        )
         self._update_rollout_ingest_counters(added, completed)
 
     async def run_training(self):

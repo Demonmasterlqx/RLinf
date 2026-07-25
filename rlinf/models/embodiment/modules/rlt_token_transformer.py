@@ -313,9 +313,14 @@ class RLTTokenTransformer(nn.Module):
     ) -> torch.Tensor:
         return self.encode(prefix_embs, mask).reshape(prefix_embs.shape[0], -1)
 
+    def discard_decoder(self) -> None:
+        self.decoder = None
+
     def decode(
         self, rl_tokens: torch.Tensor, target_seq_len: int | None = None
     ) -> torch.Tensor:
+        if self.decoder is None:
+            raise RuntimeError("RLT decoder was discarded for Stage 2 inference.")
         return self.decoder(rl_tokens, target_seq_len)
 
     def reconstruct(

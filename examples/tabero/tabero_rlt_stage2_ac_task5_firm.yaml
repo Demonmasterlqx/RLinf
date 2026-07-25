@@ -1,0 +1,358 @@
+# Copyright 2026 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# IsaacLab launch prerequisite from the RLinf root:
+# source isaac_sim/setup_conda_env.sh
+# export PYTHONPATH=$PWD:$PYTHONPATH  # preserve the paths added above
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+  job_logging:
+    version: 1
+    formatters:
+      simple:
+        format: "%(message)s"
+    handlers:
+      console:
+        class: logging.StreamHandler
+        formatter: simple
+        stream: ext://sys.stdout
+    root:
+      level: INFO
+      handlers: [console]
+    disable_existing_loggers: false
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor: "0-7"
+    rollout: "0:0,7:1"
+    env: "0:0,7:1"
+
+runner:
+  task_type: embodied
+  logger:
+    log_path: "/data/home/sim6g/code/tabero/results/tabero_rlt_stage2_task5_firm_20260722"
+    project_name: "tabero-rlinf"
+    experiment_name: "tabero_rlt_stage2_task5_firm"
+    logger_backends: ["tensorboard", "wandb"]
+  max_epochs: 100
+  max_steps: -1
+  only_eval: false
+  weight_sync_interval: 1
+  val_check_interval: -1
+  save_interval: 5
+  resume_dir: null
+  ckpt_path: null
+
+algorithm:
+  update_epoch: 1
+  rlt_schedule:
+    enable: true
+    transition_replay: true
+    max_updates_per_train_step: 500
+    # Replay readiness is checked per actor rank. Each rank receives
+    # 2 envs x 4 epochs x 36 chunks = 288 transitions per global step.
+    warmup_min_size: 256
+    warmup_post_collect_updates: 2000
+    train_every_episodes: 0
+    train_every_transitions: 32
+  rlt_route:
+    actor_scope: "full_task"
+  group_size: 1
+  adv_type: "embodied_sac"
+  loss_type: "rlt_ac"
+  loss_agg_func: "token-mean"
+  agg_q: "min"
+  actor_agg_q: "q1"
+  enable_drq: false
+  q_head_type: ${actor.model.q_head_type}
+  bootstrap_type: "standard"
+  gamma: 0.995
+  tau: 0.005
+  q_weight: 0.45
+  bc_weight: 2.5
+  reference_dropout_prob: 0.0
+  actor_weight_schedule:
+    enable: true
+    warmup_updates: 2000
+    ramp_updates: 5000
+    warmup_bc_weight: 7.0
+    warmup_q_weight: 0.05
+    online_bc_weight: 2.5
+    online_q_weight: 0.45
+  entropy_tuning:
+    alpha_type: "fixed_alpha"
+    initial_alpha: 0.0
+    optim:
+      lr: 1.0e-4
+      lr_scheduler: "torch_constant"
+      clip_grad: 10.0
+  replay_buffer:
+    enable_cache: true
+    cache_size: 10000
+    sample_window_size: 100000
+    max_num_samples: 100000
+    min_buffer_size: 1
+    auto_save: true
+  target_update_freq: 1
+  target_update_type: "all"
+  train_actor_steps: 1000
+  critic_actor_ratio: 4
+  critic_subsample_size: 0
+  backup_entropy: false
+
+env:
+  group_name: "EnvGroup"
+  train:
+    env_type: "isaaclab"
+    rollout_epoch: 4
+    total_num_envs: 16
+    auto_reset: false
+    ignore_terminations: false
+    use_rel_reward: false
+    seed: 42
+    group_size: 1
+    reward_coef: 1.0
+    use_fixed_reset_state_ids: true
+    max_steps_per_rollout_epoch: 360
+    max_episode_steps: 360
+    video_cfg:
+      save_video: false
+      info_on_video: true
+      fps: 20
+      video_base_dir: ${runner.logger.log_path}/video/train
+    init_params:
+      id: "Isaac-Libero-Franka-Hybrid-Tactile-v0"
+      num_envs: null
+      max_episode_steps: ${..max_episode_steps}
+      task_description: "pick up the tomato sauce and place it in the basket"
+      extension_path: "/data/home/sim6g/code/tabero/Tabero/source/tac_manip"
+      libero_config_dir: "/data/home/sim6g/code/tabero/Tabero/benchmarks/datasets/libero/config"
+      libero_assets_dir: "/data/home/sim6g/code/tabero/Tabero/benchmarks/datasets/libero/USD"
+      hdf5_initial_states_path: "/data/home/sim6g/code/tabero/Tabero/benchmarks/datasets/libero/assembled_hdf5/libero_object_task5_pick_up_the_tomato_sauce_and_place_it_in_the_basket_demo.hdf5"
+      hdf5_reset_assignment: "cyclic"
+      task_suite: "libero_object"
+      task_id: 5
+      tasks:
+        - task_suite: "libero_object"
+          task_id: 5
+      require_all_tasks_active: true
+      success:
+        required_consecutive_steps: 8
+        terminal_reward: 1.0
+        condition_reward_multipliers: null
+      prompt_conditions:
+        enabled: true
+        assignment: "cyclic"
+        condition_cycle: ["firm"]
+        firm_adverbs: ["firmly", "tightly"]
+        gentle_adverbs: ["gently", "softly"]
+        prompt_seed: 0
+      use_relative_mode: false
+      marker_history_len: 8
+      combined_marker_count: 198
+      main_image_key: "agentview_rgb"
+      wrist_image_key: "eye_in_hand_rgb"
+      marker_motion_key: "gripper_marker_motion"
+      force_key: null
+      agentview_cam:
+        height: 256
+        width: 256
+      eye_in_hand_cam:
+        height: 256
+        width: 256
+  eval:
+    env_type: "isaaclab"
+    rollout_epoch: 25
+    total_num_envs: 2
+    auto_reset: false
+    ignore_terminations: false
+    use_rel_reward: false
+    seed: 11
+    group_size: 1
+    reward_coef: 1.0
+    use_fixed_reset_state_ids: true
+    max_steps_per_rollout_epoch: 360
+    max_episode_steps: 360
+    policy_mode: "eval"
+    video_cfg:
+      save_video: false
+      info_on_video: true
+      fps: 20
+      video_base_dir: ${runner.logger.log_path}/video/eval
+    init_params:
+      id: "Isaac-Libero-Franka-Hybrid-Tactile-v0"
+      num_envs: null
+      max_episode_steps: ${..max_episode_steps}
+      task_description: "pick up the tomato sauce and place it in the basket"
+      extension_path: "/data/home/sim6g/code/tabero/Tabero/source/tac_manip"
+      libero_config_dir: "/data/home/sim6g/code/tabero/Tabero/benchmarks/datasets/libero/config"
+      libero_assets_dir: "/data/home/sim6g/code/tabero/Tabero/benchmarks/datasets/libero/USD"
+      hdf5_initial_states_path: "/data/home/sim6g/code/tabero/Tabero/benchmarks/datasets/libero/assembled_hdf5/libero_object_task5_pick_up_the_tomato_sauce_and_place_it_in_the_basket_demo.hdf5"
+      hdf5_reset_assignment: "cyclic"
+      task_suite: "libero_object"
+      task_id: 5
+      tasks:
+        - task_suite: "libero_object"
+          task_id: 5
+      require_all_tasks_active: true
+      success:
+        required_consecutive_steps: 8
+        terminal_reward: 1.0
+        condition_reward_multipliers: null
+      prompt_conditions:
+        enabled: true
+        assignment: "cyclic"
+        condition_cycle: ["firm"]
+        firm_adverbs: ["firmly", "tightly"]
+        gentle_adverbs: ["gently", "softly"]
+        prompt_seed: 0
+      use_relative_mode: false
+      marker_history_len: 8
+      combined_marker_count: 198
+      main_image_key: "agentview_rgb"
+      wrist_image_key: "eye_in_hand_rgb"
+      marker_motion_key: "gripper_marker_motion"
+      force_key: null
+      agentview_cam:
+        height: 256
+        width: 256
+      eye_in_hand_cam:
+        height: 256
+        width: 256
+
+rollout:
+  group_name: "RolloutGroup"
+  backend: "huggingface"
+  enable_offload: false
+  pipeline_stage_num: 1
+  collect_transitions: true
+  collect_prev_infos: true
+  model:
+    model_type: ${actor.model.model_type}
+    model_path: ""
+    precision: ${actor.model.precision}
+    policy_setup: ${actor.model.policy_setup}
+    action_dim: ${actor.model.action_dim}
+    num_action_chunks: ${actor.model.num_action_chunks}
+    ref_num_action_chunks: ${actor.model.ref_num_action_chunks}
+    z_dim: ${actor.model.z_dim}
+    proprio_dim: ${actor.model.proprio_dim}
+    add_q_head: ${actor.model.add_q_head}
+    q_head_type: ${actor.model.q_head_type}
+    fixed_std: ${actor.model.fixed_std}
+    normalized_action_bound: ${actor.model.normalized_action_bound}
+    is_lora: false
+    lora_rank: 32
+  rlt_feature_model:
+    model_type: "openpi"
+    model_path: "/data/home/sim6g/code/tabero/results/tabero_rlt_stage1_20260721_tactile_fixed/tabero_rlt_stage1_tacfield_tactile_fixed/checkpoints/global_step_2000/actor"
+    precision: null
+    num_action_chunks: 10
+    action_dim: 13
+    add_value_head: false
+    is_lora: false
+    lora_rank: 32
+    openpi_data:
+      norm_stats_path: "/data/home/sim6g/code/tabero/models/pi0_lora_tacfield_tabero_safetensors/assets/NathanWu7/tabero/norm_stats.json"
+    openpi:
+      config_name: "pi0_lora_tacfield_tabero"
+      num_images_in_input: 2
+      train_expert_only: true
+      action_chunk: 10
+      action_env_dim: 13
+      num_steps: 10
+      tactile_loss_weight: 0.0
+      use_rlt: true
+      rlt_train_module_only: false
+      rlt_stage2_encoder_only: true
+      rlt_action_space: "model_normalized"
+      rlt_use_normalized_proprio: true
+      rlt_alpha: 1.0
+      rlt_input_dim: 2048
+      rlt_embed_dim: 2048
+      rlt_num_rl_tokens: 1
+      rlt_prefix_seq_len: 1024
+      rlt_num_layers: 2
+      rlt_num_heads: 8
+      rlt_mlp_ratio: 4.0
+      rlt_image_only: false
+      rlt_use_mask: true
+  enable_torch_compile: false
+  enable_cuda_graph: false
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 32
+  global_batch_size: 512
+  seed: 42
+  enable_offload: false
+  model:
+    model_type: "rlt_mlp_policy"
+    model_path: ""
+    precision: "fp32"
+    policy_setup: "tabero-eef-state"
+    action_dim: 13
+    num_action_chunks: 10
+    ref_num_action_chunks: 10
+    z_dim: 2048
+    proprio_dim: 7
+    add_value_head: false
+    add_q_head: true
+    q_head_type: "default"
+    fixed_std: 0.05
+    normalized_action_bound: 4.0
+    is_lora: false
+    lora_rank: 32
+  optim:
+    clip_grad: 10.0
+    lr: 1.0e-4
+    lr_scheduler: "torch_constant"
+  critic_optim:
+    clip_grad: 10.0
+    lr: 1.0e-4
+    lr_scheduler: "torch_constant"
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "no_shard"
+    use_orig_params: false
+    cpu_offload: false
+    save_trainable_model_weights: true
+    checkpoint_format: "dcp"
+    mixed_precision:
+      param_dtype: ${actor.model.precision}
+      reduce_dtype: ${actor.model.precision}
+      buffer_dtype: ${actor.model.precision}
+
+weight_syncer:
+  type: "patch"
+  patch:
+    snapshot_device: "cpu"
+    delta_encoding: true
+    compression: "none"
+    init_sync:
+      enabled: true
+      prefixes: null
+      bucket_size: 134217728
+
+reward:
+  use_reward_model: false
+
+critic:
+  use_critic_model: false

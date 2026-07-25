@@ -147,9 +147,24 @@ class RealworldRLTRoute(RLTRoute):
 class SimulatorRLTRoute(RLTRoute):
     """Actor/ref/expert routing for ManiSkill RLT with schedule warmup."""
 
-    def __init__(self, *, use_schedule: bool, warmup_updates: int):
+    def __init__(
+        self,
+        *,
+        use_schedule: bool,
+        warmup_updates: int,
+        actor_scope: Literal["env_switch", "full_task"] = "env_switch",
+        standalone_eval: bool = False,
+        action_space: Literal["environment", "model_normalized"] = "environment",
+    ):
+        if actor_scope not in ("env_switch", "full_task"):
+            raise ValueError(f"Unsupported RLT actor_scope: {actor_scope!r}.")
+        if action_space not in ("environment", "model_normalized"):
+            raise ValueError(f"Unsupported RLT action_space: {action_space!r}.")
         self.use_schedule = use_schedule
         self.warmup_updates = warmup_updates
+        self.actor_scope = actor_scope
+        self.standalone_eval = bool(standalone_eval)
+        self.action_space = action_space
 
     def _ready_for_online(self, version: int) -> bool:
         return not self.use_schedule or int(version) >= self.warmup_updates
@@ -158,14 +173,24 @@ class SimulatorRLTRoute(RLTRoute):
         actions = ctx.student_actions
         result = ctx.result
         batch_size, chunk_len, action_dim = actions.shape
-        ready_for_online = self._ready_for_online(ctx.version)
+        # Standalone evaluation loads a policy checkpoint directly and does not
+        # run weight sync, so its rollout version remains zero. Periodic
+        # validation during training must still obey the warmup schedule.
+        ready_for_online = (
+            ctx.mode == "eval" and self.standalone_eval
+        ) or self._ready_for_online(ctx.version)
 
-        critical_phase = _last_info_bool(
-            ctx.rlt_switch_flags,
-            batch_size=batch_size,
-            device=actions.device,
-            default=False,
-        )
+        if self.actor_scope == "full_task":
+            critical_phase = torch.ones(
+                batch_size, dtype=torch.bool, device=actions.device
+            )
+        else:
+            critical_phase = _last_info_bool(
+                ctx.rlt_switch_flags,
+                batch_size=batch_size,
+                device=actions.device,
+                default=False,
+            )
         actor_switch = critical_phase
         if self.use_schedule:
             actor_switch = actor_switch & torch.full(
@@ -219,6 +244,7 @@ class SimulatorRLTRoute(RLTRoute):
                 action_dim=action_dim,
                 device=actions.device,
                 dtype=actions.dtype,
+                action_space=self.action_space,
             )
             routed_actions = torch.where(
                 expert_takeover[:, None, None],
@@ -239,8 +265,17 @@ class SimulatorRLTRoute(RLTRoute):
 def build_rlt_route(cfg: Any) -> RLTRoute:
     if use_simulator_transition_replay(cfg):
         schedule_cfg = cfg.algorithm.get("rlt_schedule", {}) or {}
+        route_cfg = cfg.algorithm.get("rlt_route", {}) or {}
+        rollout_cfg = cfg.get("rollout", {}) or {}
+        feature_cfg = rollout_cfg.get("rlt_feature_model", {}) or {}
+        openpi_cfg = feature_cfg.get("openpi", {}) or {}
         return SimulatorRLTRoute(
             use_schedule=bool(schedule_cfg.get("enable", False)),
             warmup_updates=int(schedule_cfg.get("warmup_post_collect_updates", 0)),
+            actor_scope=str(route_cfg.get("actor_scope", "env_switch")),
+            standalone_eval=bool(
+                getattr(getattr(cfg, "runner", None), "only_eval", False)
+            ),
+            action_space=str(openpi_cfg.get("rlt_action_space", "environment")),
         )
     return RealworldRLTRoute()

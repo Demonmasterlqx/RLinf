@@ -20,6 +20,14 @@ import torch
 from omegaconf import DictConfig
 
 
+def _prepare_stage2_feature_model(model, actor_model_config) -> None:
+    if not actor_model_config.rlt_stage2_encoder_only:
+        return
+    if not actor_model_config.use_rlt or not hasattr(model, "rlt_module"):
+        raise ValueError("rlt_stage2_encoder_only=True requires an RLT module.")
+    model.rlt_module.discard_decoder()
+
+
 def get_model(cfg: DictConfig, torch_dtype=None):
     import glob
 
@@ -86,6 +94,8 @@ def get_model(cfg: DictConfig, torch_dtype=None):
             state_dict = safetensors.torch.load_file(weight_path, device="cpu")
             all_state_dict.update(state_dict)
         model.load_state_dict(all_state_dict, strict=False)
+
+    _prepare_stage2_feature_model(model, actor_model_config)
 
     if actor_model_config.rlt_train_module_only:
         model.freeze_non_rlt_parameters()

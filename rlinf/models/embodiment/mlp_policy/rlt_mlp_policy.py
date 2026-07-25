@@ -37,6 +37,7 @@ class RLTMLPPolicy(MLPPolicy):
         add_q_head: bool = True,
         q_head_type: str = "default",
         fixed_std: float = 0.002,
+        normalized_action_bound: float = 1.0,
     ):
         if not add_q_head:
             raise ValueError(
@@ -77,6 +78,12 @@ class RLTMLPPolicy(MLPPolicy):
         self.fixed_std = float(fixed_std)
         if self.fixed_std <= 0:
             raise ValueError(f"fixed_std must be positive, got {self.fixed_std}.")
+        self.normalized_action_bound = float(normalized_action_bound)
+        if self.normalized_action_bound <= 0:
+            raise ValueError(
+                "normalized_action_bound must be positive, got "
+                f"{self.normalized_action_bound}."
+            )
 
     def preprocess_env_obs(self, env_obs):
         device = next(self.parameters()).device
@@ -152,9 +159,12 @@ class RLTMLPPolicy(MLPPolicy):
         action_mean = self.actor_mean(feat)
         action_std = torch.full_like(action_mean, self.fixed_std)
         probs = Normal(action_mean, action_std)
-        action = action_mean if deterministic else probs.rsample()
-        chunk_logprobs = probs.log_prob(action)
-        action = torch.tanh(action)
+        raw_action = action_mean if deterministic else probs.rsample()
+        squashed_action = torch.tanh(raw_action / self.normalized_action_bound)
+        action = self.normalized_action_bound * squashed_action
+        chunk_logprobs = probs.log_prob(raw_action) - torch.log(
+            1.0 - squashed_action.square() + 1.0e-6
+        )
         return action, chunk_logprobs, None
 
     def sac_q_forward(self, obs, actions, shared_feature=None, detach_encoder=False):

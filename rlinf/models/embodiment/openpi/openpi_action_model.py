@@ -126,6 +126,9 @@ class OpenPi0Config(Pi0Config):
     rlt_mlp_ratio: float = 4.0
     rlt_image_only: bool = True
     rlt_use_mask: bool = False
+    rlt_action_space: str = "environment"
+    rlt_use_normalized_proprio: bool = False
+    rlt_stage2_encoder_only: bool = False
     state_indices: list[int] | None = None
 
     def __post_init__(self):
@@ -772,6 +775,58 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             return states.index_select(-1, index_tensor)
         return np.asarray(states)[..., indices]
 
+    def _prepare_rlt_reference_chunk(self, outputs, observation):
+        if self.config.rlt_action_space == "model_normalized":
+            return outputs["actions"][
+                :, : self.config.action_chunk, : self.config.action_env_dim
+            ]
+        return self.output_transform(
+            self._make_output_transform_input(outputs["actions"], observation)
+        )["actions"]
+
+    def _prepare_rlt_proprio(self, raw_states, normalized_state):
+        if not self.config.rlt_use_normalized_proprio:
+            return self._select_configured_state(raw_states)
+
+        raw_state_dim = (
+            raw_states.shape[-1]
+            if hasattr(raw_states, "shape")
+            else np.asarray(raw_states).shape[-1]
+        )
+        return self._select_configured_state(
+            normalized_state[..., :raw_state_dim]
+        )
+
+    @torch.no_grad()
+    def decode_rlt_actions(
+        self,
+        normalized_actions: torch.Tensor,
+        env_obs: dict[str, Any],
+    ) -> torch.Tensor:
+        model_action_dim = int(self.config.action_dim)
+        if normalized_actions.shape[-1] > model_action_dim:
+            raise ValueError(
+                "RLT action width exceeds the OpenPI model action width: "
+                f"{normalized_actions.shape[-1]} > {model_action_dim}."
+            )
+
+        to_process_obs = self.obs_processor(env_obs)
+        processed_obs = self.input_transform(to_process_obs, transpose=False)
+        processed_obs = self.precision_processor(processed_obs)
+        observation = self._observation_from_dict(processed_obs)
+
+        padded_actions = torch.zeros(
+            *normalized_actions.shape[:-1],
+            model_action_dim,
+            device=normalized_actions.device,
+            dtype=normalized_actions.dtype,
+        )
+        padded_actions[..., : normalized_actions.shape[-1]] = normalized_actions
+        decoded = self.output_transform(
+            self._make_output_transform_input(padded_actions, observation)
+        )["actions"]
+        return decoded[..., : self.config.action_env_dim]
+
     @torch.no_grad()
     def extract_rlt_obs(
         self,
@@ -816,14 +871,13 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             mode="eval",
             compute_values=False,
         )
-        ref_chunk = self.output_transform(
-            {"actions": outputs["actions"], "state": observation.state}
-        )["actions"]
-        raw_proprio = self._select_configured_state(env_obs["states"])
-        if (
+        ref_chunk = self._prepare_rlt_reference_chunk(outputs, observation)
+        use_legacy_maniskill_normalized_proprio = (
             isinstance(self.config.config_name, str)
             and "maniskill" in self.config.config_name.lower()
-        ):
+        )
+        if use_legacy_maniskill_normalized_proprio:
+            raw_proprio = self._select_configured_state(env_obs["states"])
             state_dim = (
                 raw_proprio.shape[-1]
                 if hasattr(raw_proprio, "shape")
@@ -831,7 +885,9 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             )
             proprio = observation.state[..., :state_dim]
         else:
-            proprio = raw_proprio
+            proprio = self._prepare_rlt_proprio(
+                env_obs["states"], observation.state
+            )
         if not torch.is_tensor(proprio):
             proprio = torch.as_tensor(proprio)
 

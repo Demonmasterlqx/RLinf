@@ -81,4 +81,12 @@ def predict_rlt_actions(
             final_obs=final_obs,
         )
 
+        if getattr(feature_model.config, "rlt_action_space", "environment") == (
+            "model_normalized"
+        ):
+            actions = feature_model.decode_rlt_actions(actions, env_obs)
+            result["forward_inputs"]["environment_action"] = actions.reshape(
+                actions.shape[0], -1
+            ).detach()
+
     return actions, result
