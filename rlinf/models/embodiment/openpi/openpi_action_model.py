@@ -106,6 +106,8 @@ class OpenPi0Config(Pi0Config):
     dsrl_agg_q: str = "mean"  # Q aggregation method: 'mean' | 'min'
     dsrl_image_latent_dim: int = 64  # Latent dim for lightweight image encoder
     dsrl_state_latent_dim: int = 64  # Hidden dim for state encoder
+    dsrl_use_tactile: bool = False  # Include TacField history in DSRL steering
+    dsrl_tactile_latent_dim: int = 64  # Latent dim for each tactile encoder
     dsrl_hidden_dims: tuple = field(
         default_factory=lambda: (128, 128, 128)
     )  # Hidden dims for Q-head and GaussianPolicy
@@ -258,61 +260,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
 
         # ===== DSRL components initialization =====
         if self.config.use_dsrl:
-            from rlinf.models.embodiment.modules.compact_encoders import (
-                CompactMultiQHead,
-                CompactStateEncoder,
-                LightweightImageEncoder64,
-            )
-            from rlinf.models.embodiment.modules.gaussian_policy import GaussianPolicy
-
-            # Use explicit bfloat16 to match the backbone dtype that will be
-            # loaded from the checkpoint later.  At __init__ time the backbone
-            # parameters are still float32 (weights are loaded afterwards by
-            # safetensors.torch.load_model), so next(self.parameters()).dtype
-            # would incorrectly return float32.  Hardcoding bfloat16 here
-            # ensures all parameters share a single dtype when FSDP creates
-            # its FlatParameter, avoiding the writeback shape-mismatch error.
-            _dsrl_dtype = torch.bfloat16
-
-            dsrl_input_dim = (
-                self.config.dsrl_state_latent_dim + self.config.dsrl_image_latent_dim
-            )  # e.g. 64 + 64 = 128
-
-            self.dsrl_action_noise_net = GaussianPolicy(
-                input_dim=dsrl_input_dim,
-                output_dim=self.config.dsrl_action_noise_dim,
-                hidden_dims=self.config.dsrl_hidden_dims,
-                low=None,
-                high=None,
-                action_horizon=self.config.action_horizon,
-            ).to(dtype=_dsrl_dtype)
-
-            self.actor_image_encoder = LightweightImageEncoder64(
-                num_images=1,
-                latent_dim=self.config.dsrl_image_latent_dim,
-                image_size=64,
-            ).to(dtype=_dsrl_dtype)
-            self.actor_state_encoder = CompactStateEncoder(
-                state_dim=self.config.dsrl_state_dim,
-                hidden_dim=self.config.dsrl_state_latent_dim,
-            ).to(dtype=_dsrl_dtype)
-            self.critic_image_encoder = LightweightImageEncoder64(
-                num_images=1,
-                latent_dim=self.config.dsrl_image_latent_dim,
-                image_size=64,
-            ).to(dtype=_dsrl_dtype)
-            self.critic_state_encoder = CompactStateEncoder(
-                state_dim=self.config.dsrl_state_dim,
-                hidden_dim=self.config.dsrl_state_latent_dim,
-            ).to(dtype=_dsrl_dtype)
-            self.q_head = CompactMultiQHead(
-                state_dim=self.config.dsrl_state_latent_dim,
-                image_dim=self.config.dsrl_image_latent_dim,
-                action_dim=self.config.dsrl_action_noise_dim,
-                hidden_dims=self.config.dsrl_hidden_dims,
-                num_q_heads=self.config.dsrl_num_q_heads,
-                output_dim=1,
-            ).to(dtype=_dsrl_dtype)
+            self._init_dsrl_components()
 
         for name, module in self.named_modules():
             # Set _fsdp_wrap_name to the last part of the path (e.g., "model.action_in_proj" -> "action_in_proj")
@@ -327,6 +275,90 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             raise ValueError("RLT-only training requires an initialized rlt_module.")
         for name, parameter in self.named_parameters():
             parameter.requires_grad = name.startswith("rlt_module.")
+
+    def freeze_non_dsrl_parameters(self):
+        """Freeze the Pi0 backbone and keep only DSRL steering modules trainable."""
+        if not self.config.use_dsrl or not hasattr(self, "dsrl_action_noise_net"):
+            raise ValueError("DSRL-only training requires initialized DSRL modules.")
+        trainable_prefixes = (
+            "dsrl_action_noise_net.",
+            "actor_image_encoder.",
+            "actor_state_encoder.",
+            "actor_tactile_encoder.",
+            "critic_image_encoder.",
+            "critic_state_encoder.",
+            "critic_tactile_encoder.",
+            "q_head.",
+        )
+        for name, parameter in self.named_parameters():
+            parameter.requires_grad = name.startswith(trainable_prefixes)
+
+    def _init_dsrl_components(self):
+        from rlinf.models.embodiment.modules.compact_encoders import (
+            CompactMultiQHead,
+            CompactStateEncoder,
+            LightweightImageEncoder64,
+        )
+        from rlinf.models.embodiment.modules.gaussian_policy import GaussianPolicy
+
+        # Match the checkpoint backbone dtype before safetensors loading so FSDP
+        # observes a single parameter dtype when it creates FlatParameters.
+        dsrl_dtype = torch.bfloat16
+        tactile_latent_dim = (
+            self.config.dsrl_tactile_latent_dim if self.config.dsrl_use_tactile else 0
+        )
+        state_side_dim = self.config.dsrl_state_latent_dim + tactile_latent_dim
+        dsrl_input_dim = state_side_dim + self.config.dsrl_image_latent_dim
+
+        self.dsrl_action_noise_net = GaussianPolicy(
+            input_dim=dsrl_input_dim,
+            output_dim=self.config.dsrl_action_noise_dim,
+            hidden_dims=self.config.dsrl_hidden_dims,
+            low=None,
+            high=None,
+            action_horizon=self.config.action_horizon,
+        ).to(dtype=dsrl_dtype)
+        self.actor_image_encoder = LightweightImageEncoder64(
+            num_images=1,
+            latent_dim=self.config.dsrl_image_latent_dim,
+            image_size=64,
+        ).to(dtype=dsrl_dtype)
+        self.actor_state_encoder = CompactStateEncoder(
+            state_dim=self.config.dsrl_state_dim,
+            hidden_dim=self.config.dsrl_state_latent_dim,
+        ).to(dtype=dsrl_dtype)
+        self.critic_image_encoder = LightweightImageEncoder64(
+            num_images=1,
+            latent_dim=self.config.dsrl_image_latent_dim,
+            image_size=64,
+        ).to(dtype=dsrl_dtype)
+        self.critic_state_encoder = CompactStateEncoder(
+            state_dim=self.config.dsrl_state_dim,
+            hidden_dim=self.config.dsrl_state_latent_dim,
+        ).to(dtype=dsrl_dtype)
+        if self.config.dsrl_use_tactile:
+            tactile_encoder_kwargs = {
+                "input_dim": 396,
+                "hidden_dim": self.config.dsrl_tactile_latent_dim,
+                "output_dim": self.config.dsrl_tactile_latent_dim,
+                "history_len": 8,
+                "has_reference_frame": True,
+                "diff_from_reference": False,
+            }
+            self.actor_tactile_encoder = TactileTCNEncoder(**tactile_encoder_kwargs).to(
+                dtype=dsrl_dtype
+            )
+            self.critic_tactile_encoder = TactileTCNEncoder(
+                **tactile_encoder_kwargs
+            ).to(dtype=dsrl_dtype)
+        self.q_head = CompactMultiQHead(
+            state_dim=state_side_dim,
+            image_dim=self.config.dsrl_image_latent_dim,
+            action_dim=self.config.dsrl_action_noise_dim,
+            hidden_dims=self.config.dsrl_hidden_dims,
+            num_q_heads=self.config.dsrl_num_q_heads,
+            output_dim=1,
+        ).to(dtype=dsrl_dtype)
 
     def _replace_projection_layers_for_config(self):
         """Align PyTorch projection layers with checkpoint action dimension."""
@@ -669,8 +701,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             prefix_pad_masks,
             lang_tokens,
             tactile_token_count=int(
-                self.tactile_prefix_encoder is not None
-                and tactile_prefix is not None
+                self.tactile_prefix_encoder is not None and tactile_prefix is not None
             ),
         )
         return loss, prefix_output, prefix_pad_masks
@@ -715,9 +746,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
     ):
         if self.config.rlt_image_only and lang_tokens is not None:
             num_image_tokens = (
-                prefix_output.shape[1]
-                - lang_tokens.shape[1]
-                - tactile_token_count
+                prefix_output.shape[1] - lang_tokens.shape[1] - tactile_token_count
             )
             image_output = prefix_output[:, :num_image_tokens]
             image_masks = prefix_pad_masks[:, :num_image_tokens]
@@ -742,9 +771,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 lang_tokens,
                 _,
                 tactile_token_count,
-            ) = (
-                self._build_rlt_prefix_cache(observation, train=train)
-            )
+            ) = self._build_rlt_prefix_cache(observation, train=train)
 
         return self._select_rlt_prefix_embeddings(
             prefix_output,
@@ -793,9 +820,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             if hasattr(raw_states, "shape")
             else np.asarray(raw_states).shape[-1]
         )
-        return self._select_configured_state(
-            normalized_state[..., :raw_state_dim]
-        )
+        return self._select_configured_state(normalized_state[..., :raw_state_dim])
 
     @torch.no_grad()
     def decode_rlt_actions(
@@ -885,9 +910,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             )
             proprio = observation.state[..., :state_dim]
         else:
-            proprio = self._prepare_rlt_proprio(
-                env_obs["states"], observation.state
-            )
+            proprio = self._prepare_rlt_proprio(env_obs["states"], observation.state)
         if not torch.is_tensor(proprio):
             proprio = torch.as_tensor(proprio)
 
@@ -1157,6 +1180,15 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         compute_values=True,
         **kwargs,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
+        if self.config.use_dsrl and self.config.dsrl_use_tactile:
+            main_images = env_obs.get("main_images")
+            batch_size = (
+                main_images.shape[0]
+                if torch.is_tensor(main_images) and main_images.ndim > 0
+                else None
+            )
+            self._validate_dsrl_tactile(env_obs, batch_size=batch_size)
+
         to_process_obs = self.obs_processor(env_obs)  # env obs -> policy input obs
         processed_obs = self.input_transform(
             to_process_obs, transpose=False
@@ -1171,8 +1203,12 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             # DSRL mode (both train and eval)
 
             # Step 1: SAC agent outputs noise
-            dsrl_obs = {"images": [env_obs["main_images"]], "states": env_obs["states"]}
-
+            dsrl_obs = {
+                "images": [env_obs["main_images"]],
+                "states": env_obs["states"],
+            }
+            if "tactile_marker_motion" in env_obs:
+                dsrl_obs["tactile_marker_motion"] = env_obs["tactile_marker_motion"]
             noise_actions, noise_logprob, _ = self.sac_forward(
                 dsrl_obs, train=False, mode=mode
             )
@@ -1786,6 +1822,50 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
 
     # ===== DSRL-specific methods =====
 
+    def _normalize_dsrl_obs(self, obs):
+        """Convert environment observations without dropping optional TacField data."""
+        if "images" in obs:
+            return obs
+        if "main_images" not in obs:
+            raise ValueError(
+                f"Invalid obs format: {obs.keys()}. Expected 'images' or "
+                "'main_images' key."
+            )
+        normalized = {
+            "images": [obs["main_images"]],
+            "states": obs["states"],
+        }
+        if "tactile_marker_motion" in obs:
+            normalized["tactile_marker_motion"] = obs["tactile_marker_motion"]
+        return normalized
+
+    def _validate_dsrl_tactile(self, obs, *, batch_size):
+        key = "tactile_marker_motion"
+        if key not in obs:
+            raise ValueError(
+                f"DSRL tactile mode requires '{key}'; available keys={list(obs.keys())}."
+            )
+        tactile = obs[key]
+        actual_shape = tuple(tactile.shape) if hasattr(tactile, "shape") else None
+        expected_shape = (batch_size, 9, 198, 2)
+        if (
+            batch_size is None
+            or not torch.is_tensor(tactile)
+            or actual_shape != expected_shape
+        ):
+            raise ValueError(
+                f"DSRL tactile '{key}' expected shape {expected_shape}, "
+                f"got {actual_shape}."
+            )
+        return tactile
+
+    def _prepare_dsrl_tactile(self, obs, *, batch_size, encoder):
+        tactile = self._validate_dsrl_tactile(obs, batch_size=batch_size)
+        parameter = next(encoder.parameters())
+        return tactile.reshape(batch_size, 9, 396).to(
+            device=parameter.device, dtype=parameter.dtype
+        )
+
     def sac_forward(
         self, obs=None, data=None, train=False, return_dist_params=False, **kwargs
     ):
@@ -1812,17 +1892,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         if obs is None:
             obs = data.get("obs", data) if data is not None else kwargs.get("obs", {})
 
-        # Handle two obs formats:
-        # Format 1 (internal): {"images": [...], "states": ...}
-        # Format 2 (env): {"main_images": ..., "wrist_images": ..., "states": ...}
-        if "images" not in obs:
-            # Convert env format to internal format
-            if "main_images" in obs:
-                obs = {"images": [obs["main_images"]], "states": obs["states"]}
-            else:
-                raise ValueError(
-                    f"Invalid obs format: {obs.keys()}. Expected 'images' or 'main_images' key."
-                )
+        obs = self._normalize_dsrl_obs(obs)
 
         # Preprocess images: resize to 64x64, use only agentview camera
         # Returns [B, 1, C, 64, 64] in [-1, 1] range (float32)
@@ -1833,11 +1903,21 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         device = next(self.actor_image_encoder.parameters()).device
         images = images.to(device=device, dtype=torch.bfloat16)
         states = states.to(device=device, dtype=torch.bfloat16)
+        tactile = None
+        if self.config.dsrl_use_tactile:
+            tactile = self._prepare_dsrl_tactile(
+                obs,
+                batch_size=states.shape[0],
+                encoder=self.actor_tactile_encoder,
+            )
 
         # Extract features (using actor's independent encoder)
         image_features = self.actor_image_encoder(images)  # [B, 64]
         state_features = self.actor_state_encoder(states)  # [B, 64]
-        features = torch.cat([state_features, image_features], dim=-1)  # [B, 128]
+        features = [state_features, image_features]
+        if tactile is not None:
+            features.append(self.actor_tactile_encoder(tactile))
+        features = torch.cat(features, dim=-1)
 
         # Sample from GaussianPolicy
         mode = kwargs.get("mode", "train")
@@ -1888,17 +1968,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         if actions is None:
             actions = kwargs.get("actions")
 
-        # Handle two obs formats:
-        # Format 1 (internal): {"images": [...], "states": ...}
-        # Format 2 (env): {"main_images": ..., "wrist_images": ..., "states": ...}
-        if "images" not in obs:
-            # Convert env format to internal format
-            if "main_images" in obs:
-                obs = {"images": [obs["main_images"]], "states": obs["states"]}
-            else:
-                raise ValueError(
-                    f"Invalid obs format: {obs.keys()}. Expected 'images' or 'main_images' key."
-                )
+        obs = self._normalize_dsrl_obs(obs)
 
         # Preprocess images: resize to 64x64, use only agentview camera
         # Returns [B, 1, C, 64, 64] in [-1, 1] range (float32)
@@ -1910,15 +1980,30 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         images = images.to(device=device, dtype=torch.bfloat16)
         states = states.to(device=device, dtype=torch.bfloat16)
         actions = actions.to(device=device, dtype=torch.bfloat16)
+        tactile = None
+        if self.config.dsrl_use_tactile:
+            tactile = self._prepare_dsrl_tactile(
+                obs,
+                batch_size=states.shape[0],
+                encoder=self.critic_tactile_encoder,
+            )
 
         # Extract features (using critic's independent encoder)
         image_features = self.critic_image_encoder(images)
         state_features = self.critic_state_encoder(states)
+        tactile_features = None
+        if tactile is not None:
+            tactile_features = self.critic_tactile_encoder(tactile)
 
         # Optionally detach encoder
         if detach_encoder:
             image_features = image_features.detach()
             state_features = state_features.detach()
+            if tactile_features is not None:
+                tactile_features = tactile_features.detach()
+
+        if tactile_features is not None:
+            state_features = torch.cat([state_features, tactile_features], dim=-1)
 
         # Process actions (DSRL: should be noise, already flattened)
         if actions.dim() == 3:

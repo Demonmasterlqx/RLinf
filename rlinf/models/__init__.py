@@ -369,6 +369,10 @@ def get_model(cfg: DictConfig):
     if model_builder is None:
         return None
 
+    use_dsrl = bool(cfg.get("openpi", {}).get("use_dsrl", False))
+    if use_dsrl and cfg.get("is_lora", False):
+        raise ValueError("OpenPI DSRL requires actor.model.is_lora=false.")
+
     torch_dtype = torch_dtype_from_precision(cfg.precision)
     model = model_builder(cfg, torch_dtype)
 
@@ -402,6 +406,9 @@ def get_model(cfg: DictConfig):
                 )
 
         _enable_value_head_if_present(model)
+
+    if use_dsrl:
+        model.freeze_non_dsrl_parameters()
 
     return model
 

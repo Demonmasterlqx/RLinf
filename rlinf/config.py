@@ -832,6 +832,10 @@ def validate_embodied_cfg(cfg):
         f"Model type: '{model_cfg.model_type}' is not an embodied model. "
         f"Supported embodied models: {sorted([x.value for x in EMBODIED_MODEL])}."
     )
+    if model_cfg.get("openpi", {}).get("use_dsrl", False) and model_cfg.get(
+        "is_lora", False
+    ):
+        raise ValueError("OpenPI DSRL requires actor.model.is_lora=false.")
     with open_dict(cfg):
         cfg.runner.val_check_interval = cfg.runner.get("val_check_interval", -1)
     enable_eval = cfg.runner.val_check_interval > 0 or only_eval

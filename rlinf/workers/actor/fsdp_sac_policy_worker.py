@@ -48,6 +48,15 @@ from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
 
 
 class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
+    @staticmethod
+    def _dsrl_critic_param_filters():
+        return [
+            "critic_image_encoder",
+            "critic_state_encoder",
+            "critic_tactile_encoder",
+            "q_head",
+        ]
+
     def __init__(self, cfg: DictConfig):
         super().__init__(cfg)
 
@@ -113,9 +122,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         use_dsrl = self.use_dsrl
         if use_dsrl:
             # DSRL: separate actor/critic encoders into different optimizer groups
-            param_filters = {
-                "critic": ["critic_image_encoder", "critic_state_encoder", "q_head"]
-            }
+            param_filters = {"critic": self._dsrl_critic_param_filters()}
         else:
             param_filters = {"critic": ["encoders", "encoder", "q_head", "state_proj"]}
         filtered_optim_config = {"critic": self.cfg.actor.critic_optim}
@@ -250,17 +257,23 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         )
 
     def _init_target_shadow(self):
-        """Create persistent float32 shadow of target model parameters.
+        """Create persistent float32 shadow of DSRL target critic parameters.
 
         bfloat16 has only 7 mantissa bits (ULP ~0.002 at magnitude 0.3).
         With tau=0.005, per-step EMA delta can be smaller than ULP/2, so
         storing back to bf16 each step rounds away the update. The shadow
         keeps the accumulated EMA state in float32 (ULP ~3.6e-8) across
-        steps, preventing precision loss.
+        steps, preventing precision loss. The target model is only used for
+        SAC_Q, so shadowing the frozen Pi0 backbone and actor encoders wastes
+        enough memory to OOM the no-shard configuration.
         """
         self._target_shadow_f32 = {}
         for name, param in self.target_model.named_parameters():
-            self._target_shadow_f32[name] = param.data.float().clone()
+            if any(
+                module_name in name.split(".")
+                for module_name in self._dsrl_critic_param_filters()
+            ):
+                self._target_shadow_f32[name] = param.data.float().clone()
 
     def soft_update_target_model(self, tau: Optional[float] = None):
         """Soft update target model parameters.
@@ -299,6 +312,8 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                     self.target_model.named_parameters(),
                 ):
                     assert name1 == name2
+                    if name1 not in self._target_shadow_f32:
+                        continue
                     if "q_head" not in name1 and self.target_update_type != "all":
                         shadow = self._target_shadow_f32[name1]
                         shadow.copy_(online_param.data.float())
@@ -512,9 +527,14 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                 shared_feature=None,
                 detach_encoder=True,
             )
+        num_q_heads = self.cfg.actor.model.get("num_q_heads", 2)
+        if self.use_dsrl:
+            num_q_heads = self.cfg.actor.model.get("openpi", {}).get(
+                "dsrl_num_q_heads", num_q_heads
+            )
         metrics = {
             f"q_value_{q_id}": all_qf_pi[..., q_id].mean().item()
-            for q_id in range(self.cfg.actor.model.get("num_q_heads", 2))
+            for q_id in range(num_q_heads)
         }
         if agg_q == "min":
             qf_pi, _ = torch.min(all_qf_pi, dim=1, keepdim=True)
@@ -768,10 +788,14 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             optimizers=[self.optimizer, self.qf_optimizer],
             lr_schedulers=[self.lr_scheduler, self.qf_lr_scheduler],
             save_path=save_base_path,
-            checkpoint_format="local_shard"
-            if self.cfg.actor.fsdp_config.use_orig_params
-            else "dcp",
+            save_full_model_weights=self.cfg.actor.fsdp_config.get(
+                "save_full_model_weights", True
+            ),
+            checkpoint_format=self.cfg.actor.fsdp_config.get(
+                "checkpoint_format", "dcp"
+            ),
         )
+        self._save_trainable_model_weights(save_base_path, step)
 
         # Save sac components
         # save alpha
@@ -811,9 +835,9 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             optimizers=[self.optimizer, self.qf_optimizer],
             lr_schedulers=[self.lr_scheduler, self.qf_lr_scheduler],
             load_path=load_base_path,
-            checkpoint_format="local_shard"
-            if self.cfg.actor.fsdp_config.use_orig_params
-            else "dcp",
+            checkpoint_format=self.cfg.actor.fsdp_config.get(
+                "checkpoint_format", "dcp"
+            ),
         )
 
         # load alpha
@@ -839,9 +863,26 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             cpu_offload=False,
             full_state_dict=True,
         )
+        if self.use_dsrl:
+            self._init_target_shadow()
 
         # load replay buffer
         buffer_load_path = os.path.join(
             load_base_path, f"sac_components/replay_buffer/rank_{self._rank}"
         )
         self.replay_buffer.load_checkpoint(buffer_load_path)
+
+        return {
+            "rank": self._rank,
+            "checkpoint_format": self.cfg.actor.fsdp_config.get(
+                "checkpoint_format", "dcp"
+            ),
+            "model": "loaded",
+            "optimizers": ["actor", "critic"],
+            "alpha": "loaded" if self.alpha_optimizer is not None else "disabled",
+            "target_model": "loaded",
+            "replay_buffer": {
+                "size": int(self.replay_buffer.size),
+                "total_samples": int(self.replay_buffer.total_samples),
+            },
+        }

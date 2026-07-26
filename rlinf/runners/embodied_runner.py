@@ -181,7 +181,11 @@ class EmbodiedRunner:
         assert os.path.exists(actor_checkpoint_path), (
             f"resume_dir {actor_checkpoint_path} does not exist."
         )
-        self.actor.load_checkpoint(actor_checkpoint_path).wait()
+        checkpoint_receipts = self.actor.load_checkpoint(actor_checkpoint_path).wait()
+        if checkpoint_receipts and any(
+            receipt is not None for receipt in checkpoint_receipts
+        ):
+            self.logger.info(f"Checkpoint restore receipts: {checkpoint_receipts}")
         self.global_step = int(resume_dir.split("global_step_")[-1])
 
     def update_rollout_weights(self):
