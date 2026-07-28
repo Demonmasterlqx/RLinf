@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from copy import deepcopy
+from math import prod
 from types import SimpleNamespace
 
 import pytest
@@ -20,10 +21,15 @@ import torch
 from omegaconf import OmegaConf
 from torch import nn
 
+from rlinf.models.embodiment.openpi.openpi_action_model import (
+    OpenPi0ForRLActionPrediction,
+)
 from rlinf.utils.dsrl_checkpoint import (
+    DSRL_TRAINABLE_MANIFEST_V1,
     restore_target_payload,
     select_dsrl_trainable_state,
 )
+from rlinf.utils.dsrl_rollout_sync import DSRL_ROLLOUT_SYNC_MANIFEST_V1
 from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
 from rlinf.workers.actor.fsdp_sac_policy_worker import EmbodiedSACFSDPPolicy
 
@@ -267,7 +273,20 @@ def _valid_compact_payload(worker):
         ),
         (lambda p: p.__setitem__("format", "wrong_format"), "wrong format"),
         (lambda p: p.__setitem__("version", 2), "version"),
+        (lambda p: p.__setitem__("version", True), "version.*integer"),
         (lambda p: p["metadata"].__setitem__("rank", 3), "rank"),
+        (lambda p: p["metadata"].__setitem__("rank", False), "rank.*integer"),
+        (
+            lambda p: p["metadata"].__setitem__("world_size", 4.0),
+            "world_size.*integer",
+        ),
+        (
+            lambda p: p["metadata"].__setitem__(
+                "tensor_count", float(p["metadata"]["tensor_count"])
+            ),
+            "tensor_count.*integer",
+        ),
+        (lambda p: p["metadata"].__setitem__("step", True), "step.*integer"),
         (
             lambda p: p["metadata"].__setitem__("tensor_count", 999),
             "count mismatch",
@@ -377,22 +396,78 @@ def test_legacy_target_load_rejects_invalid_critic_state(
         )
 
 
+def _canonical_trainable_shapes():
+    shapes = dict(DSRL_ROLLOUT_SYNC_MANIFEST_V1)
+    shapes.update(
+        {
+            name.replace("actor_", "critic_", 1): shape
+            for name, shape in DSRL_ROLLOUT_SYNC_MANIFEST_V1.items()
+            if name.startswith("actor_")
+        }
+    )
+    q_layer_shapes = {
+        "net.0.weight": (128, 224),
+        "net.0.bias": (128,),
+        "net.1.weight": (128,),
+        "net.1.bias": (128,),
+        "net.3.weight": (128, 128),
+        "net.3.bias": (128,),
+        "net.4.weight": (128,),
+        "net.4.bias": (128,),
+        "net.6.weight": (128, 128),
+        "net.6.bias": (128,),
+        "net.7.weight": (128,),
+        "net.7.bias": (128,),
+        "net.9.weight": (1, 128),
+        "net.9.bias": (1,),
+    }
+    for head_index in range(10):
+        shapes.update(
+            {
+                f"q_head.q_heads.{head_index}.{suffix}": shape
+                for suffix, shape in q_layer_shapes.items()
+            }
+        )
+    assert len(shapes) == 220
+    assert sum(prod(shape) for shape in shapes.values()) == 5_183_754
+    return shapes
+
+
 class _ManyParameters(nn.Module):
     def __init__(self):
         super().__init__()
-        per_prefix = [28, 28, 28, 28, 27, 27, 27, 27]
-        remaining_numel = 5_183_754
-        for prefix, count in zip(TRAINABLE_PREFIXES, per_prefix, strict=True):
-            module = nn.Module()
-            setattr(self, prefix.removesuffix("."), module)
-            for index in range(count):
-                total_index = (
-                    sum(per_prefix[: TRAINABLE_PREFIXES.index(prefix)]) + index
-                )
-                numel = remaining_numel - 219 if total_index == 0 else 1
-                module.register_parameter(
-                    f"parameter_{index:03d}", nn.Parameter(torch.ones(numel))
-                )
+        self.checkpoint_parameters = [
+            (name, nn.Parameter(torch.ones(shape)))
+            for name, shape in _canonical_trainable_shapes().items()
+        ]
+        for index, (_, parameter) in enumerate(self.checkpoint_parameters):
+            self.register_parameter(f"registered_parameter_{index:03d}", parameter)
+
+    def named_parameters(self, *args, **kwargs):
+        del args, kwargs
+        yield from self.checkpoint_parameters
+
+    def replace_name(self, old_name, new_name):
+        self.checkpoint_parameters = [
+            (new_name if name == old_name else name, parameter)
+            for name, parameter in self.checkpoint_parameters
+        ]
+
+    def replace_shape(self, name, shape):
+        for index, (parameter_name, parameter) in enumerate(self.checkpoint_parameters):
+            if parameter_name == name:
+                replacement = nn.Parameter(torch.ones(shape))
+                self.checkpoint_parameters[index] = (parameter_name, replacement)
+                setattr(self, f"registered_parameter_{index:03d}", replacement)
+                return
+        raise AssertionError(name)
+
+    def parameter_by_name(self, expected_name):
+        return next(
+            parameter
+            for name, parameter in self.checkpoint_parameters
+            if name == expected_name
+        )
 
 
 def _sidecar_worker(model=None):
@@ -429,6 +504,31 @@ def test_dsrl_sidecar_saves_exact_direct_trainable_manifest(tmp_path, distribute
     assert worker._strategy.full_state_dict_calls == 0
 
 
+def test_dsrl_trainable_manifest_matches_representative_runtime_components():
+    model = OpenPi0ForRLActionPrediction.__new__(OpenPi0ForRLActionPrediction)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(
+        use_dsrl=True,
+        dsrl_use_tactile=True,
+        dsrl_tactile_latent_dim=64,
+        dsrl_state_dim=7,
+        dsrl_action_noise_dim=32,
+        dsrl_num_q_heads=10,
+        dsrl_image_latent_dim=64,
+        dsrl_state_latent_dim=64,
+        dsrl_hidden_dims=(128, 128, 128),
+        action_horizon=2,
+    )
+    model._init_dsrl_components()
+
+    state = select_dsrl_trainable_state(model)
+
+    assert set(state) == set(DSRL_TRAINABLE_MANIFEST_V1)
+    assert {name: tuple(tensor.shape) for name, tensor in state.items()} == dict(
+        DSRL_TRAINABLE_MANIFEST_V1
+    )
+
+
 def test_dsrl_sidecar_nonzero_rank_only_synchronizes(monkeypatch, tmp_path):
     barriers = []
     worker = _sidecar_worker(nn.Linear(1, 1))
@@ -446,17 +546,23 @@ def test_dsrl_sidecar_nonzero_rank_only_synchronizes(monkeypatch, tmp_path):
     ("break_model", "message"),
     [
         (
-            lambda model: model.add_module("backbone", nn.Linear(1, 1)),
+            lambda model: model.replace_name(
+                "actor_image_encoder.encoder.0.weight", "backbone.replacement"
+            ),
             "allowed prefixes",
         ),
         (
             lambda model: setattr(
-                model.actor_image_encoder.parameter_000, "requires_grad", False
+                model.parameter_by_name("actor_image_encoder.encoder.0.weight"),
+                "requires_grad",
+                False,
             ),
             "exactly 220 tensors",
         ),
         (
-            lambda model: model.q_head.parameter_000.data.fill_(torch.nan),
+            lambda model: model.parameter_by_name(
+                "q_head.q_heads.0.net.0.weight"
+            ).data.fill_(torch.nan),
             "non-finite",
         ),
     ],
@@ -470,6 +576,25 @@ def test_dsrl_sidecar_rejects_bad_key_count_or_finite(
 
     with pytest.raises(ValueError, match=message):
         select_dsrl_trainable_state(worker.model)
+
+
+def test_dsrl_sidecar_rejects_same_numel_wrong_shape():
+    model = _ManyParameters()
+    model.replace_shape("q_head.q_heads.0.net.0.weight", (224, 128))
+
+    with pytest.raises(ValueError, match="shape mismatches"):
+        select_dsrl_trainable_state(model)
+
+
+def test_dsrl_sidecar_rejects_compensating_allowed_prefix_key_substitution():
+    model = _ManyParameters()
+    model.replace_name(
+        "q_head.q_heads.0.net.0.weight",
+        "q_head.q_heads.0.net.replacement.weight",
+    )
+
+    with pytest.raises(ValueError, match="missing keys.*unexpected keys"):
+        select_dsrl_trainable_state(model)
 
 
 def test_non_dsrl_sidecar_routes_to_inherited_implementation(monkeypatch, tmp_path):

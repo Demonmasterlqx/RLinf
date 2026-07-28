@@ -15,12 +15,17 @@
 """Compact checkpoint helpers for Tabero OpenPI DSRL training."""
 
 from collections.abc import Mapping, Sequence
+from math import prod
+from types import MappingProxyType
 from typing import Any
 
 import torch
 from torch import nn
 
-from rlinf.utils.dsrl_rollout_sync import normalize_fsdp_parameter_name
+from rlinf.utils.dsrl_rollout_sync import (
+    DSRL_ROLLOUT_SYNC_MANIFEST_V1,
+    normalize_fsdp_parameter_name,
+)
 
 DSRL_TARGET_FORMAT = "tabero_dsrl_target"
 DSRL_TARGET_VERSION = 1
@@ -39,6 +44,70 @@ DSRL_TRAINABLE_PREFIXES = (
 )
 DSRL_TRAINABLE_TENSOR_COUNT = 220
 DSRL_TRAINABLE_PARAMETER_COUNT = 5_183_754
+DSRL_Q_STATE_DIM = 128
+DSRL_Q_IMAGE_DIM = 64
+DSRL_Q_ACTION_DIM = 32
+DSRL_Q_HIDDEN_DIMS = (128, 128, 128)
+DSRL_Q_OUTPUT_DIM = 1
+DSRL_Q_HEAD_COUNT = 10
+
+
+def _build_dsrl_trainable_manifest() -> Mapping[str, tuple[int, ...]]:
+    manifest = dict(DSRL_ROLLOUT_SYNC_MANIFEST_V1)
+    manifest.update(
+        {
+            name.replace("actor_", "critic_", 1): shape
+            for name, shape in DSRL_ROLLOUT_SYNC_MANIFEST_V1.items()
+            if name.startswith("actor_")
+        }
+    )
+
+    input_dim = DSRL_Q_STATE_DIM + DSRL_Q_IMAGE_DIM + DSRL_Q_ACTION_DIM
+    q_head_shapes: dict[str, tuple[int, ...]] = {}
+    in_dim = input_dim
+    for hidden_index, out_dim in enumerate(DSRL_Q_HIDDEN_DIMS):
+        linear_index = hidden_index * 3
+        norm_index = linear_index + 1
+        q_head_shapes[f"net.{linear_index}.weight"] = (out_dim, in_dim)
+        q_head_shapes[f"net.{linear_index}.bias"] = (out_dim,)
+        q_head_shapes[f"net.{norm_index}.weight"] = (out_dim,)
+        q_head_shapes[f"net.{norm_index}.bias"] = (out_dim,)
+        in_dim = out_dim
+    output_index = len(DSRL_Q_HIDDEN_DIMS) * 3
+    q_head_shapes[f"net.{output_index}.weight"] = (DSRL_Q_OUTPUT_DIM, in_dim)
+    q_head_shapes[f"net.{output_index}.bias"] = (DSRL_Q_OUTPUT_DIM,)
+    for head_index in range(DSRL_Q_HEAD_COUNT):
+        manifest.update(
+            {
+                f"q_head.q_heads.{head_index}.{suffix}": shape
+                for suffix, shape in q_head_shapes.items()
+            }
+        )
+    return MappingProxyType(manifest)
+
+
+DSRL_TRAINABLE_MANIFEST_V1 = _build_dsrl_trainable_manifest()
+
+assert len(DSRL_TRAINABLE_MANIFEST_V1) == DSRL_TRAINABLE_TENSOR_COUNT
+assert (
+    sum(prod(shape) for shape in DSRL_TRAINABLE_MANIFEST_V1.values())
+    == DSRL_TRAINABLE_PARAMETER_COUNT
+)
+
+
+def _require_strict_int(
+    value: Any,
+    *,
+    label: str,
+    minimum: int,
+) -> int:
+    if type(value) is not int or value < minimum:
+        qualifier = "positive" if minimum == 1 else "non-negative"
+        raise ValueError(
+            f"OpenPI DSRL compact target {label} must be a {qualifier} integer; "
+            f"got {value!r}."
+        )
+    return value
 
 
 def _normalized_named_parameters(
@@ -163,6 +232,9 @@ def build_compact_target_payload(
     world_size: int,
 ) -> dict[str, Any]:
     """Build and validate a v1 compact target payload from live tensors."""
+    _require_strict_int(step, label="step", minimum=0)
+    _require_strict_int(rank, label="rank", minimum=0)
+    _require_strict_int(world_size, label="world_size", minimum=1)
     runtime = select_target_parameters(target_model)
     shadow = _normalize_tensor_mapping(target_shadow_f32, label="target shadow")
     _validate_tensor_mapping(
@@ -222,15 +294,20 @@ def _validate_compact_metadata(
 ) -> None:
     if not isinstance(metadata, Mapping):
         raise ValueError("OpenPI DSRL compact target metadata must be a mapping.")
-    if metadata.get("rank") != rank:
+    checkpoint_rank = _require_strict_int(metadata.get("rank"), label="rank", minimum=0)
+    checkpoint_world_size = _require_strict_int(
+        metadata.get("world_size"), label="world_size", minimum=1
+    )
+    _require_strict_int(metadata.get("step"), label="step", minimum=0)
+    if checkpoint_rank != rank:
         raise ValueError(
             "OpenPI DSRL compact target rank mismatch: "
-            f"checkpoint={metadata.get('rank')!r}, runtime={rank}."
+            f"checkpoint={checkpoint_rank!r}, runtime={rank}."
         )
-    if metadata.get("world_size") != world_size:
+    if checkpoint_world_size != world_size:
         raise ValueError(
             "OpenPI DSRL compact target world-size mismatch: "
-            f"checkpoint={metadata.get('world_size')!r}, runtime={world_size}."
+            f"checkpoint={checkpoint_world_size!r}, runtime={world_size}."
         )
     expected_counts = {
         "tensor_count": len(model_state),
@@ -240,16 +317,11 @@ def _validate_compact_metadata(
             tensor.numel() for tensor in shadow_state.values()
         ),
     }
-    count_mismatches = {
-        name: {"expected": expected, "actual": metadata.get(name)}
-        for name, expected in expected_counts.items()
-        if metadata.get(name) != expected
-    }
-    step = metadata.get("step")
-    if isinstance(step, bool) or not isinstance(step, int) or step < 0:
-        raise ValueError(
-            f"OpenPI DSRL compact target step must be a non-negative integer; got {step!r}."
-        )
+    count_mismatches = {}
+    for name, expected in expected_counts.items():
+        actual = _require_strict_int(metadata.get(name), label=name, minimum=1)
+        if actual != expected:
+            count_mismatches[name] = {"expected": expected, "actual": actual}
     if count_mismatches:
         raise ValueError(
             f"OpenPI DSRL compact target metadata count mismatch: {count_mismatches}."
@@ -288,6 +360,8 @@ def restore_target_payload(
     """Validate/copy compact or legacy target tensors and return shadow/receipt."""
     if not isinstance(payload, Mapping):
         raise ValueError("OpenPI DSRL target checkpoint must be a mapping.")
+    _require_strict_int(rank, label="runtime rank", minimum=0)
+    _require_strict_int(world_size, label="runtime world_size", minimum=1)
     runtime = select_target_parameters(target_model)
 
     if "format" in payload:
@@ -296,10 +370,12 @@ def restore_target_payload(
                 "OpenPI DSRL target checkpoint has wrong format: "
                 f"{payload.get('format')!r}."
             )
-        if payload.get("version") != DSRL_TARGET_VERSION:
+        version = _require_strict_int(
+            payload.get("version"), label="version", minimum=1
+        )
+        if version != DSRL_TARGET_VERSION:
             raise ValueError(
-                "OpenPI DSRL target checkpoint has unsupported version: "
-                f"{payload.get('version')!r}."
+                f"OpenPI DSRL target checkpoint has unsupported version: {version!r}."
             )
         model_state = payload.get("model")
         shadow_state = payload.get("target_shadow_f32")
@@ -381,6 +457,24 @@ def select_dsrl_trainable_state(model: nn.Module) -> dict[str, torch.Tensor]:
             "OpenPI DSRL trainable sidecar requires exactly 220 tensors and "
             "5,183,754 parameters; got "
             f"{tensor_count} tensors and {parameter_count:,} parameters."
+        )
+    expected_keys = set(DSRL_TRAINABLE_MANIFEST_V1)
+    actual_keys = set(trainable)
+    missing_keys = sorted(expected_keys - actual_keys)
+    unexpected_keys = sorted(actual_keys - expected_keys)
+    shape_mismatches = {
+        name: {
+            "expected": DSRL_TRAINABLE_MANIFEST_V1[name],
+            "actual": tuple(trainable[name].shape),
+        }
+        for name in expected_keys & actual_keys
+        if tuple(trainable[name].shape) != DSRL_TRAINABLE_MANIFEST_V1[name]
+    }
+    if missing_keys or unexpected_keys or shape_mismatches:
+        raise ValueError(
+            "OpenPI DSRL trainable sidecar does not match canonical manifest v1; "
+            f"missing keys: {missing_keys}; unexpected keys: {unexpected_keys}; "
+            f"shape mismatches: {shape_mismatches}."
         )
     _validate_tensor_mapping(
         trainable,
