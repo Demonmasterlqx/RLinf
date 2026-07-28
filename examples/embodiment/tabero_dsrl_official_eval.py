@@ -529,7 +529,7 @@ def _parse_normalized_result(
     if isinstance(success_rate, bool) or not isinstance(success_rate, (int, float)):
         raise ValueError("raw result success rate must be numeric")
     expected_rate = success_count * 100.0 / 50
-    if not math.isclose(float(success_rate), expected_rate, abs_tol=1e-12):
+    if not math.isclose(float(success_rate), expected_rate, rel_tol=0.0, abs_tol=1e-12):
         raise ValueError(
             f"raw result rate/count mismatch: rate={success_rate}, count={success_count}"
         )

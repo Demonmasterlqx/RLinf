@@ -433,6 +433,13 @@ def test_normalize_result_matches_prior_schema_and_is_no_clobber(tmp_path):
             ),
             "rate",
         ),
+        (
+            lambda payload: payload["results"]["libero_object_task0"].update(
+                successful_experiments=50,
+                success_rate=100.00000005,
+            ),
+            "rate",
+        ),
     ],
 )
 def test_normalize_result_rejects_protocol_or_metric_mismatch(
