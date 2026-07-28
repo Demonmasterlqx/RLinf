@@ -48,6 +48,28 @@ def bundle_fixture(tmp_path):
     base_model = tmp_path / "base"
     base_model.mkdir()
     (base_model / "model.safetensors").write_bytes(b"fixed-test-base")
+    source_checkpoint = tmp_path / "global_step_50/trainable_weights.pt"
+    source_checkpoint.parent.mkdir()
+    source_checkpoint.write_bytes(b"final trainable checkpoint")
+    config_snapshot = tmp_path / "config_snapshot.yaml"
+    config_snapshot.write_text("formal: true\n")
+    source_provenance = tmp_path / "provenance.env"
+    source_provenance.write_text(
+        "\n".join(
+            (
+                "TABERO_PROVENANCE_VERSION=1",
+                "TABERO_PROVENANCE_MODE=fresh",
+                f"TABERO_CONFIG_SHA256={_sha256(config_snapshot)}",
+                f"TABERO_CONFIG_SNAPSHOT_SHA256={_sha256(config_snapshot)}",
+                f"TABERO_GIT_COMMIT={'4' * 40}",
+                "TABERO_GIT_DIRTY=false",
+                f"TABERO_BASE_MODEL_PATH={base_model.resolve()}",
+                f"TABERO_BASE_MODEL_SHA256={_sha256(base_model / 'model.safetensors')}",
+                "TABERO_SOURCE_CONFIG_SHA256=none",
+            )
+        )
+        + "\n"
+    )
     bundle = tmp_path / "bundle"
     bundle.mkdir()
     actor_path = bundle / "dsrl_actor.safetensors"
@@ -75,12 +97,12 @@ def bundle_fixture(tmp_path):
         "training_config": "isaaclab_pi0_dsrl_tacfield_tabero_task0_firm_8gpu_50step",
         "base_model": str(base_model.resolve()),
         "base_model_sha256": _sha256(base_model / "model.safetensors"),
-        "source_checkpoint": str(tmp_path / "global_step_50/trainable_weights.pt"),
-        "source_checkpoint_sha256": "1" * 64,
-        "source_provenance": str(tmp_path / "provenance.env"),
-        "source_provenance_sha256": "2" * 64,
-        "source_config_snapshot": str(tmp_path / "config_snapshot.yaml"),
-        "source_config_snapshot_sha256": "3" * 64,
+        "source_checkpoint": str(source_checkpoint),
+        "source_checkpoint_sha256": _sha256(source_checkpoint),
+        "source_provenance": str(source_provenance),
+        "source_provenance_sha256": _sha256(source_provenance),
+        "source_config_snapshot": str(config_snapshot),
+        "source_config_snapshot_sha256": _sha256(config_snapshot),
         "legacy_source_config": None,
         "legacy_source_config_sha256": None,
         "source_git_commit": "4" * 40,
@@ -143,7 +165,7 @@ def bundle_fixture(tmp_path):
         "status": "passed",
         "task_id": 0,
         "global_step": 50,
-        "source_checkpoint_sha256": "1" * 64,
+        "source_checkpoint_sha256": manifest["source_checkpoint_sha256"],
         "base_model_sha256": manifest["base_model_sha256"],
         "actor_weights_sha256": manifest["actor_weights_sha256"],
         "manifest_sha256": _sha256(manifest_path),
@@ -247,6 +269,65 @@ def test_validate_bundle_rejects_actor_keyspace(bundle_fixture):
     _rewrite_bundle_json(bundle, "artifact_audit.json", audit)
 
     with pytest.raises(ValueError, match="actor.*manifest|keyspace"):
+        helper.validate_bundle(bundle, 0, base_model)
+
+
+def test_validate_bundle_rejects_coherently_rehashed_nonfinite_actor(
+    bundle_fixture,
+):
+    helper = _load_helper()
+    bundle, base_model, manifest, audit = bundle_fixture
+    tensors = {
+        key: torch.zeros(shape, dtype=torch.bfloat16)
+        for key, shape in DSRL_ROLLOUT_SYNC_MANIFEST_V1.items()
+    }
+    first_key = next(iter(tensors))
+    tensors[first_key].flatten()[0] = float("nan")
+    actor_path = bundle / "dsrl_actor.safetensors"
+    save_file(
+        tensors,
+        actor_path,
+        metadata={
+            "format": "tabero_dsrl_t2vla",
+            "format_version": "1",
+            "task_id": "0",
+            "global_step": "50",
+            "dtype": "bfloat16",
+        },
+    )
+    manifest["actor_weights_sha256"] = _sha256(actor_path)
+    _rewrite_bundle_json(bundle, "manifest.json", manifest)
+    audit["actor_weights_sha256"] = manifest["actor_weights_sha256"]
+    audit["manifest_sha256"] = _sha256(bundle / "manifest.json")
+    _rewrite_bundle_json(bundle, "artifact_audit.json", audit)
+
+    with pytest.raises(ValueError, match="finite"):
+        helper.validate_bundle(bundle, 0, base_model)
+
+
+@pytest.mark.parametrize(
+    "manifest_key",
+    ["source_checkpoint", "source_provenance", "source_config_snapshot"],
+)
+def test_validate_bundle_rejects_tampered_source_artifact(bundle_fixture, manifest_key):
+    helper = _load_helper()
+    bundle, base_model, manifest, _ = bundle_fixture
+    source_path = Path(manifest[manifest_key])
+    source_path.write_bytes(source_path.read_bytes() + b"tamper")
+
+    with pytest.raises(ValueError, match="source|provenance|config|hash"):
+        helper.validate_bundle(bundle, 0, base_model)
+
+
+def test_validate_bundle_binds_source_git_commit_to_provenance(bundle_fixture):
+    helper = _load_helper()
+    bundle, base_model, manifest, audit = bundle_fixture
+    manifest["source_git_commit"] = "5" * 40
+    _rewrite_bundle_json(bundle, "manifest.json", manifest)
+    audit["manifest_sha256"] = _sha256(bundle / "manifest.json")
+    _rewrite_bundle_json(bundle, "artifact_audit.json", audit)
+
+    with pytest.raises(ValueError, match="Git|provenance"):
         helper.validate_bundle(bundle, 0, base_model)
 
 
@@ -436,7 +517,7 @@ def test_normalize_result_matches_prior_schema_and_is_no_clobber(tmp_path):
         (
             lambda payload: payload["results"]["libero_object_task0"].update(
                 successful_experiments=50,
-                success_rate=100.00000005,
+                success_rate=100.0000000000005,
             ),
             "rate",
         ),
@@ -581,14 +662,21 @@ def test_launcher_public_contract_is_present():
     assert "dsrl <0|5> formal --dsrl-bundle ABS_PATH [--dry-run]" in launcher
     assert "CUDA_VISIBLE_DEVICES=0" in launcher
     assert "unset CUDA_VISIBLE_DEVICES" in launcher
+    assert "CUDA_DEVICE_ORDER=PCI_BUS_ID" in launcher
     assert "JAX_PLATFORMS=cuda" in launcher
     assert "XLA_PYTHON_CLIENT_PREALLOCATE=false" in launcher
     assert "--dsrl-bundle" in launcher
     assert "--send-dsrl-raw-image" in launcher
     assert "--sim-device" in launcher and "cuda:1" in launcher
     assert "--sim-kit-args=--/renderer/activeGpu=1" in launcher
-    assert "sleep 5" in launcher
+    assert "--interval 5" in launcher
     assert "flock -n" in launcher
+    assert "close_gpu_lock_fds" in launcher
+    assert "kill -KILL" in launcher
+    assert "listener-owned" in launcher
+    assert "sample-gpus" in launcher
+    assert "--parent-pid" in launcher
+    assert "cmp --silent" in launcher
 
 
 def test_launcher_does_not_clear_process_cleanup_trap_after_installing_it():
@@ -862,6 +950,62 @@ def test_launcher_rejects_formal_test_override(tmp_path, bundle_fixture):
 
     assert result.returncode != 0
     assert "only allowed with --dry-run" in result.stderr
+
+
+def test_launcher_rejects_symlink_gpu_lock_directory(tmp_path, bundle_fixture):
+    bundle, base_model, _, _ = bundle_fixture
+    env, _, results = _launcher_environment(tmp_path, bundle, base_model)
+    lock_target = tmp_path / "lock-target"
+    lock_target.mkdir()
+    Path(env["TABERO_TEST_GPU_LOCK_DIR"]).symlink_to(
+        lock_target, target_is_directory=True
+    )
+
+    result = _run_launcher(bundle, 0, env)
+
+    assert result.returncode != 0
+    assert "lock" in result.stderr.lower() or "symlink" in result.stderr.lower()
+    assert not any(results.iterdir())
+
+
+def test_listener_ownership_is_bound_to_launched_process():
+    helper = _load_helper()
+    listener = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import socket,time; "
+                "s=socket.socket(); s.bind(('127.0.0.1',0)); s.listen(); "
+                "print(s.getsockname()[1],flush=True); time.sleep(30)"
+            ),
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    unrelated = subprocess.Popen(["sleep", "30"])
+    try:
+        assert listener.stdout is not None
+        port = int(listener.stdout.readline())
+        assert helper.listener_owned_by_process(listener.pid, port)
+        assert not helper.listener_owned_by_process(unrelated.pid, port)
+    finally:
+        listener.terminate()
+        listener.wait(timeout=5)
+        unrelated.terminate()
+        unrelated.wait(timeout=5)
+
+
+def test_gpu_sampler_propagates_nvidia_smi_failure(tmp_path):
+    helper = _load_helper()
+    failed_smi = tmp_path / "nvidia-smi"
+    _write_executable(failed_smi, "#!/usr/bin/env bash\nexit 7\n")
+    with pytest.raises(subprocess.CalledProcessError):
+        helper.sample_gpus_once(
+            tmp_path / "gpu.csv",
+            tmp_path / "process.csv",
+            nvidia_smi=str(failed_smi),
+        )
 
 
 @pytest.mark.parametrize(

@@ -4,7 +4,7 @@ set -euo pipefail
 readonly FIXED_PROJECT_ROOT="/data/home/sim6g/code/tabero"
 readonly FIXED_BASE_MODEL="${FIXED_PROJECT_ROOT}/models/pi0_lora_tacfield_tabero_safetensors"
 readonly DEFAULT_RESULTS_ROOT="${FIXED_PROJECT_ROOT}/results"
-readonly DEFAULT_GPU_LOCK_DIR="/tmp/tabero-formal-gpu-locks"
+readonly DEFAULT_GPU_LOCK_DIR="/tmp/tabero-formal-gpu-locks-${EUID}"
 readonly MIN_FREE_DISK_KIB=52428800
 
 usage() {
@@ -83,6 +83,7 @@ CLIENT_SCRIPT="${TABERO_ROOT}/scripts/tools/run_task_evaluations.py"
 HDF5_FOLDER="${TABERO_ROOT}/benchmarks/datasets/libero/assembled_hdf5"
 RLINF_PYTHON="${RLINF_ROOT}/.venv/bin/python"
 HELPER="${SCRIPT_DIR}/tabero_dsrl_official_eval.py"
+export PYTHONPATH="${RLINF_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
 [[ -x "${RLINF_PYTHON}" ]] || die "RLinf Python is missing: ${RLINF_PYTHON}"
 [[ -x "${T2_PYTHON}" ]] || die "T2 Python is missing: ${T2_PYTHON}"
@@ -95,9 +96,12 @@ command -v conda >/dev/null 2>&1 || die "conda is required"
 command -v flock >/dev/null 2>&1 || die "flock is required"
 command -v nvidia-smi >/dev/null 2>&1 || die "nvidia-smi is required"
 command -v setsid >/dev/null 2>&1 || die "setsid is required"
+command -v stat >/dev/null 2>&1 || die "stat is required"
 
 # The client pins physical GPU 1 by index; inherited remapping would violate it.
 unset CUDA_VISIBLE_DEVICES
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+export PYTHONDONTWRITEBYTECODE=1
 
 declare -A INSTALLED_GPUS=()
 while IFS= read -r gpu_id; do
@@ -110,10 +114,20 @@ done < <(nvidia-smi --query-gpu=index --format=csv,noheader)
 [[ -n "${INSTALLED_GPUS[0]:-}" ]] || die "required physical GPU 0 is not installed"
 [[ -n "${INSTALLED_GPUS[1]:-}" ]] || die "required physical GPU 1 is not installed"
 
-mkdir -p "${GPU_LOCK_DIR}"
+[[ ! -L "${GPU_LOCK_DIR}" ]] || die "GPU lock directory must not be a symlink: ${GPU_LOCK_DIR}"
+mkdir -p -m 700 "${GPU_LOCK_DIR}"
+[[ -d "${GPU_LOCK_DIR}" && ! -L "${GPU_LOCK_DIR}" ]] || die "invalid GPU lock directory: ${GPU_LOCK_DIR}"
+[[ "$(stat -c %u "${GPU_LOCK_DIR}")" == "${EUID}" ]] || die "GPU lock directory must be owned by UID ${EUID}"
+chmod 700 "${GPU_LOCK_DIR}"
 GPU_LOCK_FDS=()
 for gpu_id in 0 1; do
-  exec {gpu_lock_fd}>"${GPU_LOCK_DIR}/gpu_${gpu_id}.lock"
+  gpu_lock_path="${GPU_LOCK_DIR}/gpu_${gpu_id}.lock"
+  [[ ! -L "${gpu_lock_path}" ]] || die "GPU lock file must not be a symlink: ${gpu_lock_path}"
+  if [[ -e "${gpu_lock_path}" ]]; then
+    [[ -f "${gpu_lock_path}" ]] || die "GPU lock path must be a regular file: ${gpu_lock_path}"
+    [[ "$(stat -c %u "${gpu_lock_path}")" == "${EUID}" ]] || die "GPU lock file must be owned by UID ${EUID}"
+  fi
+  exec {gpu_lock_fd}<>"${gpu_lock_path}"
   flock -n "${gpu_lock_fd}" || die "GPU ${gpu_id} lease is already held by another formal launcher"
   GPU_LOCK_FDS+=("${gpu_lock_fd}")
 done
@@ -172,6 +186,7 @@ STATUS_FILE="${OUTPUT_DIR}/run_status.env"
 SERVER_PID=""
 CLIENT_PID=""
 GPU_SAMPLER_PID=""
+RUNTIME_VERIFY_DIR=""
 STATUS_FINALIZED=false
 
 write_status() {
@@ -187,11 +202,54 @@ write_status() {
   mv "${temporary}" "${STATUS_FILE}"
 }
 
-terminate_group() {
+write_running_status() {
+  local temporary
+  temporary="$(mktemp "${OUTPUT_DIR}/.run_status.env.XXXXXX")"
+  {
+    printf 'TABERO_RUN_STATUS=running\n'
+    printf 'TABERO_EXIT_STATUS=\n'
+    printf 'TABERO_START_TIME_UTC=%s\n' "${START_TIME_UTC}"
+    printf 'TABERO_DURATION_SECONDS=\n'
+  } >"${temporary}"
+  mv "${temporary}" "${STATUS_FILE}"
+}
+
+close_gpu_lock_fds() {
+  local lock_fd
+  for lock_fd in "${GPU_LOCK_FDS[@]}"; do
+    eval "exec ${lock_fd}>&-"
+  done
+}
+
+process_group_alive() {
   local pid="$1"
+  kill -0 -- "-${pid}" 2>/dev/null || kill -0 "${pid}" 2>/dev/null
+}
+
+terminate_group() {
+  local pid="$1" target
   [[ -n "${pid}" ]] || return 0
-  if kill -0 "${pid}" 2>/dev/null; then
-    kill -TERM -- "-${pid}" 2>/dev/null || kill -TERM "${pid}" 2>/dev/null || true
+  if kill -0 -- "-${pid}" 2>/dev/null; then
+    target="-${pid}"
+  elif kill -0 "${pid}" 2>/dev/null; then
+    target="${pid}"
+  else
+    wait "${pid}" 2>/dev/null || true
+    return 0
+  fi
+  kill -TERM -- "${target}" 2>/dev/null || true
+  for _ in $(seq 1 10); do
+    kill -0 -- "${target}" 2>/dev/null || break
+    sleep 1
+  done
+  if kill -0 -- "${target}" 2>/dev/null; then
+    kill -KILL -- "${target}" 2>/dev/null || true
+  fi
+  for _ in $(seq 1 10); do
+    kill -0 -- "${target}" 2>/dev/null || break
+    sleep 1
+  done
+  if ! kill -0 -- "${target}" 2>/dev/null; then
     wait "${pid}" 2>/dev/null || true
   fi
 }
@@ -203,6 +261,10 @@ cleanup() {
   terminate_group "${SERVER_PID}"
   terminate_group "${GPU_SAMPLER_PID}"
   cleanup_preflight
+  if [[ -n "${RUNTIME_VERIFY_DIR}" && -d "${RUNTIME_VERIFY_DIR}" ]]; then
+    rm -f -- "${RUNTIME_VERIFY_DIR}/current.env"
+    rmdir -- "${RUNTIME_VERIFY_DIR}" 2>/dev/null || true
+  fi
   if [[ "${STATUS_FINALIZED}" != true ]]; then
     write_status failed "${exit_status}"
   fi
@@ -213,6 +275,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 mkdir "${OUTPUT_DIR}/raw" "${OUTPUT_DIR}/output"
+write_running_status
 RUN_ID_SUFFIX="${RUN_STAMP/_/-}"
 RUN_ID_SUFFIX="${RUN_ID_SUFFIX/_/-}"
 WANDB_RUN_ID="tabero-official-dsrl-task${TASK_ID}-${RUN_ID_SUFFIX//_/-}"
@@ -233,6 +296,8 @@ fi
 
 RUN_ENV="${OUTPUT_DIR}/run.env"
 START_METADATA="${OUTPUT_DIR}/start_metadata.env"
+PREFLIGHT_SNAPSHOT="${OUTPUT_DIR}/.preflight_snapshot.env"
+RUN_ENV_TEMP="$(mktemp "${OUTPUT_DIR}/.run.env.XXXXXX")"
 {
   printf 'TABERO_OFFICIAL_EVAL_RUN_ID=%s\n' "${RUN_STAMP}"
   printf 'WANDB_RUN_ID=%s\n' "${WANDB_RUN_ID}"
@@ -243,14 +308,19 @@ START_METADATA="${OUTPUT_DIR}/start_metadata.env"
   printf 'TABERO_DSRL_BUNDLE=%s\n' "${DSRL_BUNDLE}"
   printf 'TABERO_OUTPUT_DIR=%s\n' "${OUTPUT_DIR}"
   printf 'TABERO_START_TIME_UTC=%s\n' "${START_TIME_UTC}"
-} >"${RUN_ENV}"
+} >"${RUN_ENV_TEMP}"
+mv "${RUN_ENV_TEMP}" "${RUN_ENV}"
+START_METADATA_TEMP="$(mktemp "${OUTPUT_DIR}/.start_metadata.env.XXXXXX")"
 {
   cat "${PREFLIGHT_DIR}/bundle_and_repos.env"
   printf 'TABERO_GPU_IDS=0,1\n'
+  printf 'TABERO_CUDA_DEVICE_ORDER=PCI_BUS_ID\n'
   printf 'TABERO_FREE_DISK_KIB=%s\n' "${FREE_DISK_KIB}"
   printf 'TABERO_EPHEMERAL_PORT=%s\n' "${PORT}"
   printf 'TABERO_START_TIME_UTC=%s\n' "${START_TIME_UTC}"
-} >"${START_METADATA}"
+} >"${START_METADATA_TEMP}"
+mv "${START_METADATA_TEMP}" "${START_METADATA}"
+cp -- "${PREFLIGHT_DIR}/bundle_and_repos.env" "${PREFLIGHT_SNAPSHOT}"
 cleanup_preflight
 
 server_command=(
@@ -309,6 +379,7 @@ if [[ "${DRY_RUN}" == true ]]; then
   : >"${OUTPUT_DIR}/server.pid"
   : >"${OUTPUT_DIR}/client.pid"
   : >"${OUTPUT_DIR}/gpu_sampler.pid"
+  rm -f -- "${PREFLIGHT_SNAPSHOT}"
   write_status dry_run 0
   STATUS_FINALIZED=true
   printf 'Output directory: %s\n' "${OUTPUT_DIR}"
@@ -316,39 +387,29 @@ if [[ "${DRY_RUN}" == true ]]; then
 fi
 
 (
-  while true; do
-    sample_time="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    while IFS= read -r row; do
-      [[ -n "${row}" ]] && printf '%s,%s\n' "${sample_time}" "${row}"
-    done < <(
-      nvidia-smi --id=0,1 --query-gpu=index,name,memory.used,memory.total,utilization.gpu,power.draw,pstate --format=csv,noheader,nounits
-    ) >>"${OUTPUT_DIR}/gpu_samples.csv"
-    while IFS= read -r row; do
-      [[ -n "${row}" ]] && printf '%s,%s\n' "${sample_time}" "${row}"
-    done < <(
-      nvidia-smi --id=0,1 --query-compute-apps=gpu_uuid,pid,process_name,used_gpu_memory --format=csv,noheader,nounits 2>/dev/null || true
-    ) >>"${OUTPUT_DIR}/gpu_process_samples.csv"
-    sleep 5
-  done
+  close_gpu_lock_fds
+  exec setsid "${RLINF_PYTHON}" "${HELPER}" sample-gpus \
+    --gpu-file "${OUTPUT_DIR}/gpu_samples.csv" \
+    --process-file "${OUTPUT_DIR}/gpu_process_samples.csv" \
+    --interval 5 \
+    --parent-pid "$$"
 ) &
 GPU_SAMPLER_PID=$!
 printf '%s\n' "${GPU_SAMPLER_PID}" >"${OUTPUT_DIR}/gpu_sampler.pid"
 
-setsid "${server_command[@]}" >"${OUTPUT_DIR}/server.log" 2>&1 &
+(
+  close_gpu_lock_fds
+  exec setsid "${RLINF_PYTHON}" "${HELPER}" supervise \
+    --parent-pid "$$" -- "${server_command[@]}"
+) >"${OUTPUT_DIR}/server.log" 2>&1 &
 SERVER_PID=$!
 printf '%s\n' "${SERVER_PID}" >"${OUTPUT_DIR}/server.pid"
 ready=false
 for _ in $(seq 1 300); do
-  kill -0 "${SERVER_PID}" 2>/dev/null || die "T2 server exited before becoming ready"
-  if "${RLINF_PYTHON}" - "${PORT}" <<'PY'
-import socket
-import sys
-try:
-    with socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=1):
-        pass
-except OSError:
-    raise SystemExit(1)
-PY
+  process_group_alive "${GPU_SAMPLER_PID}" || die "GPU sampler exited before server readiness"
+  process_group_alive "${SERVER_PID}" || die "T2 server exited before becoming ready"
+  if PYTHONPATH="${RLINF_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" \
+    "${RLINF_PYTHON}" "${HELPER}" listener-owned --pid "${SERVER_PID}" --port "${PORT}"
   then
     ready=true
     break
@@ -357,15 +418,44 @@ PY
 done
 [[ "${ready}" == true ]] || die "T2 server did not listen within 600 seconds"
 
-setsid "${client_command[@]}" >"${OUTPUT_DIR}/client.log" 2>&1 &
+(
+  close_gpu_lock_fds
+  exec setsid "${RLINF_PYTHON}" "${HELPER}" supervise \
+    --parent-pid "$$" -- "${client_command[@]}"
+) >"${OUTPUT_DIR}/client.log" 2>&1 &
 CLIENT_PID=$!
 printf '%s\n' "${CLIENT_PID}" >"${OUTPUT_DIR}/client.pid"
+while process_group_alive "${CLIENT_PID}"; do
+  process_group_alive "${SERVER_PID}" || die "T2 server exited while client was running"
+  process_group_alive "${GPU_SAMPLER_PID}" || die "GPU sampler exited while client was running"
+  sleep 1
+done
 set +e
 wait "${CLIENT_PID}"
 CLIENT_STATUS=$?
 set -e
 CLIENT_PID=""
 [[ "${CLIENT_STATUS}" -eq 0 ]] || die "Tabero client failed with exit status ${CLIENT_STATUS}"
+process_group_alive "${SERVER_PID}" || die "T2 server exited before result finalization"
+process_group_alive "${GPU_SAMPLER_PID}" || die "GPU sampler exited before result finalization"
+
+RUNTIME_VERIFY_DIR="$(mktemp -d "${OUTPUT_DIR}/.runtime_verify.XXXXXX")"
+runtime_preflight_command=(
+  "${RLINF_PYTHON}" "${HELPER}" preflight
+  --bundle "${DSRL_BUNDLE}"
+  --task-id "${TASK_ID}"
+  --base-model "${BASE_MODEL}"
+  --rlinf-repo "${RLINF_ROOT}"
+  --t2-repo "${T2_ROOT}"
+  --tabero-repo "${TABERO_ROOT}"
+  --metadata-out "${RUNTIME_VERIFY_DIR}/current.env"
+)
+PYTHONPATH="${RLINF_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" "${runtime_preflight_command[@]}"
+cmp --silent "${PREFLIGHT_SNAPSHOT}" "${RUNTIME_VERIFY_DIR}/current.env" || \
+  die "bundle, base model, or repository provenance changed during evaluation"
+rm -f -- "${RUNTIME_VERIFY_DIR}/current.env" "${PREFLIGHT_SNAPSHOT}"
+rmdir -- "${RUNTIME_VERIFY_DIR}"
+RUNTIME_VERIFY_DIR=""
 
 PYTHONPATH="${RLINF_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" "${RLINF_PYTHON}" "${HELPER}" finalize \
   --raw-dir "${OUTPUT_DIR}/raw" \
@@ -373,6 +463,9 @@ PYTHONPATH="${RLINF_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" "${RLINF_PYTHON}" "${HEL
   --bundle "${DSRL_BUNDLE}" \
   --task-id "${TASK_ID}" \
   --run-id "${WANDB_RUN_ID}"
+process_group_alive "${SERVER_PID}" || die "T2 server exited during result finalization"
+process_group_alive "${GPU_SAMPLER_PID}" || die "GPU sampler exited during result finalization"
+trap '' INT TERM
 write_status completed 0
 STATUS_FINALIZED=true
 exit 0

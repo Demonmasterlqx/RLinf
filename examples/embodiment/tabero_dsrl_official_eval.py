@@ -6,16 +6,21 @@
 """CPU-only validation and receipt helpers for Tabero DSRL official eval."""
 
 import argparse
+import ctypes
 import hashlib
 import json
-import math
 import os
+import signal
+import socket
 import subprocess
 import tempfile
+import time
 from collections.abc import Mapping
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import torch
 from safetensors import safe_open
 
 from rlinf.utils.dsrl_rollout_sync import (
@@ -129,6 +134,17 @@ EXPECTED_ARCHITECTURE = {
     "feature_dim": 192,
     "noise_dim": 32,
 }
+PROVENANCE_KEYS = {
+    "TABERO_PROVENANCE_VERSION",
+    "TABERO_PROVENANCE_MODE",
+    "TABERO_CONFIG_SHA256",
+    "TABERO_CONFIG_SNAPSHOT_SHA256",
+    "TABERO_GIT_COMMIT",
+    "TABERO_GIT_DIRTY",
+    "TABERO_BASE_MODEL_PATH",
+    "TABERO_BASE_MODEL_SHA256",
+    "TABERO_SOURCE_CONFIG_SHA256",
+}
 
 
 def sha256_file(path: Path) -> str:
@@ -190,6 +206,24 @@ def _read_json(path: Path, label: str) -> dict[str, Any]:
     return payload
 
 
+def _read_env(path: Path, label: str) -> dict[str, str]:
+    if not path.is_file():
+        raise ValueError(f"{label} is missing: {path}")
+    values: dict[str, str] = {}
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError) as error:
+        raise ValueError(f"{label} is not valid UTF-8: {path}") from error
+    for line in lines:
+        key, separator, value = line.partition("=")
+        if not separator or not key or not value:
+            raise ValueError(f"invalid {label} line: {line!r}")
+        if key in values:
+            raise ValueError(f"duplicate {label} key: {key}")
+        values[key] = value
+    return values
+
+
 def _atomic_write(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
@@ -248,10 +282,73 @@ def _validate_actor(actor_path: Path, task_id: int) -> None:
                         f"actor tensor manifest dtype mismatch for {key}: "
                         f"{tensor.get_dtype()}"
                     )
+                if not torch.isfinite(actor.get_tensor(key)).all().item():
+                    raise ValueError(f"actor tensor must be finite: {key}")
     except (OSError, ValueError) as error:
         if isinstance(error, ValueError) and str(error).startswith("actor"):
             raise
         raise ValueError(f"actor safetensors validation failed: {error}") from error
+
+
+def _validate_source_artifacts(
+    manifest: Mapping[str, Any], base_model_path: Path, base_hash: str
+) -> None:
+    source_paths: dict[str, Path] = {}
+    for path_key, hash_key, label in (
+        ("source_checkpoint", "source_checkpoint_sha256", "source checkpoint"),
+        ("source_provenance", "source_provenance_sha256", "source provenance"),
+        (
+            "source_config_snapshot",
+            "source_config_snapshot_sha256",
+            "source config snapshot",
+        ),
+    ):
+        path = _require_absolute_path(manifest.get(path_key), label)
+        if not path.is_file():
+            raise ValueError(f"{label} is missing: {path}")
+        expected_hash = _require_sha256(manifest.get(hash_key), f"{label} hash")
+        if sha256_file(path) != expected_hash:
+            raise ValueError(f"{label} hash mismatch")
+        source_paths[path_key] = path
+
+    legacy_path_value = manifest.get("legacy_source_config")
+    legacy_hash_value = manifest.get("legacy_source_config_sha256")
+    legacy_path: Path | None = None
+    if legacy_path_value is not None:
+        legacy_path = _require_absolute_path(legacy_path_value, "legacy source config")
+        if not legacy_path.is_file():
+            raise ValueError(f"legacy source config is missing: {legacy_path}")
+        legacy_hash = _require_sha256(legacy_hash_value, "legacy source config hash")
+        if sha256_file(legacy_path) != legacy_hash:
+            raise ValueError("legacy source config hash mismatch")
+
+    provenance = _read_env(source_paths["source_provenance"], "source provenance")
+    if set(provenance) != PROVENANCE_KEYS:
+        raise ValueError("source provenance keyspace mismatch")
+    _require_exact(
+        provenance["TABERO_PROVENANCE_VERSION"], "1", "source provenance version"
+    )
+    mode = provenance["TABERO_PROVENANCE_MODE"]
+    if mode not in {"fresh", "legacy_migration"}:
+        raise ValueError(f"source provenance mode is invalid: {mode}")
+    config_hash = manifest["source_config_snapshot_sha256"]
+    for key in ("TABERO_CONFIG_SHA256", "TABERO_CONFIG_SNAPSHOT_SHA256"):
+        if _require_sha256(provenance[key], f"source provenance {key}") != config_hash:
+            raise ValueError(f"source provenance {key} does not match config snapshot")
+    if provenance["TABERO_GIT_COMMIT"] != manifest["source_git_commit"]:
+        raise ValueError("source Git commit does not match provenance")
+    if provenance["TABERO_GIT_DIRTY"] != "false":
+        raise ValueError("source provenance Git dirty state must be false")
+    if Path(provenance["TABERO_BASE_MODEL_PATH"]).resolve() != base_model_path:
+        raise ValueError("source provenance base model path mismatch")
+    if provenance["TABERO_BASE_MODEL_SHA256"] != base_hash:
+        raise ValueError("source provenance base model hash mismatch")
+    source_config_hash = provenance["TABERO_SOURCE_CONFIG_SHA256"]
+    if mode == "fresh":
+        if legacy_path is not None or source_config_hash != "none":
+            raise ValueError("fresh source provenance must not reference legacy config")
+    elif legacy_path is None or source_config_hash != legacy_hash_value:
+        raise ValueError("legacy source provenance config hash mismatch")
 
 
 def validate_bundle(
@@ -382,6 +479,7 @@ def validate_bundle(
         raise ValueError("actor hash does not match manifest")
     if base_hash != manifest_base_hash:
         raise ValueError("fixed base model hash does not match manifest")
+    _validate_source_artifacts(manifest, base_model_path, base_hash)
 
     if set(audit) != EXPECTED_AUDIT_KEYS:
         raise ValueError("audit keyspace mismatch")
@@ -529,7 +627,7 @@ def _parse_normalized_result(
     if isinstance(success_rate, bool) or not isinstance(success_rate, (int, float)):
         raise ValueError("raw result success rate must be numeric")
     expected_rate = success_count * 100.0 / 50
-    if not math.isclose(float(success_rate), expected_rate, rel_tol=0.0, abs_tol=1e-12):
+    if float(success_rate) != expected_rate:
         raise ValueError(
             f"raw result rate/count mismatch: rate={success_rate}, count={success_count}"
         )
@@ -658,6 +756,144 @@ def write_receipts(
     return receipt
 
 
+def _descendant_pids(root_pid: int) -> set[int]:
+    descendants = {root_pid}
+    changed = True
+    while changed:
+        changed = False
+        for status_path in Path("/proc").glob("[0-9]*/status"):
+            fields: dict[str, str] = {}
+            try:
+                for line in status_path.read_text().splitlines():
+                    key, separator, value = line.partition(":")
+                    if separator and key in {"Pid", "PPid"}:
+                        fields[key] = value.strip()
+                pid = int(fields["Pid"])
+                parent_pid = int(fields["PPid"])
+            except (KeyError, OSError, ValueError):
+                continue
+            if parent_pid in descendants and pid not in descendants:
+                descendants.add(pid)
+                changed = True
+    return descendants
+
+
+def _listening_socket_inodes(port: int) -> set[str]:
+    inodes: set[str] = set()
+    encoded_port = f"{port:04X}"
+    for table in (Path("/proc/net/tcp"), Path("/proc/net/tcp6")):
+        try:
+            rows = table.read_text().splitlines()[1:]
+        except OSError:
+            continue
+        for row in rows:
+            fields = row.split()
+            if (
+                len(fields) >= 10
+                and fields[1].rsplit(":", 1)[-1] == encoded_port
+                and fields[3] == "0A"
+            ):
+                inodes.add(fields[9])
+    return inodes
+
+
+def listener_owned_by_process(pid: int, port: int) -> bool:
+    """Return whether pid or one of its descendants owns the listening port."""
+    if pid <= 0 or not 1 <= port <= 65535:
+        return False
+    inodes = _listening_socket_inodes(port)
+    if not inodes:
+        return False
+    for process_id in _descendant_pids(pid):
+        try:
+            descriptors = list(Path(f"/proc/{process_id}/fd").iterdir())
+        except OSError:
+            continue
+        for descriptor in descriptors:
+            try:
+                target = str(descriptor.readlink())
+            except OSError:
+                continue
+            if target.startswith("socket:[") and target[8:-1] in inodes:
+                try:
+                    with socket.create_connection(("127.0.0.1", port), timeout=1):
+                        return True
+                except OSError:
+                    return False
+    return False
+
+
+def sample_gpus_once(
+    gpu_file: str | Path,
+    process_file: str | Path,
+    *,
+    nvidia_smi: str = "nvidia-smi",
+) -> None:
+    """Append one GPU/process sample and propagate query or write failures."""
+    gpu_result = subprocess.run(
+        [
+            nvidia_smi,
+            "--id=0,1",
+            "--query-gpu=index,name,memory.used,memory.total,utilization.gpu,power.draw,pstate",
+            "--format=csv,noheader,nounits",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    process_result = subprocess.run(
+        [
+            nvidia_smi,
+            "--id=0,1",
+            "--query-compute-apps=gpu_uuid,pid,process_name,used_gpu_memory",
+            "--format=csv,noheader,nounits",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    timestamp = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    for output_path, rows in (
+        (Path(gpu_file), gpu_result.stdout.splitlines()),
+        (Path(process_file), process_result.stdout.splitlines()),
+    ):
+        with output_path.open("a", encoding="utf-8") as file:
+            for row in rows:
+                if row:
+                    file.write(f"{timestamp},{row}\n")
+            file.flush()
+            os.fsync(file.fileno())
+
+
+def _set_parent_death_signal(expected_parent_pid: int) -> None:
+    if os.getppid() != expected_parent_pid:
+        raise RuntimeError("launcher parent exited before child supervision started")
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(1, signal.SIGKILL, 0, 0, 0) != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+    if os.getppid() != expected_parent_pid:
+        raise RuntimeError("launcher parent exited before child supervision was armed")
+
+
+def _sample_forever(args: argparse.Namespace) -> None:
+    _set_parent_death_signal(args.parent_pid)
+    while True:
+        started = time.monotonic()
+        sample_gpus_once(args.gpu_file, args.process_file)
+        time.sleep(max(0.0, args.interval - (time.monotonic() - started)))
+
+
+def _supervise(args: argparse.Namespace) -> None:
+    command = list(args.child_command)
+    if command and command[0] == "--":
+        command.pop(0)
+    if not command:
+        raise ValueError("supervise requires a child command")
+    _set_parent_death_signal(args.parent_pid)
+    os.execvpe(command[0], command, os.environ)
+
+
 def _metadata_lines(
     bundle: Mapping[str, str], repos: Mapping[str, Mapping[str, Any]]
 ) -> list[str]:
@@ -717,6 +953,17 @@ def _parser() -> argparse.ArgumentParser:
     finalize.add_argument("--bundle", type=Path, required=True)
     finalize.add_argument("--task-id", type=int, choices=(0, 5), required=True)
     finalize.add_argument("--run-id", required=True)
+    listener = commands.add_parser("listener-owned")
+    listener.add_argument("--pid", type=int, required=True)
+    listener.add_argument("--port", type=int, required=True)
+    sampler = commands.add_parser("sample-gpus")
+    sampler.add_argument("--gpu-file", type=Path, required=True)
+    sampler.add_argument("--process-file", type=Path, required=True)
+    sampler.add_argument("--interval", type=float, default=5.0)
+    sampler.add_argument("--parent-pid", type=int, required=True)
+    supervise = commands.add_parser("supervise")
+    supervise.add_argument("--parent-pid", type=int, required=True)
+    supervise.add_argument("child_command", nargs=argparse.REMAINDER)
     return parser
 
 
@@ -725,8 +972,15 @@ def main() -> None:
     try:
         if args.command == "preflight":
             _preflight(args)
-        else:
+        elif args.command == "finalize":
             _finalize(args)
+        elif args.command == "listener-owned":
+            if not listener_owned_by_process(args.pid, args.port):
+                raise SystemExit(1)
+        elif args.command == "sample-gpus":
+            _sample_forever(args)
+        else:
+            _supervise(args)
     except (FileExistsError, OSError, RuntimeError, ValueError) as error:
         raise SystemExit(f"error: {error}") from error
 
