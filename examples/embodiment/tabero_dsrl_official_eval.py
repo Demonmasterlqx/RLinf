@@ -893,6 +893,18 @@ def _set_child_subreaper() -> None:
         raise OSError(error_number, os.strerror(error_number))
 
 
+def _set_parent_death_signal(parent_death_signal: int) -> None:
+    expected_parent_pid = os.getppid()
+    if expected_parent_pid <= 1:
+        raise RuntimeError("supervisor exited before parent-death signal was armed")
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(1, parent_death_signal, 0, 0, 0) != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+    if os.getppid() != expected_parent_pid:
+        raise RuntimeError("supervisor exited while parent-death signal was armed")
+
+
 def _process_group_exists(process_group_id: int) -> bool:
     try:
         os.killpg(process_group_id, 0)
@@ -1049,8 +1061,6 @@ def _open_gpu_lock(directory_fd: int, gpu_id: int) -> int:
 
 
 def _hold_gpu_locks(args: argparse.Namespace) -> None:
-    directory_fd = _validate_lock_directory(args.lock_dir)
-    lock_descriptors: list[int] = []
     stop_requested = threading.Event()
 
     def request_stop(_signum: int, _frame: Any) -> None:
@@ -1058,6 +1068,9 @@ def _hold_gpu_locks(args: argparse.Namespace) -> None:
 
     signal.signal(signal.SIGTERM, request_stop)
     signal.signal(signal.SIGINT, request_stop)
+    _set_parent_death_signal(signal.SIGTERM)
+    directory_fd = _validate_lock_directory(args.lock_dir)
+    lock_descriptors: list[int] = []
     try:
         for gpu_id in (0, 1):
             lock_descriptors.append(_open_gpu_lock(directory_fd, gpu_id))

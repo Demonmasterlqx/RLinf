@@ -695,10 +695,17 @@ def test_launcher_stops_gpu_workers_before_finalization():
 
 def test_launcher_runs_every_business_helper_under_supervision():
     launcher = LAUNCHER_PATH.read_text()
-    assert 'run_supervised "${preflight_command[@]}"' in launcher
-    assert 'run_supervised "${runtime_preflight_command[@]}"' in launcher
-    assert 'run_supervised "${RLINF_PYTHON}" "${HELPER}" listener-owned' in launcher
-    assert 'run_supervised "${RLINF_PYTHON}" "${HELPER}" finalize' in launcher
+    assert 'run_supervised_with_gpu_lease "${preflight_command[@]}"' in launcher
+    assert 'run_supervised_with_gpu_lease "${runtime_preflight_command[@]}"' in launcher
+    assert (
+        'run_supervised_with_gpu_lease "${RLINF_PYTHON}" "${HELPER}" listener-owned'
+        in launcher
+    )
+    assert (
+        'run_supervised_with_gpu_lease "${RLINF_PYTHON}" "${HELPER}" finalize'
+        in launcher
+    )
+    assert launcher.count("require_gpu_lease_guardian") >= 8
     assert "exec {gpu_lock_fd}" not in launcher
 
 
@@ -1035,6 +1042,99 @@ def test_launcher_rejects_symlink_gpu_lock_directory(tmp_path, bundle_fixture):
     assert result.returncode != 0
     assert "lock" in result.stderr.lower() or "symlink" in result.stderr.lower()
     assert not any(results.iterdir())
+
+
+def test_launcher_fails_and_releases_leases_if_guardian_supervisor_dies(
+    tmp_path, bundle_fixture
+):
+    bundle, base_model, _, _ = bundle_fixture
+    env, _, _ = _launcher_environment(tmp_path, bundle, base_model)
+    command = [
+        "bash",
+        str(LAUNCHER_PATH),
+        "dsrl",
+        "0",
+        "formal",
+        "--dsrl-bundle",
+        str(bundle.resolve()),
+        "--dry-run",
+    ]
+    launcher = subprocess.Popen(
+        command,
+        cwd=REPO_ROOT,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    supervisor_pid = None
+    guardian_pid = None
+    contender = None
+    try:
+        helper = _load_helper()
+        for _ in range(200):
+            for pid in helper._descendant_pids(launcher.pid):
+                if pid == launcher.pid:
+                    continue
+                try:
+                    command_line = (
+                        Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+                    )
+                except OSError:
+                    continue
+                if b"hold-gpu-locks" not in command_line:
+                    continue
+                if b"supervise" in command_line:
+                    supervisor_pid = pid
+                else:
+                    guardian_pid = pid
+            leases_held = True
+            for gpu_id in (0, 1):
+                lock_path = (
+                    Path(env["TABERO_TEST_GPU_LOCK_DIR"])
+                    / f"tabero-formal-gpu-{gpu_id}.lock"
+                )
+                try:
+                    with lock_path.open("r+") as lock_file:
+                        flock(lock_file, LOCK_EX | LOCK_NB)
+                except (BlockingIOError, PermissionError):
+                    continue
+                except FileNotFoundError:
+                    pass
+                leases_held = False
+                break
+            if supervisor_pid is not None and guardian_pid is not None and leases_held:
+                break
+            time.sleep(0.05)
+        assert supervisor_pid is not None
+        assert guardian_pid is not None
+
+        os.kill(supervisor_pid, signal.SIGKILL)
+
+        assert launcher.wait(timeout=30) != 0
+        assert _wait_until_not_running(guardian_pid)
+        assert launcher.stderr is not None
+        assert "GPU lease guardian" in launcher.stderr.read()
+
+        second_ready = tmp_path / "second.ready"
+        contender = _start_gpu_lock_guardian(
+            Path(env["TABERO_TEST_GPU_LOCK_DIR"]), second_ready
+        )
+        for _ in range(100):
+            if second_ready.exists() or contender.poll() is not None:
+                break
+            time.sleep(0.05)
+        assert second_ready.read_text() == "ready\n"
+    finally:
+        if launcher.poll() is None:
+            launcher.kill()
+            launcher.wait(timeout=5)
+        if contender is not None:
+            contender.terminate()
+            contender.wait(timeout=5)
+        for pid in (supervisor_pid, guardian_pid):
+            if pid is not None and _pid_is_running(pid):
+                os.kill(pid, signal.SIGKILL)
 
 
 def test_listener_ownership_is_bound_to_launched_process():

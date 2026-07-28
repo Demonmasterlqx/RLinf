@@ -165,6 +165,39 @@ cleanup_gpu_lease() {
 }
 trap cleanup_gpu_lease EXIT
 
+require_gpu_lease_guardian() {
+  local guardian_status
+  if process_alive "${GPU_LOCK_GUARDIAN_PID}"; then
+    return 0
+  fi
+  set +e
+  wait "${GPU_LOCK_GUARDIAN_PID}" 2>/dev/null
+  guardian_status=$?
+  set -e
+  GPU_LOCK_GUARDIAN_PID=""
+  die "GPU lease guardian exited unexpectedly with status ${guardian_status}"
+}
+
+run_supervised_with_gpu_lease() {
+  local supervised_pid supervised_status
+  require_gpu_lease_guardian
+  run_supervised "$@" &
+  supervised_pid=$!
+  while process_alive "${supervised_pid}"; do
+    if ! process_alive "${GPU_LOCK_GUARDIAN_PID}"; then
+      stop_supervised_process "${supervised_pid}" || true
+      require_gpu_lease_guardian
+    fi
+    sleep 0.1
+  done
+  set +e
+  wait "${supervised_pid}"
+  supervised_status=$?
+  set -e
+  require_gpu_lease_guardian
+  [[ "${supervised_status}" -eq 0 ]]
+}
+
 declare -A INSTALLED_GPUS=()
 while IFS= read -r gpu_id; do
   gpu_id="${gpu_id// /}"
@@ -238,7 +271,7 @@ preflight_command=(
 if [[ "${DRY_RUN}" == true && "${TABERO_TEST_ALLOW_DIRTY:-}" == "1" ]]; then
   preflight_command+=(--allow-dirty)
 fi
-PYTHONPATH="${RLINF_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" run_supervised "${preflight_command[@]}"
+PYTHONPATH="${RLINF_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" run_supervised_with_gpu_lease "${preflight_command[@]}"
 
 RUN_STAMP="$(date +%Y%m%d_%H%M%S)_formal"
 if [[ "${DRY_RUN}" == true && -n "${TABERO_TEST_TIMESTAMP:-}" ]]; then
@@ -331,7 +364,7 @@ PORT=""
 if [[ "${DRY_RUN}" == true && -n "${TABERO_TEST_PORT:-}" ]]; then
   PORT="${TABERO_TEST_PORT}"
 else
-  PORT="$(run_supervised "${RLINF_PYTHON}" - <<'PY'
+  PORT="$(run_supervised_with_gpu_lease "${RLINF_PYTHON}" - <<'PY'
 import socket
 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
     sock.bind(("127.0.0.1", 0))
@@ -433,6 +466,7 @@ if [[ "${DRY_RUN}" == true ]]; then
   exit 0
 fi
 
+require_gpu_lease_guardian
 run_supervised "${RLINF_PYTHON}" "${HELPER}" sample-gpus \
   --gpu-file "${OUTPUT_DIR}/gpu_samples.csv" \
   --process-file "${OUTPUT_DIR}/gpu_process_samples.csv" \
@@ -441,15 +475,17 @@ run_supervised "${RLINF_PYTHON}" "${HELPER}" sample-gpus \
 GPU_SAMPLER_PID=$!
 printf '%s\n' "${GPU_SAMPLER_PID}" >"${OUTPUT_DIR}/gpu_sampler.pid"
 
+require_gpu_lease_guardian
 run_supervised "${server_command[@]}" >"${OUTPUT_DIR}/server.log" 2>&1 &
 SERVER_PID=$!
 printf '%s\n' "${SERVER_PID}" >"${OUTPUT_DIR}/server.pid"
 ready=false
 for _ in $(seq 1 300); do
+  require_gpu_lease_guardian
   process_group_alive "${GPU_SAMPLER_PID}" || die "GPU sampler exited before server readiness"
   process_group_alive "${SERVER_PID}" || die "T2 server exited before becoming ready"
   if PYTHONPATH="${RLINF_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" \
-    run_supervised "${RLINF_PYTHON}" "${HELPER}" listener-owned --pid "${SERVER_PID}" --port "${PORT}"
+    run_supervised_with_gpu_lease "${RLINF_PYTHON}" "${HELPER}" listener-owned --pid "${SERVER_PID}" --port "${PORT}"
   then
     ready=true
     break
@@ -458,10 +494,12 @@ for _ in $(seq 1 300); do
 done
 [[ "${ready}" == true ]] || die "T2 server did not listen within 600 seconds"
 
+require_gpu_lease_guardian
 run_supervised "${client_command[@]}" >"${OUTPUT_DIR}/client.log" 2>&1 &
 CLIENT_PID=$!
 printf '%s\n' "${CLIENT_PID}" >"${OUTPUT_DIR}/client.pid"
 while process_group_alive "${CLIENT_PID}"; do
+  require_gpu_lease_guardian
   process_group_alive "${SERVER_PID}" || die "T2 server exited while client was running"
   process_group_alive "${GPU_SAMPLER_PID}" || die "GPU sampler exited while client was running"
   sleep 1
@@ -472,6 +510,7 @@ CLIENT_STATUS=$?
 set -e
 CLIENT_PID=""
 [[ "${CLIENT_STATUS}" -eq 0 ]] || die "Tabero client failed with exit status ${CLIENT_STATUS}"
+require_gpu_lease_guardian
 process_group_alive "${SERVER_PID}" || die "T2 server exited before controlled shutdown"
 process_group_alive "${GPU_SAMPLER_PID}" || die "GPU sampler exited before controlled shutdown"
 stop_gpu_sampler_successfully
@@ -489,19 +528,20 @@ runtime_preflight_command=(
   --tabero-repo "${TABERO_ROOT}"
   --metadata-out "${RUNTIME_VERIFY_DIR}/current.env"
 )
-PYTHONPATH="${RLINF_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" run_supervised "${runtime_preflight_command[@]}"
+PYTHONPATH="${RLINF_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" run_supervised_with_gpu_lease "${runtime_preflight_command[@]}"
 cmp --silent "${PREFLIGHT_SNAPSHOT}" "${RUNTIME_VERIFY_DIR}/current.env" || \
   die "bundle, base model, or repository provenance changed during evaluation"
 rm -f -- "${RUNTIME_VERIFY_DIR}/current.env" "${PREFLIGHT_SNAPSHOT}"
 rmdir -- "${RUNTIME_VERIFY_DIR}"
 RUNTIME_VERIFY_DIR=""
 
-PYTHONPATH="${RLINF_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" run_supervised "${RLINF_PYTHON}" "${HELPER}" finalize \
+PYTHONPATH="${RLINF_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" run_supervised_with_gpu_lease "${RLINF_PYTHON}" "${HELPER}" finalize \
   --raw-dir "${OUTPUT_DIR}/raw" \
   --output-dir "${OUTPUT_DIR}" \
   --bundle "${DSRL_BUNDLE}" \
   --task-id "${TASK_ID}" \
   --run-id "${WANDB_RUN_ID}"
+require_gpu_lease_guardian
 stop_supervised_process "${GPU_LOCK_GUARDIAN_PID}" || die "GPU lease guardian did not stop cleanly"
 GPU_LOCK_GUARDIAN_PID=""
 rm -f -- "${GPU_LOCK_STATE_DIR}/ready"
