@@ -14,6 +14,7 @@
 
 import asyncio
 import copy
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -36,6 +37,18 @@ ROLLOUT_SYNC_PREFIXES = [
     "actor_state_encoder.",
     "actor_tactile_encoder.",
 ]
+REPO_ROOT = Path(__file__).resolve().parents[2]
+LEGACY_DSRL_CONFIG_PATHS = [
+    REPO_ROOT / "examples/embodiment/config/libero_spatial_dsrl_openpi.yaml",
+    REPO_ROOT / "examples/embodiment/config/libero_spatial_dsrl_openpi_pi05.yaml",
+    REPO_ROOT / "examples/embodiment/config/libero_spatial_async_dsrl_openpi.yaml",
+    REPO_ROOT / "examples/embodiment/config/libero_spatial_async_dsrl_openpi_pi05.yaml",
+    REPO_ROOT / "tests/e2e_tests/embodied/libero_spatial_dsrl_openpi.yaml",
+]
+SELECTIVE_DSRL_SMOKE_CONFIG_PATH = (
+    REPO_ROOT
+    / "examples/embodiment/config/isaaclab_pi0_dsrl_tacfield_tabero_task0_firm_8gpu_smoke.yaml"
+)
 
 
 def _representative_dsrl_model() -> OpenPi0ForRLActionPrediction:
@@ -74,6 +87,7 @@ def _actor_cfg(**fsdp_overrides):
             "training_backend": "fsdp",
             "rollout_sync_prefixes": ROLLOUT_SYNC_PREFIXES,
             "fsdp_config": fsdp_config,
+            "model": {"openpi": {"use_dsrl": True, "dsrl_use_tactile": True}},
         }
     )
 
@@ -84,9 +98,7 @@ def test_dsrl_sender_selects_exact_actor_keyspace_and_normalizes_fsdp_names():
     selected = EmbodiedSACFSDPPolicy._select_dsrl_rollout_state_dict(
         model, ROLLOUT_SYNC_PREFIXES
     )
-    EmbodiedSACFSDPPolicy._validate_dsrl_rollout_state_dict(
-        selected, expected_keys=tuple(selected)
-    )
+    EmbodiedSACFSDPPolicy._validate_dsrl_rollout_state_dict(selected)
 
     assert len(selected) == 48
     assert sum(parameter.numel() for parameter in selected.values()) == 2_311_648
@@ -125,6 +137,52 @@ def test_dsrl_sender_does_not_call_full_model_state_dict_api():
     selected = worker.get_rollout_state_dict()
 
     assert list(selected) == worker.param_names_need_sync
+
+
+@pytest.mark.parametrize("config_path", LEGACY_DSRL_CONFIG_PATHS, ids=lambda p: p.stem)
+def test_legacy_non_tactile_dsrl_configs_keep_full_sync_path(config_path):
+    cfg = OmegaConf.load(config_path)
+    assert "rollout_sync_prefixes" not in cfg.actor
+    assert cfg.actor.model.openpi.use_dsrl is True
+    assert cfg.actor.model.openpi.get("dsrl_use_tactile", False) is False
+    assert EmbodiedSACFSDPPolicy._validate_dsrl_rollout_sync_config(cfg.actor) is None
+
+    worker = EmbodiedSACFSDPPolicy.__new__(EmbodiedSACFSDPPolicy)
+    worker.use_dsrl = True
+    worker.cfg = OmegaConf.create({"actor": cfg.actor})
+    expected = {"legacy.full.weight": torch.ones(1)}
+    calls = []
+
+    def get_model_state_dict(**kwargs):
+        calls.append(kwargs)
+        return expected
+
+    worker.get_model_state_dict = get_model_state_dict
+
+    assert worker.get_rollout_state_dict() is expected
+    assert calls == [{"cpu_offload": False, "full_state_dict": False}]
+
+    rollout = MultiStepRolloutWorker.__new__(MultiStepRolloutWorker)
+    rollout.model_cfg = cfg.actor.model
+    rollout.cfg = OmegaConf.create({"actor": cfg.actor})
+    rollout.hf_model = SimpleNamespace(state_dict=lambda: expected)
+    assert rollout._get_rollout_sync_state_dict() is expected
+
+
+def test_tabero_tactile_dsrl_smoke_opts_into_selective_sync():
+    cfg = OmegaConf.load(SELECTIVE_DSRL_SMOKE_CONFIG_PATH)
+
+    assert EmbodiedSACFSDPPolicy._validate_dsrl_rollout_sync_config(cfg.actor) == tuple(
+        ROLLOUT_SYNC_PREFIXES
+    )
+
+
+def test_selected_dsrl_rollout_sync_requires_tactile_model():
+    actor_cfg = _actor_cfg()
+    actor_cfg.model.openpi.dsrl_use_tactile = False
+
+    with pytest.raises(ValueError, match="dsrl_use_tactile.*true"):
+        EmbodiedSACFSDPPolicy._validate_dsrl_rollout_sync_config(actor_cfg)
 
 
 class _SmallSyncModel(nn.Module):
@@ -238,7 +296,11 @@ def test_dsrl_rollout_sync_rejects_invalid_fsdp_config(overrides, message):
 
 @pytest.mark.parametrize(
     "prefixes",
-    [ROLLOUT_SYNC_PREFIXES[:-1], [*ROLLOUT_SYNC_PREFIXES, "critic_image_encoder."]],
+    [
+        [],
+        ROLLOUT_SYNC_PREFIXES[:-1],
+        [*ROLLOUT_SYNC_PREFIXES, "critic_image_encoder."],
+    ],
 )
 def test_dsrl_rollout_sync_rejects_missing_or_extra_configured_prefix(prefixes):
     actor_cfg = _actor_cfg()
@@ -253,30 +315,56 @@ def test_dsrl_rollout_sync_rejects_wrong_model_keyspace(mutation):
     selected = EmbodiedSACFSDPPolicy._select_dsrl_rollout_state_dict(
         _representative_dsrl_model(), ROLLOUT_SYNC_PREFIXES
     )
-    expected_keys = tuple(selected)
     if mutation == "missing":
         selected.pop(next(iter(selected)))
     else:
         selected["actor_state_encoder.unexpected"] = torch.ones(1)
 
     with pytest.raises(ValueError, match="missing keys.*unexpected keys"):
-        EmbodiedSACFSDPPolicy._validate_dsrl_rollout_state_dict(
-            selected, expected_keys=expected_keys
-        )
+        EmbodiedSACFSDPPolicy._validate_dsrl_rollout_state_dict(selected)
 
 
 def test_dsrl_rollout_sync_rejects_compensating_key_substitution():
     selected = EmbodiedSACFSDPPolicy._select_dsrl_rollout_state_dict(
         _representative_dsrl_model(), ROLLOUT_SYNC_PREFIXES
     )
-    expected_keys = tuple(selected)
     expected_key = next(iter(selected))
     selected["actor_state_encoder.unexpected"] = selected.pop(expected_key)
 
     with pytest.raises(ValueError, match="missing keys.*unexpected keys"):
-        EmbodiedSACFSDPPolicy._validate_dsrl_rollout_state_dict(
-            selected, expected_keys=expected_keys
-        )
+        EmbodiedSACFSDPPolicy._validate_dsrl_rollout_state_dict(selected)
+
+
+def test_dsrl_rollout_sync_rejects_same_numel_wrong_shape():
+    selected = EmbodiedSACFSDPPolicy._select_dsrl_rollout_state_dict(
+        _representative_dsrl_model(), ROLLOUT_SYNC_PREFIXES
+    )
+    key = "dsrl_action_noise_net.shared_net.0.weight"
+    selected[key] = torch.empty(192, 128)
+
+    with pytest.raises(ValueError, match="shape mismatches"):
+        EmbodiedSACFSDPPolicy._validate_dsrl_rollout_state_dict(selected)
+
+
+def test_dsrl_sender_rejects_runtime_compensating_parameter_rename():
+    model = _representative_dsrl_model()
+    first_layer = model.dsrl_action_noise_net.shared_net[0]
+    parameter = first_layer._parameters.pop("weight")
+    first_layer.register_parameter("unexpected_weight", parameter)
+    selected = EmbodiedSACFSDPPolicy._select_dsrl_rollout_state_dict(
+        model, ROLLOUT_SYNC_PREFIXES
+    )
+    assert len(selected) == 48
+    assert sum(value.numel() for value in selected.values()) == 2_311_648
+
+    worker = EmbodiedSACFSDPPolicy.__new__(EmbodiedSACFSDPPolicy)
+    worker.use_dsrl = True
+    worker.cfg = OmegaConf.create({"actor": _actor_cfg()})
+    worker.model = model
+    worker.param_names_need_sync = list(selected)
+
+    with pytest.raises(ValueError, match="missing keys.*unexpected keys"):
+        worker.get_rollout_state_dict()
 
 
 def test_non_dsrl_sender_keeps_existing_state_dict_path():

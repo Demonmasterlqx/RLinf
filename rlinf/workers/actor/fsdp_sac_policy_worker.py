@@ -74,11 +74,10 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         prefixes = getattr(self, "_rollout_sync_prefixes", None)
         if prefixes is None:
             prefixes = validate_dsrl_rollout_sync_config(self.cfg.actor)
+        if prefixes is None:
+            return super().get_rollout_state_dict()
         state_dict = select_named_parameters_by_prefix(self.model, prefixes)
-        expected_keys = getattr(
-            self, "_rollout_sync_expected_keys", self.param_names_need_sync
-        )
-        validate_dsrl_rollout_state_dict(state_dict, expected_keys=expected_keys)
+        validate_dsrl_rollout_state_dict(state_dict)
         if list(state_dict) != self.param_names_need_sync:
             raise ValueError(
                 "OpenPI DSRL rollout sync parameter names changed after FSDP "
@@ -117,10 +116,9 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         """Setup model, lr_scheduler, optimizer and grad_scaler."""
         """Add initializing target model logic."""
         self.use_dsrl = self.cfg.actor.model.get("openpi", {}).get("use_dsrl", False)
-        if self.use_dsrl:
-            self._rollout_sync_prefixes = validate_dsrl_rollout_sync_config(
-                self.cfg.actor
-            )
+        self._rollout_sync_prefixes = (
+            validate_dsrl_rollout_sync_config(self.cfg.actor) if self.use_dsrl else None
+        )
         module = self.model_provider_func()
         if initialize_target:
             target_module = self.model_provider_func()
@@ -137,16 +135,12 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         # Record names before FSDP wrapping. DSRL rollout sync is intentionally
         # limited to actor-side steering parameters; other policies retain the
         # existing trainable-parameter and persistent-buffer behavior.
-        if self.use_dsrl:
+        if self._rollout_sync_prefixes is not None:
             rollout_state_dict = select_named_parameters_by_prefix(
                 module, self._rollout_sync_prefixes
             )
-            self._rollout_sync_expected_keys = tuple(rollout_state_dict)
-            validate_dsrl_rollout_state_dict(
-                rollout_state_dict,
-                expected_keys=self._rollout_sync_expected_keys,
-            )
-            self.param_names_need_sync = list(self._rollout_sync_expected_keys)
+            validate_dsrl_rollout_state_dict(rollout_state_dict)
+            self.param_names_need_sync = list(rollout_state_dict)
         else:
             self.param_names_need_sync = collect_param_names_need_sync(module)
 

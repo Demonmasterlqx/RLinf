@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Mapping, Sequence
+from math import prod
+from types import MappingProxyType
 
 import torch
 
@@ -22,12 +24,82 @@ DSRL_ROLLOUT_SYNC_PREFIXES = (
     "actor_state_encoder.",
     "actor_tactile_encoder.",
 )
-DSRL_ROLLOUT_SYNC_TENSOR_COUNT = 48
+DSRL_ROLLOUT_SYNC_MANIFEST_VERSION = 1
+DSRL_ROLLOUT_SYNC_MANIFEST_V1: Mapping[str, tuple[int, ...]] = MappingProxyType(
+    {
+        "dsrl_action_noise_net.shared_net.0.weight": (128, 192),
+        "dsrl_action_noise_net.shared_net.0.bias": (128,),
+        "dsrl_action_noise_net.shared_net.1.weight": (128,),
+        "dsrl_action_noise_net.shared_net.1.bias": (128,),
+        "dsrl_action_noise_net.shared_net.3.weight": (128, 128),
+        "dsrl_action_noise_net.shared_net.3.bias": (128,),
+        "dsrl_action_noise_net.shared_net.4.weight": (128,),
+        "dsrl_action_noise_net.shared_net.4.bias": (128,),
+        "dsrl_action_noise_net.shared_net.6.weight": (128, 128),
+        "dsrl_action_noise_net.shared_net.6.bias": (128,),
+        "dsrl_action_noise_net.shared_net.7.weight": (128,),
+        "dsrl_action_noise_net.shared_net.7.bias": (128,),
+        "dsrl_action_noise_net.mean_layer.weight": (32, 128),
+        "dsrl_action_noise_net.mean_layer.bias": (32,),
+        "dsrl_action_noise_net.log_std_layer.weight": (32, 128),
+        "dsrl_action_noise_net.log_std_layer.bias": (32,),
+        "actor_image_encoder.encoder.0.weight": (32, 3, 3, 3),
+        "actor_image_encoder.encoder.0.bias": (32,),
+        "actor_image_encoder.encoder.2.weight": (32, 32, 3, 3),
+        "actor_image_encoder.encoder.2.bias": (32,),
+        "actor_image_encoder.encoder.4.weight": (32, 32, 3, 3),
+        "actor_image_encoder.encoder.4.bias": (32,),
+        "actor_image_encoder.encoder.6.weight": (32, 32, 3, 3),
+        "actor_image_encoder.encoder.6.bias": (32,),
+        "actor_image_encoder.bottleneck.1.weight": (64, 32768),
+        "actor_image_encoder.bottleneck.1.bias": (64,),
+        "actor_image_encoder.bottleneck.2.weight": (64,),
+        "actor_image_encoder.bottleneck.2.bias": (64,),
+        "actor_state_encoder.encoder.0.weight": (64, 7),
+        "actor_state_encoder.encoder.0.bias": (64,),
+        "actor_state_encoder.encoder.1.weight": (64,),
+        "actor_state_encoder.encoder.1.bias": (64,),
+        "actor_tactile_encoder.blocks.0.kernels.0.weight": (64, 396),
+        "actor_tactile_encoder.blocks.0.kernels.0.bias": (64,),
+        "actor_tactile_encoder.blocks.0.kernels.1.weight": (64, 396),
+        "actor_tactile_encoder.blocks.0.kernels.1.bias": (64,),
+        "actor_tactile_encoder.blocks.0.kernels.2.weight": (64, 396),
+        "actor_tactile_encoder.blocks.0.kernels.2.bias": (64,),
+        "actor_tactile_encoder.blocks.0.residual_proj.weight": (64, 396),
+        "actor_tactile_encoder.blocks.0.residual_proj.bias": (64,),
+        "actor_tactile_encoder.blocks.1.kernels.0.weight": (64, 64),
+        "actor_tactile_encoder.blocks.1.kernels.0.bias": (64,),
+        "actor_tactile_encoder.blocks.1.kernels.1.weight": (64, 64),
+        "actor_tactile_encoder.blocks.1.kernels.1.bias": (64,),
+        "actor_tactile_encoder.blocks.1.kernels.2.weight": (64, 64),
+        "actor_tactile_encoder.blocks.1.kernels.2.bias": (64,),
+        "actor_tactile_encoder.out_proj.weight": (64, 64),
+        "actor_tactile_encoder.out_proj.bias": (64,),
+    }
+)
+DSRL_ROLLOUT_SYNC_TENSOR_COUNT = len(DSRL_ROLLOUT_SYNC_MANIFEST_V1)
 DSRL_ROLLOUT_SYNC_PARAMETER_COUNT = 2_311_648
 
+assert DSRL_ROLLOUT_SYNC_TENSOR_COUNT == 48
+assert (
+    sum(prod(shape) for shape in DSRL_ROLLOUT_SYNC_MANIFEST_V1.values())
+    == DSRL_ROLLOUT_SYNC_PARAMETER_COUNT
+)
 
-def validate_dsrl_rollout_sync_config(actor_cfg) -> tuple[str, ...]:
-    """Validate the explicit DSRL actor-to-rollout synchronization contract."""
+
+def validate_dsrl_rollout_sync_config(actor_cfg) -> tuple[str, ...] | None:
+    """Validate opt-in DSRL sync, or return ``None`` for the legacy path."""
+    if "rollout_sync_prefixes" not in actor_cfg:
+        return None
+
+    configured_prefixes = tuple(actor_cfg.rollout_sync_prefixes)
+    if configured_prefixes != DSRL_ROLLOUT_SYNC_PREFIXES:
+        raise ValueError(
+            "OpenPI DSRL actor.rollout_sync_prefixes must contain exactly "
+            f"{list(DSRL_ROLLOUT_SYNC_PREFIXES)} in this order; got "
+            f"{list(configured_prefixes)}."
+        )
+
     training_backend = actor_cfg.get("training_backend")
     if training_backend != "fsdp":
         raise ValueError(
@@ -35,12 +107,11 @@ def validate_dsrl_rollout_sync_config(actor_cfg) -> tuple[str, ...]:
             f"fsdp; got {training_backend!r}."
         )
 
-    configured_prefixes = tuple(actor_cfg.get("rollout_sync_prefixes", ()))
-    if configured_prefixes != DSRL_ROLLOUT_SYNC_PREFIXES:
+    openpi_cfg = actor_cfg.get("model", {}).get("openpi", {})
+    if openpi_cfg.get("dsrl_use_tactile") is not True:
         raise ValueError(
-            "OpenPI DSRL actor.rollout_sync_prefixes must contain exactly "
-            f"{list(DSRL_ROLLOUT_SYNC_PREFIXES)} in this order; got "
-            f"{list(configured_prefixes)}."
+            "OpenPI DSRL selective rollout sync requires "
+            "actor.model.openpi.dsrl_use_tactile: true."
         )
 
     fsdp_cfg = actor_cfg.get("fsdp_config", {})
@@ -107,19 +178,26 @@ def filter_state_dict_by_prefix(
 
 def validate_dsrl_rollout_state_dict(
     state_dict: Mapping[str, torch.Tensor],
-    *,
-    expected_keys: Collection[str],
 ) -> None:
-    """Require the Tabero DSRL actor rollout synchronization keyspace."""
+    """Require the versioned Tabero DSRL rollout synchronization manifest."""
     actual_key_set = set(state_dict)
-    expected_key_set = set(expected_keys)
+    expected_key_set = set(DSRL_ROLLOUT_SYNC_MANIFEST_V1)
     missing_keys = sorted(expected_key_set - actual_key_set)
     unexpected_keys = sorted(actual_key_set - expected_key_set)
-    if missing_keys or unexpected_keys:
+    shape_mismatches = {
+        key: {
+            "expected": expected_shape,
+            "actual": tuple(state_dict[key].shape),
+        }
+        for key, expected_shape in DSRL_ROLLOUT_SYNC_MANIFEST_V1.items()
+        if key in state_dict and tuple(state_dict[key].shape) != expected_shape
+    }
+    if missing_keys or unexpected_keys or shape_mismatches:
         raise ValueError(
-            "OpenPI DSRL rollout sync state dict does not match the exact reference "
-            f"keyspace; missing keys: {missing_keys}; unexpected keys: "
-            f"{unexpected_keys}."
+            "OpenPI DSRL rollout sync state dict does not match canonical manifest "
+            f"v{DSRL_ROLLOUT_SYNC_MANIFEST_VERSION}; missing keys: {missing_keys}; "
+            "unexpected keys: "
+            f"{unexpected_keys}; shape mismatches: {shape_mismatches}."
         )
 
     tensor_count = len(state_dict)
