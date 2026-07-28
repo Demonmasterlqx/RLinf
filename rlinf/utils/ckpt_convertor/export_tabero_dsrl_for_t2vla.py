@@ -12,6 +12,7 @@ import os
 import shutil
 import tempfile
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -52,6 +53,17 @@ PROVENANCE_KEYS = {
 }
 
 
+@dataclass(frozen=True)
+class _ValidatedProvenance:
+    path: Path
+    sha256: str
+    config_snapshot: Path
+    config_snapshot_sha256: str
+    legacy_source_config: Path | None
+    legacy_source_config_sha256: str | None
+    values: dict[str, str]
+
+
 def checkpoint_sha256(path: str | Path) -> str:
     """Return the SHA-256 digest of one checkpoint file."""
     checkpoint = Path(path)
@@ -60,6 +72,18 @@ def checkpoint_sha256(path: str | Path) -> str:
         for chunk in iter(lambda: file.read(8 * 1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _require_artifact_unchanged(path: Path, expected_hash: str, label: str) -> None:
+    try:
+        actual_hash = checkpoint_sha256(path)
+    except OSError as error:
+        raise ValueError(f"{label} changed during export: {path}") from error
+    if actual_hash != expected_hash:
+        raise ValueError(
+            f"{label} changed during export; "
+            f"expected={expected_hash}, actual={actual_hash}, path={path}"
+        )
 
 
 def _require_sha256(value: str, label: str) -> str:
@@ -327,11 +351,19 @@ def _validate_provenance(
     base_model: Path,
     actual_base_hash: str,
     metadata: Mapping[str, Any],
-) -> tuple[Path, Path, Path | None, dict[str, str]]:
+) -> _ValidatedProvenance:
     output_root = checkpoint.parents[5]
     provenance_path = output_root / "provenance.env"
     config_snapshot = output_root / "config_snapshot.yaml"
+    if not provenance_path.is_file():
+        raise ValueError(f"formal provenance does not exist: {provenance_path}")
+    provenance_hash = checkpoint_sha256(provenance_path)
     provenance = _load_provenance(provenance_path)
+    _require_artifact_unchanged(
+        provenance_path,
+        provenance_hash,
+        "formal provenance",
+    )
     if not config_snapshot.is_file():
         raise ValueError(f"formal config snapshot does not exist: {config_snapshot}")
     snapshot_hash = checkpoint_sha256(config_snapshot)
@@ -345,20 +377,64 @@ def _validate_provenance(
     if provenance["TABERO_BASE_MODEL_SHA256"] != actual_base_hash:
         raise ValueError("base model SHA-256 does not match formal provenance")
     _validate_config_snapshot(config_snapshot, base_model, metadata)
+    _require_artifact_unchanged(
+        config_snapshot,
+        snapshot_hash,
+        "formal config snapshot",
+    )
 
     legacy_source_config = None
+    legacy_source_hash = None
     if provenance["TABERO_PROVENANCE_MODE"] == "legacy_migration":
         legacy_source_config = output_root / "tensorboard" / "config.yaml"
         if not legacy_source_config.is_file():
             raise ValueError(
                 f"legacy source config does not exist: {legacy_source_config}"
             )
-        if (
-            checkpoint_sha256(legacy_source_config)
-            != provenance["TABERO_SOURCE_CONFIG_SHA256"]
-        ):
+        legacy_source_hash = checkpoint_sha256(legacy_source_config)
+        if legacy_source_hash != provenance["TABERO_SOURCE_CONFIG_SHA256"]:
             raise ValueError("legacy source config SHA-256 does not match provenance")
-    return provenance_path, config_snapshot, legacy_source_config, provenance
+    return _ValidatedProvenance(
+        path=provenance_path,
+        sha256=provenance_hash,
+        config_snapshot=config_snapshot,
+        config_snapshot_sha256=snapshot_hash,
+        legacy_source_config=legacy_source_config,
+        legacy_source_config_sha256=legacy_source_hash,
+        values=provenance,
+    )
+
+
+def _require_sources_unchanged(
+    *,
+    checkpoint: Path,
+    checkpoint_hash: str,
+    base_weights: Path,
+    base_hash: str,
+    provenance: _ValidatedProvenance,
+) -> None:
+    artifacts = [
+        (checkpoint, checkpoint_hash, "source checkpoint"),
+        (base_weights, base_hash, "base model weights"),
+        (provenance.path, provenance.sha256, "formal provenance"),
+        (
+            provenance.config_snapshot,
+            provenance.config_snapshot_sha256,
+            "formal config snapshot",
+        ),
+    ]
+    if provenance.legacy_source_config is not None:
+        artifacts.append(
+            (
+                provenance.legacy_source_config,
+                provenance.legacy_source_config_sha256,
+                "legacy source config",
+            )
+        )
+    for path, expected_hash, label in artifacts:
+        if expected_hash is None:
+            raise ValueError(f"{label} changed during export: missing validated hash")
+        _require_artifact_unchanged(path, expected_hash, label)
 
 
 def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
@@ -398,7 +474,9 @@ def export_tabero_dsrl_bundle(
             f"expected={expected_base_hash}, actual={actual_base_hash}"
         )
 
+    checkpoint_hash = checkpoint_sha256(checkpoint)
     payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    _require_artifact_unchanged(checkpoint, checkpoint_hash, "source checkpoint")
     if not isinstance(payload, Mapping) or set(payload) != {"model", "metadata"}:
         raise ValueError("final DSRL sidecar must contain exactly model and metadata")
     metadata = _validate_metadata(payload["metadata"], task_id)
@@ -408,16 +486,13 @@ def export_tabero_dsrl_bundle(
         for key in DSRL_ROLLOUT_SYNC_MANIFEST_V1
     }
     validate_dsrl_rollout_state_dict(actor_state)
-    provenance_path, config_snapshot, legacy_source_config, provenance = (
-        _validate_provenance(
-            checkpoint,
-            base_model,
-            actual_base_hash,
-            metadata,
-        )
+    provenance = _validate_provenance(
+        checkpoint,
+        base_model,
+        actual_base_hash,
+        metadata,
     )
 
-    checkpoint_hash = checkpoint_sha256(checkpoint)
     output_dir.parent.mkdir(parents=True, exist_ok=True)
     temporary_dir = Path(
         tempfile.mkdtemp(prefix=f".{output_dir.name}.", dir=output_dir.parent)
@@ -457,19 +532,17 @@ def export_tabero_dsrl_bundle(
             "base_model_sha256": actual_base_hash,
             "source_checkpoint": str(checkpoint),
             "source_checkpoint_sha256": checkpoint_hash,
-            "source_provenance": str(provenance_path),
-            "source_provenance_sha256": checkpoint_sha256(provenance_path),
-            "source_config_snapshot": str(config_snapshot),
-            "source_config_snapshot_sha256": checkpoint_sha256(config_snapshot),
+            "source_provenance": str(provenance.path),
+            "source_provenance_sha256": provenance.sha256,
+            "source_config_snapshot": str(provenance.config_snapshot),
+            "source_config_snapshot_sha256": provenance.config_snapshot_sha256,
             "legacy_source_config": (
-                str(legacy_source_config) if legacy_source_config is not None else None
-            ),
-            "legacy_source_config_sha256": (
-                provenance["TABERO_SOURCE_CONFIG_SHA256"]
-                if legacy_source_config is not None
+                str(provenance.legacy_source_config)
+                if provenance.legacy_source_config is not None
                 else None
             ),
-            "source_git_commit": provenance["TABERO_GIT_COMMIT"],
+            "legacy_source_config_sha256": provenance.legacy_source_config_sha256,
+            "source_git_commit": provenance.values["TABERO_GIT_COMMIT"],
             "actor_weights": ACTOR_WEIGHTS_NAME,
             "actor_weights_sha256": actor_hash,
             "actor_manifest_version": DSRL_ROLLOUT_SYNC_MANIFEST_VERSION,
@@ -546,6 +619,13 @@ def export_tabero_dsrl_bundle(
             },
         }
         _write_json(temporary_dir / AUDIT_NAME, audit)
+        _require_sources_unchanged(
+            checkpoint=checkpoint,
+            checkpoint_hash=checkpoint_hash,
+            base_weights=base_weights,
+            base_hash=actual_base_hash,
+            provenance=provenance,
+        )
         if output_dir.exists():
             raise FileExistsError(f"DSRL bundle output already exists: {output_dir}")
         os.rename(temporary_dir, output_dir)

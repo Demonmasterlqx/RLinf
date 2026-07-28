@@ -9,6 +9,7 @@ from math import prod
 
 import pytest
 import torch
+from omegaconf import OmegaConf
 from safetensors.torch import load_file
 
 from rlinf.utils.ckpt_convertor import export_tabero_dsrl_for_t2vla as exporter
@@ -166,6 +167,31 @@ def _write_provenance(
         + "\n"
     )
     return base_hash
+
+
+def _replace_provenance_value(checkpoint, key, value):
+    provenance_path = checkpoint.parents[5] / "provenance.env"
+    lines = provenance_path.read_text().splitlines()
+    provenance_path.write_text(
+        "\n".join(
+            f"{key}={value}" if line.startswith(f"{key}=") else line for line in lines
+        )
+        + "\n"
+    )
+
+
+def _rewrite_config_snapshot(checkpoint, path, value):
+    config_snapshot = checkpoint.parents[5] / "config_snapshot.yaml"
+    config = OmegaConf.load(config_snapshot)
+    OmegaConf.update(config, path, value, force_add=True)
+    OmegaConf.save(config, config_snapshot)
+    config_hash = _sha256(config_snapshot)
+    _replace_provenance_value(checkpoint, "TABERO_CONFIG_SHA256", config_hash)
+    _replace_provenance_value(
+        checkpoint,
+        "TABERO_CONFIG_SNAPSHOT_SHA256",
+        config_hash,
+    )
 
 
 def _export(tmp_path, *, task_id=0, checkpoint=None, **kwargs):
@@ -381,6 +407,56 @@ def test_export_rejects_config_snapshot_for_other_task(tmp_path):
         )
 
 
+@pytest.mark.parametrize(
+    ("path", "invalid_value"),
+    [
+        ("runner.max_epochs", 49),
+        ("runner.save_interval", 9),
+        ("runner.logger.logger_backends", ["tensorboard"]),
+        ("env.train.total_num_envs", 83),
+        ("env.train.rollout_epoch", 1),
+        ("algorithm.update_epoch", 199),
+        ("algorithm.gamma", 0.99),
+        ("algorithm.tau", 0.01),
+        ("actor.rollout_sync_prefixes", ["dsrl_action_noise_net."]),
+        ("actor.model.openpi.use_dsrl", False),
+        ("actor.model.openpi.dsrl_use_tactile", False),
+        ("actor.model.openpi.dsrl_state_dim", 8),
+        ("actor.model.openpi.dsrl_action_noise_dim", 31),
+        ("actor.model.model_path", "/wrong/actor/base"),
+        ("rollout.model.model_path", "/wrong/rollout/base"),
+        ("actor.fsdp_config.trainable_checkpoint_metadata.method", "pirl"),
+        ("actor.fsdp_config.trainable_checkpoint_metadata.task_id", 5),
+        (
+            "actor.fsdp_config.trainable_checkpoint_metadata.training_config",
+            "wrong",
+        ),
+        (
+            "actor.fsdp_config.trainable_checkpoint_metadata.target_global_step",
+            40,
+        ),
+    ],
+)
+def test_export_rejects_config_snapshot_contract_mutation(
+    tmp_path,
+    path,
+    invalid_value,
+):
+    checkpoint = _checkpoint(tmp_path)
+    base_model = _base_model(tmp_path)
+    base_hash = _write_provenance(checkpoint, base_model)
+    _rewrite_config_snapshot(checkpoint, path, invalid_value)
+
+    with pytest.raises(ValueError, match="config snapshot"):
+        exporter.export_tabero_dsrl_bundle(
+            trainable_checkpoint=checkpoint,
+            output_dir=tmp_path / "bundle",
+            base_model=base_model,
+            expected_base_model_sha256=base_hash,
+            task_id=0,
+        )
+
+
 @pytest.mark.parametrize("corruption", ["fresh_source", "base_path", "base_hash"])
 def test_export_rejects_corrupt_formal_provenance(tmp_path, corruption):
     checkpoint = _checkpoint(tmp_path)
@@ -411,6 +487,84 @@ def test_export_rejects_corrupt_formal_provenance(tmp_path, corruption):
         )
 
 
+@pytest.mark.parametrize(
+    ("key", "invalid_value", "message"),
+    [
+        ("TABERO_PROVENANCE_VERSION", "2", "version"),
+        ("TABERO_PROVENANCE_MODE", "unknown", "mode"),
+        ("TABERO_CONFIG_SHA256", "f" * 64, "config snapshot SHA-256"),
+        (
+            "TABERO_CONFIG_SNAPSHOT_SHA256",
+            "f" * 64,
+            "config snapshot SHA-256",
+        ),
+    ],
+)
+def test_export_rejects_invalid_provenance_contract(
+    tmp_path,
+    key,
+    invalid_value,
+    message,
+):
+    checkpoint = _checkpoint(tmp_path)
+    base_model = _base_model(tmp_path)
+    base_hash = _write_provenance(checkpoint, base_model)
+    _replace_provenance_value(checkpoint, key, invalid_value)
+
+    with pytest.raises(ValueError, match=message):
+        exporter.export_tabero_dsrl_bundle(
+            trainable_checkpoint=checkpoint,
+            output_dir=tmp_path / "bundle",
+            base_model=base_model,
+            expected_base_model_sha256=base_hash,
+            task_id=0,
+        )
+
+
+@pytest.mark.parametrize("corruption", ["missing", "extra"])
+def test_export_rejects_invalid_provenance_keyspace(tmp_path, corruption):
+    checkpoint = _checkpoint(tmp_path)
+    base_model = _base_model(tmp_path)
+    base_hash = _write_provenance(checkpoint, base_model)
+    provenance_path = checkpoint.parents[5] / "provenance.env"
+    lines = provenance_path.read_text().splitlines()
+    if corruption == "missing":
+        lines = lines[1:]
+    else:
+        lines.append("TABERO_UNEXPECTED=value")
+    provenance_path.write_text("\n".join(lines) + "\n")
+
+    with pytest.raises(ValueError, match="keyspace"):
+        exporter.export_tabero_dsrl_bundle(
+            trainable_checkpoint=checkpoint,
+            output_dir=tmp_path / "bundle",
+            base_model=base_model,
+            expected_base_model_sha256=base_hash,
+            task_id=0,
+        )
+
+
+@pytest.mark.parametrize("corruption", ["missing", "tampered"])
+def test_export_rejects_invalid_config_snapshot_artifact(tmp_path, corruption):
+    checkpoint = _checkpoint(tmp_path)
+    base_model = _base_model(tmp_path)
+    base_hash = _write_provenance(checkpoint, base_model)
+    config_snapshot = checkpoint.parents[5] / "config_snapshot.yaml"
+    if corruption == "missing":
+        config_snapshot.unlink()
+    else:
+        config_snapshot.write_text(config_snapshot.read_text() + "# tampered\n")
+
+    with pytest.raises(ValueError, match="config snapshot"):
+        exporter.export_tabero_dsrl_bundle(
+            trainable_checkpoint=checkpoint,
+            output_dir=tmp_path / "bundle",
+            base_model=base_model,
+            expected_base_model_sha256=base_hash,
+            task_id=0,
+        )
+
+
 def test_export_rejects_tampered_legacy_source_config(tmp_path):
     checkpoint = _checkpoint(tmp_path)
     base_model = _base_model(tmp_path)
@@ -423,6 +577,26 @@ def test_export_rejects_tampered_legacy_source_config(tmp_path):
     legacy_config.write_text("legacy_source: tampered\n")
 
     with pytest.raises(ValueError, match="legacy source config SHA-256"):
+        exporter.export_tabero_dsrl_bundle(
+            trainable_checkpoint=checkpoint,
+            output_dir=tmp_path / "bundle",
+            base_model=base_model,
+            expected_base_model_sha256=base_hash,
+            task_id=0,
+        )
+
+
+def test_export_rejects_missing_legacy_source_config(tmp_path):
+    checkpoint = _checkpoint(tmp_path)
+    base_model = _base_model(tmp_path)
+    base_hash = _write_provenance(
+        checkpoint,
+        base_model,
+        mode="legacy_migration",
+    )
+    (checkpoint.parents[5] / "tensorboard" / "config.yaml").unlink()
+
+    with pytest.raises(ValueError, match="legacy source config does not exist"):
         exporter.export_tabero_dsrl_bundle(
             trainable_checkpoint=checkpoint,
             output_dir=tmp_path / "bundle",
@@ -452,6 +626,84 @@ def test_export_records_exact_legacy_source_config(tmp_path):
 
     assert manifest["legacy_source_config"] == str(legacy_config)
     assert manifest["legacy_source_config_sha256"] == _sha256(legacy_config)
+
+
+def test_export_accepts_uppercase_legacy_source_config_sha256(tmp_path):
+    checkpoint = _checkpoint(tmp_path)
+    base_model = _base_model(tmp_path)
+    base_hash = _write_provenance(
+        checkpoint,
+        base_model,
+        mode="legacy_migration",
+    )
+    legacy_config = checkpoint.parents[5] / "tensorboard" / "config.yaml"
+    _replace_provenance_value(
+        checkpoint,
+        "TABERO_SOURCE_CONFIG_SHA256",
+        _sha256(legacy_config).upper(),
+    )
+
+    manifest = exporter.export_tabero_dsrl_bundle(
+        trainable_checkpoint=checkpoint,
+        output_dir=tmp_path / "bundle",
+        base_model=base_model,
+        expected_base_model_sha256=base_hash,
+        task_id=0,
+    )
+
+    assert manifest["legacy_source_config_sha256"] == _sha256(legacy_config)
+
+
+@pytest.mark.parametrize(
+    "artifact",
+    ["checkpoint", "base_model", "provenance", "config_snapshot", "legacy"],
+)
+def test_export_rejects_source_artifact_changed_after_validation(
+    tmp_path,
+    monkeypatch,
+    artifact,
+):
+    checkpoint = _checkpoint(tmp_path)
+    base_model = _base_model(tmp_path)
+    base_hash = _write_provenance(
+        checkpoint,
+        base_model,
+        mode="legacy_migration",
+    )
+    output_root = checkpoint.parents[5]
+    real_validate = exporter._validate_provenance
+
+    def validate_then_mutate(*args, **kwargs):
+        result = real_validate(*args, **kwargs)
+        if artifact == "checkpoint":
+            checkpoint.write_bytes(checkpoint.read_bytes() + b"changed")
+        elif artifact == "base_model":
+            base_weights = base_model / "model.safetensors"
+            base_weights.write_bytes(base_weights.read_bytes() + b"changed")
+        elif artifact == "provenance":
+            _replace_provenance_value(
+                checkpoint,
+                "TABERO_GIT_COMMIT",
+                "b" * 40,
+            )
+        elif artifact == "config_snapshot":
+            config_snapshot = output_root / "config_snapshot.yaml"
+            config_snapshot.write_text(config_snapshot.read_text() + "# changed\n")
+        else:
+            legacy_config = output_root / "tensorboard" / "config.yaml"
+            legacy_config.write_text("legacy_source: changed\n")
+        return result
+
+    monkeypatch.setattr(exporter, "_validate_provenance", validate_then_mutate)
+
+    with pytest.raises(ValueError, match="changed during export"):
+        exporter.export_tabero_dsrl_bundle(
+            trainable_checkpoint=checkpoint,
+            output_dir=tmp_path / "bundle",
+            base_model=base_model,
+            expected_base_model_sha256=base_hash,
+            task_id=0,
+        )
 
 
 def test_export_loads_sidecar_in_weights_only_mode(tmp_path, monkeypatch):
