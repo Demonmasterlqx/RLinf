@@ -39,6 +39,31 @@ def _cfg_get(cfg: Any, name: str, default: Any = None) -> Any:
     return getattr(cfg, name, default) if cfg is not None else default
 
 
+def configure_tabero_episode_horizon(init_params: Any, isaac_env_cfg: Any) -> int:
+    max_episode_steps = _cfg_get(init_params, "max_episode_steps", None)
+    if (
+        isinstance(max_episode_steps, bool)
+        or not isinstance(max_episode_steps, int)
+        or max_episode_steps <= 0
+    ):
+        raise ValueError(
+            "Tabero init_params.max_episode_steps must be a positive integer."
+        )
+    isaac_env_cfg.episode_length_s = (
+        max_episode_steps * float(isaac_env_cfg.sim.dt) * int(isaac_env_cfg.decimation)
+    )
+    return max_episode_steps
+
+
+def validate_tabero_episode_horizon(env: Any, expected_steps: int) -> None:
+    actual_steps = getattr(env, "max_episode_length", None)
+    if actual_steps != expected_steps:
+        raise ValueError(
+            "Tabero IsaacLab episode horizon mismatch: "
+            f"expected {expected_steps} steps, got {actual_steps}."
+        )
+
+
 @dataclass(frozen=True)
 class TaberoTaskSpec:
     task_suite: str
@@ -904,6 +929,9 @@ class IsaaclabTaberoTacFieldEnv(IsaaclabBaseEnv):
             )
             isaac_env_cfg.seed = self.seed
             isaac_env_cfg.scene.num_envs = self.cfg.init_params.num_envs
+            expected_episode_steps = configure_tabero_episode_horizon(
+                init_params, isaac_env_cfg
+            )
 
             _set_camera_resolution(
                 isaac_env_cfg.scene,
@@ -946,6 +974,7 @@ class IsaaclabTaberoTacFieldEnv(IsaaclabBaseEnv):
             env = gym.make(
                 self.isaaclab_env_id, cfg=isaac_env_cfg, render_mode="rgb_array"
             ).unwrapped
+            validate_tabero_episode_horizon(env, expected_episode_steps)
             if self._hdf5_initial_states_path is not None:
                 from isaaclab.utils.datasets import HDF5DatasetFileHandler
 

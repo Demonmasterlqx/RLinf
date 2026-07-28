@@ -51,7 +51,7 @@ def _small_actor_state() -> dict[str, torch.Tensor]:
     }
 
 
-def _export_small_bundle(stage1_path, stage2_path, output_dir):
+def _export_small_bundle(stage1_path, stage2_path, output_dir, **kwargs):
     base_model = stage1_path.parent / "base-model"
     base_model.mkdir(exist_ok=True)
     (base_model / "model.safetensors").write_bytes(b"test base checkpoint")
@@ -85,6 +85,7 @@ def _export_small_bundle(stage1_path, stage2_path, output_dir):
         state_indices=None,
         reference_num_steps=10,
         reference_sampling_method="flow_ode",
+        **kwargs,
     )
 
 
@@ -148,6 +149,68 @@ def test_export_filters_stage1_encoder_and_stage2_actor(tmp_path):
         export_tabero_rlt_for_t2vla.checkpoint_sha256(stage1_path.parent / "base-model")
     )
     assert json.loads((output_dir / "manifest.json").read_text()) == manifest
+
+
+def test_formal_export_binds_sources_and_explicit_provenance(tmp_path):
+    stage1_path = tmp_path / "stage1.pt"
+    stage2_path = tmp_path / "stage2.pt"
+    train_config = tmp_path / "tabero_rlt_stage2_ac_task5_firm.yaml"
+    train_config.write_text("runner: {}\n")
+    torch.save({"model": _small_encoder_state()}, stage1_path)
+    torch.save(_small_actor_state(), stage2_path)
+
+    manifest = _export_small_bundle(
+        stage1_path,
+        stage2_path,
+        tmp_path / "bundle",
+        task_id=5,
+        source_train_config=train_config,
+        target_global_step=75,
+        is_final=True,
+    )
+
+    assert manifest["task_id"] == 5
+    assert manifest["source_train_config"] == str(train_config.resolve())
+    assert manifest["stage1_checkpoint_sha256"] == (
+        export_tabero_rlt_for_t2vla.checkpoint_sha256(stage1_path)
+    )
+    assert manifest["stage2_checkpoint_sha256"] == (
+        export_tabero_rlt_for_t2vla.checkpoint_sha256(stage2_path)
+    )
+    assert manifest["stage2_checkpoint_metadata"] == {
+        "format": "full_weights",
+        "method": "rlt",
+        "task_id": 5,
+        "training_config": train_config.stem,
+        "step": 75,
+        "global_step": 75,
+        "target_global_step": 75,
+        "is_final": True,
+    }
+
+
+@pytest.mark.parametrize(
+    "config_name",
+    ["tabero_rlt_stage2_ac_task0_firm.yaml", "arbitrary_existing.yaml"],
+)
+def test_formal_export_rejects_source_config_not_bound_to_task(tmp_path, config_name):
+    stage1_path = tmp_path / "stage1.pt"
+    stage2_path = tmp_path / "stage2.pt"
+    train_config = tmp_path / config_name
+    train_config.write_text("runner: {}\n")
+    torch.save({"model": _small_encoder_state()}, stage1_path)
+    torch.save(_small_actor_state(), stage2_path)
+
+    with pytest.raises(ValueError, match="source training config|task5"):
+        _export_small_bundle(
+            stage1_path,
+            stage2_path,
+            tmp_path / "bundle",
+            task_id=5,
+            source_train_config=train_config,
+            target_global_step=75,
+            is_final=True,
+        )
 
 
 def test_export_rejects_unsupported_proprio_or_reference_semantics(tmp_path):

@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from pathlib import Path
+from types import SimpleNamespace
+
 import pytest
 import torch
 from omegaconf import OmegaConf
@@ -106,6 +109,59 @@ def test_get_env_cls_resolves_tabero_tacfield_id_to_adapter():
     )
 
     assert get_env_cls("isaaclab", cfg) is IsaaclabTaberoTacFieldEnv
+
+
+def test_tabero_episode_horizon_configures_registry_cfg_for_exact_step_count():
+    init_params = OmegaConf.create({"max_episode_steps": 300})
+    isaac_env_cfg = SimpleNamespace(
+        sim=SimpleNamespace(dt=1 / 60),
+        decimation=3,
+        episode_length_s=8.0,
+    )
+
+    expected_steps = tabero_tacfield.configure_tabero_episode_horizon(
+        init_params, isaac_env_cfg
+    )
+
+    assert expected_steps == 300
+    assert isaac_env_cfg.episode_length_s == pytest.approx(15.0)
+
+
+@pytest.mark.parametrize("horizon", [None, True, 0, -1, 300.0, "300"])
+def test_tabero_episode_horizon_rejects_missing_or_invalid_steps(horizon):
+    init_params = OmegaConf.create(
+        {} if horizon is None else {"max_episode_steps": horizon}
+    )
+    isaac_env_cfg = SimpleNamespace(
+        sim=SimpleNamespace(dt=1 / 60),
+        decimation=3,
+        episode_length_s=8.0,
+    )
+
+    with pytest.raises(ValueError, match="max_episode_steps"):
+        tabero_tacfield.configure_tabero_episode_horizon(init_params, isaac_env_cfg)
+
+
+def test_tabero_episode_horizon_rejects_created_env_length_mismatch():
+    tabero_tacfield.validate_tabero_episode_horizon(
+        SimpleNamespace(max_episode_length=300), 300
+    )
+
+    with pytest.raises(ValueError, match="expected 300.*got 160"):
+        tabero_tacfield.validate_tabero_episode_horizon(
+            SimpleNamespace(max_episode_length=160), 300
+        )
+
+
+def test_tabero_env_build_path_applies_and_validates_episode_horizon():
+    source = Path(tabero_tacfield.__file__).read_text()
+    build_path = source.split("def make_env_isaaclab():", 1)[1]
+    build_path = build_path.split("return make_env_isaaclab", 1)[0]
+
+    configure_at = build_path.index("configure_tabero_episode_horizon(")
+    make_at = build_path.index("env = gym.make(")
+    validate_at = build_path.index("validate_tabero_episode_horizon(")
+    assert configure_at < make_at < validate_at
 
 
 def test_env_output_preserves_tabero_tactile_marker_motion_for_rollout_channel():

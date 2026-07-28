@@ -14,6 +14,7 @@
 
 import os
 import warnings
+from collections.abc import Mapping
 from typing import ContextManager, Union
 
 import torch
@@ -420,16 +421,37 @@ class FSDPModelManager:
                 )
             sd_save_path = os.path.join(save_path, "model_state_dict")
             os.makedirs(sd_save_path, exist_ok=True)
+            metadata = {
+                "step": step,
+                "rank": rank,
+                "world_size": world_size,
+                "format": "trainable_weights",
+                "parameter_count": len(state_dict),
+            }
+            configured_metadata = self._cfg.fsdp_config.get(
+                "trainable_checkpoint_metadata", None
+            )
+            if configured_metadata is not None:
+                if not isinstance(configured_metadata, Mapping):
+                    raise ValueError(
+                        "fsdp_config.trainable_checkpoint_metadata must be a mapping"
+                    )
+                target_global_step = configured_metadata.get("target_global_step")
+                if (
+                    isinstance(target_global_step, bool)
+                    or not isinstance(target_global_step, int)
+                    or target_global_step <= 0
+                ):
+                    raise ValueError(
+                        "trainable checkpoint target_global_step must be a positive integer"
+                    )
+                metadata = dict(configured_metadata) | metadata
+                metadata["global_step"] = step
+                metadata["is_final"] = step == target_global_step
             torch.save(
                 {
                     "model": state_dict,
-                    "metadata": {
-                        "step": step,
-                        "rank": rank,
-                        "world_size": world_size,
-                        "format": "trainable_weights",
-                        "parameter_count": len(state_dict),
-                    },
+                    "metadata": metadata,
                 },
                 os.path.join(sd_save_path, "trainable_weights.pt"),
             )

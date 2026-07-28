@@ -26,8 +26,10 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import hashlib
 import json
 import os
+import re
 import shutil
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -35,6 +37,7 @@ from pathlib import Path
 import safetensors.torch
 import torch
 from omegaconf import DictConfig, ListConfig, OmegaConf
+from safetensors import safe_open
 
 from rlinf.models import get_model
 
@@ -54,6 +57,67 @@ DROP_EXACT_KEYS = {
     # PyTorch PI0 wrapper does not expose it as a loadable state_dict key.
     "paligemma_with_expert.paligemma.model.language_model.embed_tokens.weight",
 }
+
+PIRL_ACTION_EXPERT_LORA_TENSOR_COUNT = 126
+
+
+def _is_action_expert_lora_weight(key: str) -> bool:
+    match = re.fullmatch(
+        r"paligemma_with_expert\.gemma_expert\.model\.layers\.(\d+)\."
+        r"(?:mlp\.(?:down_proj|gate_proj|up_proj)|"
+        r"self_attn\.(?:k_proj|o_proj|q_proj|v_proj))\.weight",
+        key,
+    )
+    return match is not None and 0 <= int(match.group(1)) < 18
+
+
+def validate_pirl_action_expert_delta(model_path: Path, base_path: Path) -> None:
+    """Require every action-expert LoRA target, and only those targets, to change."""
+    try:
+        with (
+            safe_open(model_path, framework="pt", device="cpu") as model,
+            safe_open(base_path, framework="pt", device="cpu") as base,
+        ):
+            model_keys = set(model.keys())
+            base_keys = set(base.keys())
+            missing_model_keys = sorted(base_keys - model_keys)
+            unexpected_model_keys = sorted(model_keys - base_keys)
+            if missing_model_keys or unexpected_model_keys:
+                raise ValueError(
+                    "piRL model/base keys differ while validating action-expert delta: "
+                    f"missing_model_keys={missing_model_keys[:5]}, "
+                    f"unexpected_model_keys={unexpected_model_keys[:5]}"
+                )
+            expected_changes = {
+                key for key in base_keys if _is_action_expert_lora_weight(key)
+            }
+            actual_changes = {
+                key
+                for key in base_keys
+                if not torch.equal(model.get_tensor(key), base.get_tensor(key))
+            }
+    except ValueError:
+        raise
+    except Exception as error:
+        raise ValueError(
+            f"cannot compare piRL model with fixed base: {error}"
+        ) from error
+    missing = sorted(expected_changes - actual_changes)
+    unexpected = sorted(actual_changes - expected_changes)
+    if (
+        len(expected_changes) != PIRL_ACTION_EXPERT_LORA_TENSOR_COUNT
+        or actual_changes != expected_changes
+    ):
+        raise ValueError(
+            "piRL action-expert delta mismatch: "
+            f"expected_count={len(expected_changes)}, "
+            f"actual_count={len(actual_changes)}, "
+            "required_expected_count="
+            f"{PIRL_ACTION_EXPERT_LORA_TENSOR_COUNT}, "
+            f"missing={missing[:5]}, unexpected={unexpected[:5]}; "
+            "non-action-expert tensors must remain unchanged"
+        )
+
 
 @dataclasses.dataclass(frozen=True)
 class LoraModuleSpec:
@@ -160,7 +224,43 @@ def _json_safe(value):
     return value
 
 
-def _save_filtered_safetensors(model: torch.nn.Module, output_path: str) -> None:
+def _checkpoint_path(path: str | Path) -> Path:
+    checkpoint = Path(path).expanduser().resolve()
+    if checkpoint.is_dir():
+        checkpoint = checkpoint / "model.safetensors"
+    if not checkpoint.is_file():
+        raise FileNotFoundError(f"Checkpoint file not found: {checkpoint}")
+    return checkpoint
+
+
+def _sha256(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with _checkpoint_path(path).open("rb") as source:
+        while chunk := source.read(8 * 1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+_SAFETENSORS_DTYPES = {
+    "BOOL": torch.bool,
+    "U8": torch.uint8,
+    "I8": torch.int8,
+    "I16": torch.int16,
+    "I32": torch.int32,
+    "I64": torch.int64,
+    "F16": torch.float16,
+    "BF16": torch.bfloat16,
+    "F32": torch.float32,
+    "F64": torch.float64,
+}
+
+
+def _save_filtered_safetensors(
+    model: torch.nn.Module,
+    output_path: str,
+    *,
+    base_model_path: str,
+) -> None:
     state_dict = {}
     for key, value in model.state_dict().items():
         if key in DROP_EXACT_KEYS:
@@ -169,9 +269,99 @@ def _save_filtered_safetensors(model: torch.nn.Module, output_path: str) -> None
             continue
         if "lora_" in key:
             raise RuntimeError(f"LoRA key remained after merge: {key}")
-        # Clone to avoid safetensors shared-storage errors from tied weights.
-        state_dict[key] = value.detach().cpu().contiguous().clone()
+        state_dict[key] = value.detach().cpu()
+    base_checkpoint = _checkpoint_path(base_model_path)
+    with safe_open(base_checkpoint, framework="pt", device="cpu") as base:
+        base_keys = set(base.keys())
+        missing = sorted(base_keys - set(state_dict))
+        unexpected = sorted(set(state_dict) - base_keys)
+        if missing or unexpected:
+            raise ValueError(
+                "Merged piRL state keys do not match the fixed base architecture; "
+                f"missing={missing[:10]}, unexpected={unexpected[:10]}"
+            )
+        for key in sorted(state_dict):
+            dtype_name = str(base.get_slice(key).get_dtype())
+            if dtype_name not in _SAFETENSORS_DTYPES:
+                raise ValueError(
+                    f"Unsupported fixed-base safetensors dtype {dtype_name!r} for {key}"
+                )
+            # Clone to avoid shared-storage errors from tied weights.
+            state_dict[key] = (
+                state_dict[key]
+                .to(dtype=_SAFETENSORS_DTYPES[dtype_name])
+                .contiguous()
+                .clone()
+            )
     safetensors.torch.save_file(state_dict, output_path)
+
+
+def _safetensor_count(path: str | Path) -> int:
+    with safe_open(_checkpoint_path(path), framework="pt", device="cpu") as handle:
+        return len(handle.keys())
+
+
+def _build_export_metadata(
+    *,
+    train_config_path: str,
+    ckpt_path: str,
+    source_model_path: str,
+    checkpoint_meta: Mapping,
+    model_path: str | Path,
+    lora_target: str,
+    adapter_dirs: list[str],
+) -> dict:
+    train_config = Path(train_config_path).expanduser().resolve()
+    source_checkpoint = _checkpoint_path(ckpt_path)
+    base_checkpoint = _checkpoint_path(source_model_path)
+    output_model = _checkpoint_path(model_path)
+    expected_training_config = train_config.stem
+    required = {
+        "format": "trainable_weights",
+        "method": "pirl",
+        "training_config": expected_training_config,
+        "is_final": True,
+    }
+    for field, expected in required.items():
+        actual = checkpoint_meta.get(field)
+        if type(actual) is not type(expected) or actual != expected:
+            raise ValueError(
+                f"piRL checkpoint provenance {field} must be {expected!r}, got {actual!r}"
+            )
+    task_id = checkpoint_meta.get("task_id")
+    if type(task_id) is not int or task_id not in {0, 5}:
+        raise ValueError("piRL checkpoint provenance task_id must be 0 or 5")
+    global_step = checkpoint_meta.get("global_step")
+    if type(global_step) is not int or global_step <= 0:
+        raise ValueError("piRL checkpoint provenance global_step must be positive")
+    for field in ("step", "target_global_step"):
+        if checkpoint_meta.get(field) != global_step:
+            raise ValueError(
+                f"piRL checkpoint provenance {field} must equal global_step {global_step}"
+            )
+    if lora_target == "action_expert":
+        validate_pirl_action_expert_delta(output_model, base_checkpoint)
+    safe_metadata = _json_safe(dict(checkpoint_meta))
+    return {
+        "source_train_config": str(train_config),
+        "source_ckpt": str(source_checkpoint),
+        "source_ckpt_sha256": _sha256(source_checkpoint),
+        "source_model_path": str(Path(source_model_path).expanduser().resolve()),
+        "base_model_sha256": _sha256(base_checkpoint),
+        "source_ckpt_metadata": safe_metadata,
+        "format": "t2vla_openpi_pytorch_merged_lora",
+        "lora_target": lora_target,
+        "task_id": task_id,
+        "global_step": global_step,
+        "model_sha256": _sha256(output_model),
+        "model_tensor_count": _safetensor_count(output_model),
+        "adapter_dir": (
+            adapter_dirs[0]
+            if len(adapter_dirs) == 1
+            else (adapter_dirs if adapter_dirs else None)
+        ),
+        "adapter_dirs": adapter_dirs,
+    }
 
 
 def _get_lora_module(model: torch.nn.Module, lora_target: str) -> LoraModuleSpec:
@@ -257,7 +447,12 @@ def export_checkpoint(
     for lora_spec in lora_specs:
         lora_spec.assign_module(lora_spec.module.merge_and_unload())
     model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
-    _save_filtered_safetensors(model, str(output_path / "model.safetensors"))
+    model_path = output_path / "model.safetensors"
+    _save_filtered_safetensors(
+        model,
+        str(model_path),
+        base_model_path=str(model_cfg.model_path),
+    )
     _copy_assets(str(model_cfg.model_path), str(output_path))
 
     model_config = getattr(model, "config", None)
@@ -267,20 +462,15 @@ def export_checkpoint(
 
     with (output_path / "export_meta.json").open("w", encoding="utf-8") as f:
         json.dump(
-            {
-                "source_train_config": os.path.abspath(train_config_path),
-                "source_ckpt": os.path.abspath(ckpt_path),
-                "source_model_path": str(model_cfg.model_path),
-                "source_ckpt_metadata": dict(checkpoint_meta),
-                "format": "t2vla_openpi_pytorch_merged_lora",
-                "lora_target": lora_target,
-                "adapter_dir": (
-                    adapter_dir_names[0]
-                    if save_adapter and len(adapter_dir_names) == 1
-                    else (adapter_dir_names if save_adapter else None)
-                ),
-                "adapter_dirs": adapter_dir_names if save_adapter else [],
-            },
+            _build_export_metadata(
+                train_config_path=os.path.abspath(train_config_path),
+                ckpt_path=os.path.abspath(ckpt_path),
+                source_model_path=str(model_cfg.model_path),
+                checkpoint_meta=checkpoint_meta,
+                model_path=model_path,
+                lora_target=lora_target,
+                adapter_dirs=adapter_dir_names if save_adapter else [],
+            ),
             f,
             indent=2,
         )

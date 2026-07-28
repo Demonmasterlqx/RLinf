@@ -142,7 +142,9 @@ def _load_checkpoint(path: Path) -> dict[str, Any]:
 def _stage1_state(checkpoint: dict[str, Any]) -> dict[str, torch.Tensor]:
     state = checkpoint.get("model", checkpoint)
     if not isinstance(state, dict):
-        raise ValueError("Stage 1 checkpoint does not contain a model state dictionary.")
+        raise ValueError(
+            "Stage 1 checkpoint does not contain a model state dictionary."
+        )
     return state
 
 
@@ -186,11 +188,47 @@ def export_tabero_rlt_bundle(
     reference_num_steps: int = 10,
     reference_sampling_method: str = "flow_ode",
     base_model_sha256: str | None = None,
+    task_id: int | None = None,
+    source_train_config: str | Path | None = None,
+    target_global_step: int | None = None,
+    is_final: bool | None = None,
 ) -> dict[str, Any]:
     """Write an encoder-only Stage 1 and actor-only Stage 2 deployment bundle."""
     stage1_checkpoint = Path(stage1_checkpoint).resolve()
     stage2_checkpoint = Path(stage2_checkpoint).resolve()
     output_dir = Path(output_dir).resolve()
+    formal_values = (task_id, source_train_config, target_global_step, is_final)
+    has_formal_provenance = any(value is not None for value in formal_values)
+    if has_formal_provenance and any(value is None for value in formal_values):
+        raise ValueError(
+            "Formal RLT export provenance requires task_id, source_train_config, "
+            "target_global_step, and is_final together."
+        )
+    resolved_train_config: Path | None = None
+    if has_formal_provenance:
+        if type(task_id) is not int or task_id not in {0, 5}:
+            raise ValueError("Formal RLT export task_id must be 0 or 5.")
+        if (
+            type(target_global_step) is not int
+            or target_global_step <= 0
+            or target_global_step != stage2_global_step
+        ):
+            raise ValueError(
+                "Formal RLT target_global_step must equal stage2_global_step."
+            )
+        if is_final is not True:
+            raise ValueError("Formal RLT export must be the final target checkpoint.")
+        resolved_train_config = Path(source_train_config).expanduser().resolve()
+        if not resolved_train_config.is_file():
+            raise FileNotFoundError(
+                f"Formal RLT source training config not found: {resolved_train_config}"
+            )
+        expected_train_config_name = f"tabero_rlt_stage2_ac_task{task_id}_firm.yaml"
+        if resolved_train_config.name != expected_train_config_name:
+            raise ValueError(
+                "Formal RLT source training config must be "
+                f"{expected_train_config_name} for task{task_id}."
+            )
     int_dimensions = {
         "proprio_dim": proprio_dim,
         "action_dim": action_dim,
@@ -272,9 +310,7 @@ def export_tabero_rlt_bundle(
 
     stage2 = _tensor_state(_load_checkpoint(stage2_checkpoint))
     actor = {
-        key: value
-        for key, value in stage2.items()
-        if key.startswith(_ACTOR_PREFIXES)
+        key: value for key, value in stage2.items() if key.startswith(_ACTOR_PREFIXES)
     }
     if not any(key.startswith("backbone.") for key in actor):
         raise ValueError("Stage 2 checkpoint contains no actor backbone weights.")
@@ -298,9 +334,7 @@ def export_tabero_rlt_bundle(
         "RLT actor",
         actor,
         _expected_actor_shapes(
-            input_dim=(
-                num_action_chunks * action_dim + z_dim + proprio_dim
-            ),
+            input_dim=(num_action_chunks * action_dim + z_dim + proprio_dim),
             output_dim=num_action_chunks * action_dim,
             hidden_dim=actor_hidden_dim,
         ),
@@ -346,13 +380,32 @@ def export_tabero_rlt_bundle(
         "base_norm_asset_id": str(base_norm_asset_id),
         "base_use_quantile_norm": bool(base_use_quantile_norm),
         "stage1_checkpoint": str(stage1_checkpoint),
+        "stage1_checkpoint_sha256": checkpoint_sha256(stage1_checkpoint),
         "stage2_checkpoint": str(stage2_checkpoint),
+        "stage2_checkpoint_sha256": checkpoint_sha256(stage2_checkpoint),
         "stage2_global_step": int(stage2_global_step),
         "encoder_weights": encoder_name,
         "encoder_tensor_count": len(encoder),
         "actor_weights": actor_name,
         "actor_tensor_count": len(actor),
     }
+    if has_formal_provenance:
+        manifest.update(
+            {
+                "task_id": task_id,
+                "source_train_config": str(resolved_train_config),
+                "stage2_checkpoint_metadata": {
+                    "format": "full_weights",
+                    "method": "rlt",
+                    "task_id": task_id,
+                    "training_config": resolved_train_config.stem,
+                    "step": int(stage2_global_step),
+                    "global_step": int(stage2_global_step),
+                    "target_global_step": target_global_step,
+                    "is_final": is_final,
+                },
+            }
+        )
     (output_dir / "manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -380,16 +433,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--rlt-num-layers", type=int, default=2)
     parser.add_argument("--rlt-num-heads", type=int, default=8)
     parser.add_argument("--rlt-mlp-ratio", type=float, default=4.0)
-    parser.add_argument(
-        "--base-config-name", default="pi0_lora_tacfield_tabero"
-    )
+    parser.add_argument("--base-config-name", default="pi0_lora_tacfield_tabero")
     parser.add_argument("--base-action-horizon", type=int, default=50)
     parser.add_argument("--base-model-action-dim", type=int, default=32)
     parser.add_argument("--base-effective-action-dim", type=int, default=13)
     parser.add_argument("--base-prefix-hidden-dim", type=int, default=2048)
-    parser.add_argument(
-        "--base-norm-asset-id", default="NathanWu7/tabero_object_25"
-    )
+    parser.add_argument("--base-norm-asset-id", default="NathanWu7/tabero_object_25")
     parser.add_argument(
         "--base-use-quantile-norm",
         action=argparse.BooleanOptionalAction,
@@ -404,6 +453,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--reference-num-steps", type=int, default=10)
     parser.add_argument("--reference-sampling-method", default="flow_ode")
     parser.add_argument("--base-model-sha256", default=None)
+    parser.add_argument("--task-id", type=int, choices=(0, 5), default=None)
+    parser.add_argument("--source-train-config", type=Path, default=None)
+    parser.add_argument("--target-global-step", type=int, default=None)
+    parser.add_argument(
+        "--is-final", action=argparse.BooleanOptionalAction, default=None
+    )
     return parser.parse_args()
 
 
@@ -440,6 +495,10 @@ def main() -> None:
         reference_num_steps=args.reference_num_steps,
         reference_sampling_method=args.reference_sampling_method,
         base_model_sha256=args.base_model_sha256,
+        task_id=args.task_id,
+        source_train_config=args.source_train_config,
+        target_global_step=args.target_global_step,
+        is_final=args.is_final,
     )
     print(json.dumps(manifest, indent=2, sort_keys=True))
 

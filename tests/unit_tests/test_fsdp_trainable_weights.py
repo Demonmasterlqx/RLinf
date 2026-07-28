@@ -45,9 +45,7 @@ def test_save_trainable_model_weights_fails_when_no_trainable_params(
 
     manager = FSDPModelManager.__new__(FSDPModelManager)
     manager.model = model
-    manager._cfg = SimpleNamespace(
-        fsdp_config={"save_trainable_model_weights": True}
-    )
+    manager._cfg = SimpleNamespace(fsdp_config={"save_trainable_model_weights": True})
     manager._logger = _Logger()
 
     monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
@@ -71,9 +69,7 @@ def test_save_trainable_model_weights_uses_pre_wrap_trainable_names_for_fsdp_fla
 
     manager = FSDPModelManager.__new__(FSDPModelManager)
     manager.model = model
-    manager._cfg = SimpleNamespace(
-        fsdp_config={"save_trainable_model_weights": True}
-    )
+    manager._cfg = SimpleNamespace(fsdp_config={"save_trainable_model_weights": True})
     manager._logger = _Logger()
     manager.trainable_param_names = [
         "paligemma.adapter.lora_A.weight",
@@ -121,3 +117,47 @@ def test_save_trainable_model_weights_uses_pre_wrap_trainable_names_for_fsdp_fla
         checkpoint["model"]["gemma_expert.adapter.lora_B.weight"],
         torch.tensor([[3.0], [4.0]]),
     )
+
+
+@pytest.mark.parametrize(("step", "is_final"), [(40, False), (50, True)])
+def test_save_trainable_model_weights_merges_configured_provenance(
+    monkeypatch, tmp_path, step, is_final
+):
+    manager = FSDPModelManager.__new__(FSDPModelManager)
+    manager.model = nn.Linear(2, 1)
+    manager._cfg = SimpleNamespace(
+        fsdp_config={
+            "save_trainable_model_weights": True,
+            "trainable_checkpoint_metadata": {
+                "method": "pirl",
+                "task_id": 5,
+                "training_config": (
+                    "isaaclab_pi0_peft_lora_tacfield_tabero_task5_firm_8gpu_50step"
+                ),
+                "target_global_step": 50,
+                "global_step": -1,
+                "is_final": False,
+            },
+        }
+    )
+    manager._logger = _Logger()
+
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 1)
+    monkeypatch.setattr(torch.distributed, "barrier", lambda: None)
+
+    manager._save_trainable_model_weights(str(tmp_path), step=step)
+
+    checkpoint = torch.load(
+        tmp_path / "model_state_dict" / "trainable_weights.pt",
+        map_location="cpu",
+        weights_only=True,
+    )
+    metadata = checkpoint["metadata"]
+    assert metadata["method"] == "pirl"
+    assert metadata["task_id"] == 5
+    assert metadata["training_config"].endswith("task5_firm_8gpu_50step")
+    assert metadata["target_global_step"] == 50
+    assert metadata["step"] == step
+    assert metadata["global_step"] == step
+    assert metadata["is_final"] is is_final
