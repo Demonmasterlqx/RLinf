@@ -26,6 +26,7 @@ from omegaconf.dictconfig import DictConfig
 
 from rlinf.envs import SupportedEnvType
 from rlinf.scheduler.cluster import Cluster
+from rlinf.utils.dsrl_rollout_sync import validate_dsrl_rollout_sync_config
 from rlinf.utils.placement import (
     HybridComponentPlacement,
     ModelParallelComponentPlacement,
@@ -832,10 +833,11 @@ def validate_embodied_cfg(cfg):
         f"Model type: '{model_cfg.model_type}' is not an embodied model. "
         f"Supported embodied models: {sorted([x.value for x in EMBODIED_MODEL])}."
     )
-    if model_cfg.get("openpi", {}).get("use_dsrl", False) and model_cfg.get(
-        "is_lora", False
-    ):
+    use_dsrl = model_cfg.get("openpi", {}).get("use_dsrl", False)
+    if use_dsrl and model_cfg.get("is_lora", False):
         raise ValueError("OpenPI DSRL requires actor.model.is_lora=false.")
+    if use_dsrl and not only_eval:
+        validate_dsrl_rollout_sync_config(cfg.actor)
     with open_dict(cfg):
         cfg.runner.val_check_interval = cfg.runner.get("val_check_interval", -1)
     enable_eval = cfg.runner.val_check_interval > 0 or only_eval

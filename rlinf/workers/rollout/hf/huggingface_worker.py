@@ -36,10 +36,17 @@ from rlinf.hybrid_engines.weight_syncer import WeightSyncer
 from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import BasePolicy
 from rlinf.scheduler import Channel, Cluster, Worker, split_channel_message
+from rlinf.utils.dsrl_rollout_sync import (
+    filter_state_dict_by_prefix,
+    validate_dsrl_rollout_state_dict,
+    validate_dsrl_rollout_sync_config,
+)
 from rlinf.utils.placement import HybridComponentPlacement
 
 
 class MultiStepRolloutWorker(Worker):
+    _filter_dsrl_rollout_state_dict = staticmethod(filter_state_dict_by_prefix)
+
     def __init__(self, cfg: DictConfig):
         Worker.__init__(self)
 
@@ -648,7 +655,7 @@ class MultiStepRolloutWorker(Worker):
 
         if not self.weight_syncer.receiver_initialized():
             await self.weight_syncer.init_receiver(
-                state_dict=self.hf_model.state_dict(),
+                state_dict=self._get_rollout_sync_state_dict(),
                 recv=recv_func,
                 send=send_func,
             )
@@ -664,6 +671,18 @@ class MultiStepRolloutWorker(Worker):
 
         gc.collect()
         self.torch_platform.empty_cache()
+
+    def _get_rollout_sync_state_dict(self) -> dict[str, torch.Tensor]:
+        """Build the receiver state dictionary for actor weight synchronization."""
+        state_dict = self.hf_model.state_dict()
+        use_dsrl = self.model_cfg.get("openpi", {}).get("use_dsrl", False)
+        if not use_dsrl:
+            return state_dict
+
+        prefixes = validate_dsrl_rollout_sync_config(self.cfg.actor)
+        state_dict = filter_state_dict_by_prefix(state_dict, prefixes)
+        validate_dsrl_rollout_state_dict(state_dict)
+        return state_dict
 
     @Worker.timer("generate_one_epoch")
     async def generate_one_epoch(self, input_channel: Channel, output_channel: Channel):

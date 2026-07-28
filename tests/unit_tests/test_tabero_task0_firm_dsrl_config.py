@@ -143,6 +143,17 @@ def test_dsrl_smoke_model_and_optimizers_are_tactile_only_steering(monkeypatch):
     assert cfg.rollout.enable_offload is True
 
 
+def test_dsrl_smoke_config_has_exact_rollout_sync_prefixes(monkeypatch):
+    cfg = _load(monkeypatch)
+
+    assert OmegaConf.to_container(cfg.actor.rollout_sync_prefixes) == [
+        "dsrl_action_noise_net.",
+        "actor_image_encoder.",
+        "actor_state_encoder.",
+        "actor_tactile_encoder.",
+    ]
+
+
 def test_dsrl_smoke_config_requires_collision_free_run_id(monkeypatch):
     monkeypatch.delenv("TABERO_TASK0_DSRL_RUN_ID", raising=False)
     cfg = OmegaConf.load(CONFIG_PATH)

@@ -35,6 +35,11 @@ from rlinf.models.embodiment.modules.entropy_tunning import EntropyTemperature
 from rlinf.scheduler import Channel, Worker
 from rlinf.utils import drq
 from rlinf.utils.distributed import all_reduce_dict
+from rlinf.utils.dsrl_rollout_sync import (
+    select_named_parameters_by_prefix,
+    validate_dsrl_rollout_state_dict,
+    validate_dsrl_rollout_sync_config,
+)
 from rlinf.utils.metric_utils import (
     append_to_dict,
     compute_split_num,
@@ -48,6 +53,10 @@ from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
 
 
 class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
+    _select_dsrl_rollout_state_dict = staticmethod(select_named_parameters_by_prefix)
+    _validate_dsrl_rollout_state_dict = staticmethod(validate_dsrl_rollout_state_dict)
+    _validate_dsrl_rollout_sync_config = staticmethod(validate_dsrl_rollout_sync_config)
+
     @staticmethod
     def _dsrl_critic_param_filters():
         return [
@@ -56,6 +65,23 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             "critic_tactile_encoder",
             "q_head",
         ]
+
+    def get_rollout_state_dict(self) -> dict:
+        """Return only actor-side DSRL parameters for rollout synchronization."""
+        if not self.use_dsrl:
+            return super().get_rollout_state_dict()
+
+        prefixes = getattr(self, "_rollout_sync_prefixes", None)
+        if prefixes is None:
+            prefixes = validate_dsrl_rollout_sync_config(self.cfg.actor)
+        state_dict = select_named_parameters_by_prefix(self.model, prefixes)
+        validate_dsrl_rollout_state_dict(state_dict)
+        if list(state_dict) != self.param_names_need_sync:
+            raise ValueError(
+                "OpenPI DSRL rollout sync parameter names changed after FSDP "
+                "wrapping; actor and rollout keyspaces cannot be synchronized."
+            )
+        return state_dict
 
     def __init__(self, cfg: DictConfig):
         super().__init__(cfg)
@@ -87,6 +113,11 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
     def setup_model_and_optimizer(self, initialize_target=False) -> None:
         """Setup model, lr_scheduler, optimizer and grad_scaler."""
         """Add initializing target model logic."""
+        self.use_dsrl = self.cfg.actor.model.get("openpi", {}).get("use_dsrl", False)
+        if self.use_dsrl:
+            self._rollout_sync_prefixes = validate_dsrl_rollout_sync_config(
+                self.cfg.actor
+            )
         module = self.model_provider_func()
         if initialize_target:
             target_module = self.model_provider_func()
@@ -100,9 +131,17 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         else:
             self.logger.info("[FSDP] Gradient checkpointing is disabled")
 
-        # Record the original trainable parameter names before FSDP wrapping.
-        # Persistent buffer names are also recorded for selective weight syncing.
-        self.param_names_need_sync = collect_param_names_need_sync(module)
+        # Record names before FSDP wrapping. DSRL rollout sync is intentionally
+        # limited to actor-side steering parameters; other policies retain the
+        # existing trainable-parameter and persistent-buffer behavior.
+        if self.use_dsrl:
+            rollout_state_dict = select_named_parameters_by_prefix(
+                module, self._rollout_sync_prefixes
+            )
+            validate_dsrl_rollout_state_dict(rollout_state_dict)
+            self.param_names_need_sync = list(rollout_state_dict)
+        else:
+            self.param_names_need_sync = collect_param_names_need_sync(module)
 
         # build model, optimizer, lr_scheduler, grad_scaler
         self.model = self._strategy.wrap_model(
@@ -118,7 +157,6 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             self.target_model.requires_grad_(False)
             self.target_model_initialized = True
 
-        self.use_dsrl = self.cfg.actor.model.get("openpi", {}).get("use_dsrl", False)
         use_dsrl = self.use_dsrl
         if use_dsrl:
             # DSRL: separate actor/critic encoders into different optimizer groups

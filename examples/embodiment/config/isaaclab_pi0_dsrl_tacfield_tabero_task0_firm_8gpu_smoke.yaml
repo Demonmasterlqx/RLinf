@@ -215,6 +215,11 @@ rollout:
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
+  rollout_sync_prefixes:
+    - "dsrl_action_noise_net."
+    - "actor_image_encoder."
+    - "actor_state_encoder."
+    - "actor_tactile_encoder."
   micro_batch_size: 2
   global_batch_size: 168
   seed: 42
