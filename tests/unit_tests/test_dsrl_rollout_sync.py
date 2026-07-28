@@ -84,7 +84,9 @@ def test_dsrl_sender_selects_exact_actor_keyspace_and_normalizes_fsdp_names():
     selected = EmbodiedSACFSDPPolicy._select_dsrl_rollout_state_dict(
         model, ROLLOUT_SYNC_PREFIXES
     )
-    EmbodiedSACFSDPPolicy._validate_dsrl_rollout_state_dict(selected)
+    EmbodiedSACFSDPPolicy._validate_dsrl_rollout_state_dict(
+        selected, expected_keys=tuple(selected)
+    )
 
     assert len(selected) == 48
     assert sum(parameter.numel() for parameter in selected.values()) == 2_311_648
@@ -251,13 +253,30 @@ def test_dsrl_rollout_sync_rejects_wrong_model_keyspace(mutation):
     selected = EmbodiedSACFSDPPolicy._select_dsrl_rollout_state_dict(
         _representative_dsrl_model(), ROLLOUT_SYNC_PREFIXES
     )
+    expected_keys = tuple(selected)
     if mutation == "missing":
         selected.pop(next(iter(selected)))
     else:
         selected["actor_state_encoder.unexpected"] = torch.ones(1)
 
-    with pytest.raises(ValueError, match="48 tensors.*2,311,648 parameters"):
-        EmbodiedSACFSDPPolicy._validate_dsrl_rollout_state_dict(selected)
+    with pytest.raises(ValueError, match="missing keys.*unexpected keys"):
+        EmbodiedSACFSDPPolicy._validate_dsrl_rollout_state_dict(
+            selected, expected_keys=expected_keys
+        )
+
+
+def test_dsrl_rollout_sync_rejects_compensating_key_substitution():
+    selected = EmbodiedSACFSDPPolicy._select_dsrl_rollout_state_dict(
+        _representative_dsrl_model(), ROLLOUT_SYNC_PREFIXES
+    )
+    expected_keys = tuple(selected)
+    expected_key = next(iter(selected))
+    selected["actor_state_encoder.unexpected"] = selected.pop(expected_key)
+
+    with pytest.raises(ValueError, match="missing keys.*unexpected keys"):
+        EmbodiedSACFSDPPolicy._validate_dsrl_rollout_state_dict(
+            selected, expected_keys=expected_keys
+        )
 
 
 def test_non_dsrl_sender_keeps_existing_state_dict_path():

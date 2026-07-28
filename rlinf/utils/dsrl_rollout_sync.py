@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 
 import torch
 
@@ -107,8 +107,21 @@ def filter_state_dict_by_prefix(
 
 def validate_dsrl_rollout_state_dict(
     state_dict: Mapping[str, torch.Tensor],
+    *,
+    expected_keys: Collection[str],
 ) -> None:
     """Require the Tabero DSRL actor rollout synchronization keyspace."""
+    actual_key_set = set(state_dict)
+    expected_key_set = set(expected_keys)
+    missing_keys = sorted(expected_key_set - actual_key_set)
+    unexpected_keys = sorted(actual_key_set - expected_key_set)
+    if missing_keys or unexpected_keys:
+        raise ValueError(
+            "OpenPI DSRL rollout sync state dict does not match the exact reference "
+            f"keyspace; missing keys: {missing_keys}; unexpected keys: "
+            f"{unexpected_keys}."
+        )
+
     tensor_count = len(state_dict)
     parameter_count = sum(tensor.numel() for tensor in state_dict.values())
     if (

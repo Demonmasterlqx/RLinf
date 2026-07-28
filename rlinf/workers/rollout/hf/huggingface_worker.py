@@ -38,6 +38,7 @@ from rlinf.models.embodiment.base_policy import BasePolicy
 from rlinf.scheduler import Channel, Cluster, Worker, split_channel_message
 from rlinf.utils.dsrl_rollout_sync import (
     filter_state_dict_by_prefix,
+    select_named_parameters_by_prefix,
     validate_dsrl_rollout_state_dict,
     validate_dsrl_rollout_sync_config,
 )
@@ -680,8 +681,15 @@ class MultiStepRolloutWorker(Worker):
             return state_dict
 
         prefixes = validate_dsrl_rollout_sync_config(self.cfg.actor)
+        reference_state_dict = select_named_parameters_by_prefix(
+            self.hf_model, prefixes
+        )
+        expected_keys = tuple(reference_state_dict)
+        validate_dsrl_rollout_state_dict(
+            reference_state_dict, expected_keys=expected_keys
+        )
         state_dict = filter_state_dict_by_prefix(state_dict, prefixes)
-        validate_dsrl_rollout_state_dict(state_dict)
+        validate_dsrl_rollout_state_dict(state_dict, expected_keys=expected_keys)
         return state_dict
 
     @Worker.timer("generate_one_epoch")

@@ -75,7 +75,10 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         if prefixes is None:
             prefixes = validate_dsrl_rollout_sync_config(self.cfg.actor)
         state_dict = select_named_parameters_by_prefix(self.model, prefixes)
-        validate_dsrl_rollout_state_dict(state_dict)
+        expected_keys = getattr(
+            self, "_rollout_sync_expected_keys", self.param_names_need_sync
+        )
+        validate_dsrl_rollout_state_dict(state_dict, expected_keys=expected_keys)
         if list(state_dict) != self.param_names_need_sync:
             raise ValueError(
                 "OpenPI DSRL rollout sync parameter names changed after FSDP "
@@ -138,8 +141,12 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             rollout_state_dict = select_named_parameters_by_prefix(
                 module, self._rollout_sync_prefixes
             )
-            validate_dsrl_rollout_state_dict(rollout_state_dict)
-            self.param_names_need_sync = list(rollout_state_dict)
+            self._rollout_sync_expected_keys = tuple(rollout_state_dict)
+            validate_dsrl_rollout_state_dict(
+                rollout_state_dict,
+                expected_keys=self._rollout_sync_expected_keys,
+            )
+            self.param_names_need_sync = list(self._rollout_sync_expected_keys)
         else:
             self.param_names_need_sync = collect_param_names_need_sync(module)
 
