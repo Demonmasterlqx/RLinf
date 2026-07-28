@@ -7,13 +7,16 @@
 
 import argparse
 import ctypes
+import fcntl
 import hashlib
 import json
 import os
 import signal
 import socket
+import stat
 import subprocess
 import tempfile
+import threading
 import time
 from collections.abc import Mapping
 from datetime import UTC, datetime
@@ -865,33 +868,205 @@ def sample_gpus_once(
             os.fsync(file.fileno())
 
 
-def _set_parent_death_signal(expected_parent_pid: int) -> None:
-    if os.getppid() != expected_parent_pid:
-        raise RuntimeError("launcher parent exited before child supervision started")
+def _pid_start_time(pid: int) -> str | None:
+    try:
+        contents = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return None
+    closing_parenthesis = contents.rfind(")")
+    if closing_parenthesis < 0:
+        return None
+    fields = contents[closing_parenthesis + 2 :].split()
+    if fields and fields[0] == "Z":
+        return None
+    return fields[19] if len(fields) > 19 else None
+
+
+def _launcher_is_alive(pid: int, start_time: str) -> bool:
+    return pid > 1 and _pid_start_time(pid) == start_time
+
+
+def _set_child_subreaper() -> None:
     libc = ctypes.CDLL(None, use_errno=True)
-    if libc.prctl(1, signal.SIGKILL, 0, 0, 0) != 0:
+    if libc.prctl(36, 1, 0, 0, 0) != 0:
         error_number = ctypes.get_errno()
         raise OSError(error_number, os.strerror(error_number))
-    if os.getppid() != expected_parent_pid:
-        raise RuntimeError("launcher parent exited before child supervision was armed")
+
+
+def _process_group_exists(process_group_id: int) -> bool:
+    try:
+        os.killpg(process_group_id, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _reap_adopted_children() -> None:
+    while True:
+        try:
+            waited_pid, _ = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return
+        if waited_pid == 0:
+            return
+
+
+def _stop_child_process_group(
+    child: subprocess.Popen[Any], *, grace_seconds: float = 3.0
+) -> None:
+    child.poll()
+    if _process_group_exists(child.pid):
+        try:
+            os.killpg(child.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    deadline = time.monotonic() + grace_seconds
+    while time.monotonic() < deadline:
+        child.poll()
+        if child.returncode is not None:
+            _reap_adopted_children()
+        if not _process_group_exists(child.pid):
+            return
+        time.sleep(0.05)
+    try:
+        os.killpg(child.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    deadline = time.monotonic() + grace_seconds
+    while time.monotonic() < deadline:
+        child.poll()
+        if child.returncode is not None:
+            _reap_adopted_children()
+        if not _process_group_exists(child.pid):
+            return
+        time.sleep(0.05)
+    raise RuntimeError(f"child process group {child.pid} survived SIGKILL")
 
 
 def _sample_forever(args: argparse.Namespace) -> None:
-    _set_parent_death_signal(args.parent_pid)
-    while True:
+    stop_requested = threading.Event()
+
+    def request_stop(_signum: int, _frame: Any) -> None:
+        stop_requested.set()
+
+    signal.signal(signal.SIGTERM, request_stop)
+    signal.signal(signal.SIGINT, request_stop)
+    parent_start_time = _pid_start_time(args.parent_pid)
+    if parent_start_time is None:
+        raise RuntimeError("launcher exited before GPU sampling started")
+    while not stop_requested.is_set():
         started = time.monotonic()
         sample_gpus_once(args.gpu_file, args.process_file)
-        time.sleep(max(0.0, args.interval - (time.monotonic() - started)))
+        if not _launcher_is_alive(args.parent_pid, parent_start_time):
+            raise RuntimeError("launcher exited while GPU sampler was running")
+        stop_requested.wait(max(0.0, args.interval - (time.monotonic() - started)))
 
 
-def _supervise(args: argparse.Namespace) -> None:
+def _supervise(args: argparse.Namespace) -> int:
     command = list(args.child_command)
     if command and command[0] == "--":
         command.pop(0)
     if not command:
         raise ValueError("supervise requires a child command")
-    _set_parent_death_signal(args.parent_pid)
-    os.execvpe(command[0], command, os.environ)
+    if not _launcher_is_alive(args.parent_pid, args.parent_start_time):
+        raise RuntimeError("launcher exited before child supervision started")
+    _set_child_subreaper()
+    requested_signal = 0
+
+    def request_shutdown(received_signal: int, _frame: Any) -> None:
+        nonlocal requested_signal
+        requested_signal = received_signal
+
+    signal.signal(signal.SIGTERM, request_shutdown)
+    signal.signal(signal.SIGINT, request_shutdown)
+    child = subprocess.Popen(command, start_new_session=True)
+    while True:
+        child_status = child.poll()
+        if child_status is not None:
+            if _process_group_exists(child.pid):
+                _stop_child_process_group(child)
+            return child_status
+        if requested_signal:
+            _stop_child_process_group(child)
+            return 0
+        if not _launcher_is_alive(args.parent_pid, args.parent_start_time):
+            _stop_child_process_group(child)
+            return 128 + signal.SIGTERM
+        time.sleep(0.05)
+
+
+def _validate_lock_directory(lock_dir: Path) -> int:
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(lock_dir, flags)
+    details = os.fstat(descriptor)
+    mode = stat.S_IMODE(details.st_mode)
+    trusted_private = details.st_uid == os.geteuid() and mode == 0o700
+    trusted_shared = details.st_uid == 0 and mode == 0o1777
+    if not stat.S_ISDIR(details.st_mode) or not (trusted_private or trusted_shared):
+        os.close(descriptor)
+        raise ValueError(
+            "GPU lock directory must be EUID-owned mode 0700 or root-owned mode 1777"
+        )
+    return descriptor
+
+
+def _open_gpu_lock(directory_fd: int, gpu_id: int) -> int:
+    name = f"tabero-formal-gpu-{gpu_id}.lock"
+    flags = os.O_RDWR | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(
+            name, flags | os.O_CREAT | os.O_EXCL, 0o666, dir_fd=directory_fd
+        )
+    except FileExistsError:
+        descriptor = os.open(name, flags, dir_fd=directory_fd)
+    else:
+        os.fchmod(descriptor, 0o666)
+    details = os.fstat(descriptor)
+    path_details = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    if (
+        not stat.S_ISREG(details.st_mode)
+        or details.st_nlink != 1
+        or stat.S_IMODE(details.st_mode) != 0o666
+        or (details.st_dev, details.st_ino)
+        != (path_details.st_dev, path_details.st_ino)
+    ):
+        os.close(descriptor)
+        raise ValueError(f"invalid GPU {gpu_id} lock file")
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(descriptor)
+        raise RuntimeError(
+            f"GPU {gpu_id} lease is already held by another formal launcher"
+        ) from None
+    return descriptor
+
+
+def _hold_gpu_locks(args: argparse.Namespace) -> None:
+    directory_fd = _validate_lock_directory(args.lock_dir)
+    lock_descriptors: list[int] = []
+    stop_requested = threading.Event()
+
+    def request_stop(_signum: int, _frame: Any) -> None:
+        stop_requested.set()
+
+    signal.signal(signal.SIGTERM, request_stop)
+    signal.signal(signal.SIGINT, request_stop)
+    try:
+        for gpu_id in (0, 1):
+            lock_descriptors.append(_open_gpu_lock(directory_fd, gpu_id))
+        _atomic_write(args.ready_file, "ready\n")
+        stop_requested.wait()
+    finally:
+        for descriptor in lock_descriptors:
+            os.close(descriptor)
+        os.close(directory_fd)
 
 
 def _metadata_lines(
@@ -963,7 +1138,11 @@ def _parser() -> argparse.ArgumentParser:
     sampler.add_argument("--parent-pid", type=int, required=True)
     supervise = commands.add_parser("supervise")
     supervise.add_argument("--parent-pid", type=int, required=True)
+    supervise.add_argument("--parent-start-time", required=True)
     supervise.add_argument("child_command", nargs=argparse.REMAINDER)
+    guardian = commands.add_parser("hold-gpu-locks")
+    guardian.add_argument("--lock-dir", type=Path, required=True)
+    guardian.add_argument("--ready-file", type=Path, required=True)
     return parser
 
 
@@ -979,8 +1158,12 @@ def main() -> None:
                 raise SystemExit(1)
         elif args.command == "sample-gpus":
             _sample_forever(args)
+        elif args.command == "hold-gpu-locks":
+            _hold_gpu_locks(args)
         else:
-            _supervise(args)
+            child_status = _supervise(args)
+            if child_status:
+                raise SystemExit(child_status)
     except (FileExistsError, OSError, RuntimeError, ValueError) as error:
         raise SystemExit(f"error: {error}") from error
 

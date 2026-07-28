@@ -7,8 +7,10 @@ import hashlib
 import importlib.util
 import json
 import os
+import signal
 import subprocess
 import sys
+import time
 from fcntl import LOCK_EX, LOCK_NB, flock
 from pathlib import Path
 
@@ -670,13 +672,77 @@ def test_launcher_public_contract_is_present():
     assert "--sim-device" in launcher and "cuda:1" in launcher
     assert "--sim-kit-args=--/renderer/activeGpu=1" in launcher
     assert "--interval 5" in launcher
-    assert "flock -n" in launcher
-    assert "close_gpu_lock_fds" in launcher
+    assert "hold-gpu-locks" in launcher
+    assert "GPU_LOCK_GUARDIAN_PID" in launcher
     assert "kill -KILL" in launcher
     assert "listener-owned" in launcher
     assert "sample-gpus" in launcher
     assert "--parent-pid" in launcher
     assert "cmp --silent" in launcher
+    assert "run_supervised" in launcher
+    assert "stop_gpu_sampler_successfully" in launcher
+
+
+def test_launcher_stops_gpu_workers_before_finalization():
+    launcher = LAUNCHER_PATH.read_text()
+    sampler_stop = launcher.rindex("stop_gpu_sampler_successfully")
+    server_stop = launcher.rindex('stop_supervised_process "${SERVER_PID}"')
+    end_preflight = launcher.rindex("runtime_preflight_command=(")
+    finalize = launcher.rindex('"${HELPER}" finalize')
+
+    assert sampler_stop < server_stop < end_preflight < finalize
+
+
+def test_launcher_runs_every_business_helper_under_supervision():
+    launcher = LAUNCHER_PATH.read_text()
+    assert 'run_supervised "${preflight_command[@]}"' in launcher
+    assert 'run_supervised "${runtime_preflight_command[@]}"' in launcher
+    assert 'run_supervised "${RLINF_PYTHON}" "${HELPER}" listener-owned' in launcher
+    assert 'run_supervised "${RLINF_PYTHON}" "${HELPER}" finalize' in launcher
+    assert "exec {gpu_lock_fd}" not in launcher
+
+
+def test_background_run_supervised_job_pid_is_the_actual_supervisor(tmp_path):
+    launcher = LAUNCHER_PATH.read_text()
+    function_text = launcher.split("run_supervised() {", 1)[1].split(
+        "\n}\n\nprocess_alive", 1
+    )[0]
+    pid_file = tmp_path / "supervisor.pid"
+    script = tmp_path / "check-wrapper.sh"
+    _write_executable(
+        script,
+        f"""#!/usr/bin/env bash
+set -euo pipefail
+RLINF_PYTHON={sys.executable}
+HELPER={HELPER_PATH}
+LAUNCHER_START_TIME=$(awk '{{print $22}}' /proc/$$/stat)
+run_supervised() {{{function_text}
+}}
+run_supervised sleep 30 &
+printf '%s\n' "$!" >{pid_file}
+wait
+""",
+    )
+    launcher_process = subprocess.Popen([str(script)], cwd=REPO_ROOT)
+    supervisor_pid = None
+    try:
+        for _ in range(100):
+            if pid_file.exists():
+                supervisor_pid = int(pid_file.read_text())
+                break
+            time.sleep(0.05)
+        assert supervisor_pid is not None
+        command = Path(f"/proc/{supervisor_pid}/cmdline").read_bytes().split(b"\0")
+        assert b"tabero_dsrl_official_eval.py" in b" ".join(command)
+        assert b"supervise" in command
+        os.killpg(supervisor_pid, signal.SIGTERM)
+        assert launcher_process.wait(timeout=10) == 0
+    finally:
+        if launcher_process.poll() is None:
+            launcher_process.kill()
+            launcher_process.wait(timeout=5)
+        if supervisor_pid is not None and _pid_is_running(supervisor_pid):
+            os.kill(supervisor_pid, signal.SIGKILL)
 
 
 def test_launcher_does_not_clear_process_cleanup_trap_after_installing_it():
@@ -921,7 +987,10 @@ def test_launcher_rejects_gpu_lease_already_held(tmp_path, bundle_fixture):
     env, _, results = _launcher_environment(tmp_path, bundle, base_model)
     lock_dir = Path(env["TABERO_TEST_GPU_LOCK_DIR"])
     lock_dir.mkdir()
-    with (lock_dir / "gpu_0.lock").open("w") as lock_file:
+    lock_path = lock_dir / "tabero-formal-gpu-0.lock"
+    lock_path.touch(mode=0o666)
+    lock_path.chmod(0o666)
+    with lock_path.open("w") as lock_file:
         flock(lock_file, LOCK_EX | LOCK_NB)
         result = _run_launcher(bundle, 0, env)
 
@@ -1006,6 +1075,227 @@ def test_gpu_sampler_propagates_nvidia_smi_failure(tmp_path):
             tmp_path / "process.csv",
             nvidia_smi=str(failed_smi),
         )
+
+
+def test_gpu_sampler_terminates_gracefully_after_writing_sample(tmp_path):
+    fake_bin = tmp_path / "fake-bin"
+    fake_smi = fake_bin / "nvidia-smi"
+    _write_executable(
+        fake_smi,
+        """#!/usr/bin/env bash
+case "$*" in
+  *"--query-gpu="*) printf '0, Fake GPU, 1, 100, 2, 3, P0\\n1, Fake GPU, 1, 100, 2, 3, P0\\n' ;;
+  *"--query-compute-apps="*) printf 'GPU-fake, 123, fake, 1\\n' ;;
+  *) exit 9 ;;
+esac
+""",
+    )
+    gpu_file = tmp_path / "gpu.csv"
+    process_file = tmp_path / "process.csv"
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "PYTHONPATH": str(REPO_ROOT),
+    }
+    sampler = subprocess.Popen(
+        [
+            sys.executable,
+            str(HELPER_PATH),
+            "sample-gpus",
+            "--gpu-file",
+            str(gpu_file),
+            "--process-file",
+            str(process_file),
+            "--interval",
+            "5",
+            "--parent-pid",
+            str(os.getpid()),
+        ],
+        env=env,
+    )
+    try:
+        for _ in range(50):
+            if gpu_file.exists() and gpu_file.read_text():
+                break
+            time.sleep(0.1)
+        sampler.terminate()
+        assert sampler.wait(timeout=7) == 0
+        assert "Fake GPU" in gpu_file.read_text()
+        assert "GPU-fake" in process_file.read_text()
+    finally:
+        if sampler.poll() is None:
+            sampler.kill()
+            sampler.wait(timeout=5)
+
+
+def _pid_is_running(pid):
+    try:
+        status = Path(f"/proc/{pid}/status").read_text()
+    except OSError:
+        return False
+    return "\nState:\tZ" not in f"\n{status}"
+
+
+def _wait_until_not_running(pid, timeout=10):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not _pid_is_running(pid):
+            return True
+        time.sleep(0.05)
+    return not _pid_is_running(pid)
+
+
+def test_supervisor_kills_descendant_group_when_launcher_is_sigkilled(tmp_path):
+    child_script = tmp_path / "child.sh"
+    child_pid_file = tmp_path / "child.pid"
+    supervisor_pid_file = tmp_path / "supervisor.pid"
+    _write_executable(
+        child_script,
+        '#!/usr/bin/env bash\nsleep 30 &\nprintf \'%s\\n\' "$!" >"$1"\nwait\n',
+    )
+    launcher_script = tmp_path / "launcher.sh"
+    _write_executable(
+        launcher_script,
+        f"""#!/usr/bin/env bash
+set -euo pipefail
+start_time=$(python -c 'import sys; data=open(f"/proc/{{sys.argv[1]}}/stat").read(); print(data[data.rfind(")") + 2:].split()[19])' "$$")
+setsid {sys.executable} {HELPER_PATH} supervise \\
+  --parent-pid $$ --parent-start-time "$start_time" -- \\
+  {child_script} {child_pid_file} &
+printf '%s\n' "$!" >{supervisor_pid_file}
+wait
+""",
+    )
+    launcher = subprocess.Popen([str(launcher_script)], cwd=REPO_ROOT)
+    supervisor_pid = None
+    child_pid = None
+    try:
+        for _ in range(100):
+            if supervisor_pid_file.exists() and child_pid_file.exists():
+                supervisor_pid = int(supervisor_pid_file.read_text())
+                child_pid = int(child_pid_file.read_text())
+                break
+            time.sleep(0.05)
+        assert supervisor_pid is not None
+        assert child_pid is not None
+
+        launcher.send_signal(signal.SIGKILL)
+        launcher.wait(timeout=5)
+
+        assert _wait_until_not_running(supervisor_pid)
+        assert _wait_until_not_running(child_pid)
+    finally:
+        if launcher.poll() is None:
+            launcher.kill()
+            launcher.wait(timeout=5)
+        for pid in (supervisor_pid, child_pid):
+            if pid is not None and _pid_is_running(pid):
+                os.kill(pid, signal.SIGKILL)
+
+
+def _start_gpu_lock_guardian(lock_dir, ready_file):
+    return subprocess.Popen(
+        [
+            sys.executable,
+            str(HELPER_PATH),
+            "hold-gpu-locks",
+            "--lock-dir",
+            str(lock_dir),
+            "--ready-file",
+            str(ready_file),
+        ],
+        cwd=REPO_ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
+def test_gpu_lock_guardian_rejects_second_contender(tmp_path):
+    lock_dir = tmp_path / "locks"
+    lock_dir.mkdir(mode=0o700)
+    first_ready = tmp_path / "first.ready"
+    first = _start_gpu_lock_guardian(lock_dir, first_ready)
+    try:
+        for _ in range(100):
+            if first_ready.exists() or first.poll() is not None:
+                break
+            time.sleep(0.05)
+        assert first_ready.read_text() == "ready\n"
+
+        second = _start_gpu_lock_guardian(lock_dir, tmp_path / "second.ready")
+        _, second_stderr = second.communicate(timeout=5)
+        assert second.returncode != 0
+        assert "lease" in second_stderr.lower()
+    finally:
+        first.terminate()
+        assert first.wait(timeout=5) == 0
+
+
+def test_gpu_lock_guardian_rejects_symlink_lock_file(tmp_path):
+    lock_dir = tmp_path / "locks"
+    lock_dir.mkdir(mode=0o700)
+    target = tmp_path / "target"
+    target.write_text("")
+    (lock_dir / "tabero-formal-gpu-0.lock").symlink_to(target)
+
+    guardian = _start_gpu_lock_guardian(lock_dir, tmp_path / "ready")
+    _, stderr = guardian.communicate(timeout=5)
+
+    assert guardian.returncode != 0
+    assert "lock" in stderr.lower() or "symlink" in stderr.lower()
+
+
+def test_gpu_lock_guardian_releases_leases_after_launcher_sigkill(tmp_path):
+    lock_dir = tmp_path / "locks"
+    lock_dir.mkdir(mode=0o700)
+    first_ready = tmp_path / "first.ready"
+    supervisor_pid_file = tmp_path / "supervisor.pid"
+    launcher_script = tmp_path / "lock-launcher.sh"
+    _write_executable(
+        launcher_script,
+        f"""#!/usr/bin/env bash
+set -euo pipefail
+start_time=$(python -c 'import sys; data=open(f"/proc/{{sys.argv[1]}}/stat").read(); print(data[data.rfind(")") + 2:].split()[19])' "$$")
+setsid {sys.executable} {HELPER_PATH} supervise \\
+  --parent-pid $$ --parent-start-time "$start_time" -- \\
+  {sys.executable} {HELPER_PATH} hold-gpu-locks \\
+  --lock-dir {lock_dir} --ready-file {first_ready} &
+printf '%s\n' "$!" >{supervisor_pid_file}
+wait
+""",
+    )
+    launcher = subprocess.Popen([str(launcher_script)], cwd=REPO_ROOT)
+    supervisor_pid = None
+    contender = None
+    try:
+        for _ in range(100):
+            if supervisor_pid_file.exists() and first_ready.exists():
+                supervisor_pid = int(supervisor_pid_file.read_text())
+                break
+            time.sleep(0.05)
+        assert supervisor_pid is not None
+
+        launcher.kill()
+        launcher.wait(timeout=5)
+        assert _wait_until_not_running(supervisor_pid)
+
+        second_ready = tmp_path / "second.ready"
+        contender = _start_gpu_lock_guardian(lock_dir, second_ready)
+        for _ in range(100):
+            if second_ready.exists() or contender.poll() is not None:
+                break
+            time.sleep(0.05)
+        assert second_ready.read_text() == "ready\n"
+    finally:
+        if launcher.poll() is None:
+            launcher.kill()
+            launcher.wait(timeout=5)
+        if contender is not None:
+            contender.terminate()
+            contender.wait(timeout=5)
+        if supervisor_pid is not None and _pid_is_running(supervisor_pid):
+            os.kill(supervisor_pid, signal.SIGKILL)
 
 
 @pytest.mark.parametrize(
