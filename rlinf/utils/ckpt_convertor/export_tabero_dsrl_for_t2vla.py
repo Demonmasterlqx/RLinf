@@ -6,10 +6,14 @@
 """Export a final Tabero DSRL-SAC actor bundle for T2-VLA inference."""
 
 import argparse
+import ctypes
+import errno
 import hashlib
+import io
 import json
 import os
 import shutil
+import sys
 import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -40,6 +44,8 @@ FINAL_GLOBAL_STEP = 50
 ACTOR_WEIGHTS_NAME = "dsrl_actor.safetensors"
 MANIFEST_NAME = "manifest.json"
 AUDIT_NAME = "artifact_audit.json"
+AT_FDCWD = -100
+RENAME_NOREPLACE = 1
 PROVENANCE_KEYS = {
     "TABERO_PROVENANCE_VERSION",
     "TABERO_PROVENANCE_MODE",
@@ -74,6 +80,14 @@ def checkpoint_sha256(path: str | Path) -> str:
     return digest.hexdigest()
 
 
+def _capture_artifact(path: Path, label: str) -> tuple[bytes, str]:
+    try:
+        content = path.read_bytes()
+    except OSError as error:
+        raise ValueError(f"{label} could not be captured: {path}") from error
+    return content, hashlib.sha256(content).hexdigest()
+
+
 def _require_artifact_unchanged(path: Path, expected_hash: str, label: str) -> None:
     try:
         actual_hash = checkpoint_sha256(path)
@@ -87,6 +101,8 @@ def _require_artifact_unchanged(path: Path, expected_hash: str, label: str) -> N
 
 
 def _require_sha256(value: str, label: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"{label} must be a string containing a SHA-256 digest")
     normalized = value.lower()
     if len(normalized) != 64 or any(
         character not in "0123456789abcdef" for character in normalized
@@ -102,11 +118,21 @@ def _require_strict_int(value: Any, expected: int, label: str) -> None:
         )
 
 
-def _load_provenance(path: Path) -> dict[str, str]:
-    if not path.is_file():
-        raise ValueError(f"formal provenance does not exist: {path}")
+def _load_provenance(
+    path: Path,
+    *,
+    captured_content: bytes | None = None,
+) -> dict[str, str]:
+    if captured_content is None:
+        if not path.is_file():
+            raise ValueError(f"formal provenance does not exist: {path}")
+        captured_content, _ = _capture_artifact(path, "formal provenance")
+    try:
+        text = captured_content.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError(f"formal provenance is not valid UTF-8: {path}") from error
     values: dict[str, str] = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in text.splitlines():
         key, separator, value = line.partition("=")
         if not separator or not key or not value:
             raise ValueError(f"invalid formal provenance line: {line!r}")
@@ -262,9 +288,17 @@ def _validate_config_snapshot(
     config_snapshot: Path,
     base_model: Path,
     metadata: Mapping[str, Any],
+    *,
+    captured_content: bytes | None = None,
 ) -> None:
+    if captured_content is None:
+        captured_content, _ = _capture_artifact(
+            config_snapshot,
+            "formal config snapshot",
+        )
     try:
-        config = OmegaConf.load(config_snapshot)
+        config_text = captured_content.decode("utf-8")
+        config = OmegaConf.load(io.StringIO(config_text))
     except Exception as error:
         raise ValueError(
             f"formal config snapshot could not be loaded: {config_snapshot}"
@@ -357,16 +391,20 @@ def _validate_provenance(
     config_snapshot = output_root / "config_snapshot.yaml"
     if not provenance_path.is_file():
         raise ValueError(f"formal provenance does not exist: {provenance_path}")
-    provenance_hash = checkpoint_sha256(provenance_path)
-    provenance = _load_provenance(provenance_path)
-    _require_artifact_unchanged(
+    provenance_content, provenance_hash = _capture_artifact(
         provenance_path,
-        provenance_hash,
         "formal provenance",
+    )
+    provenance = _load_provenance(
+        provenance_path,
+        captured_content=provenance_content,
     )
     if not config_snapshot.is_file():
         raise ValueError(f"formal config snapshot does not exist: {config_snapshot}")
-    snapshot_hash = checkpoint_sha256(config_snapshot)
+    snapshot_content, snapshot_hash = _capture_artifact(
+        config_snapshot,
+        "formal config snapshot",
+    )
     if (
         snapshot_hash != provenance["TABERO_CONFIG_SHA256"]
         or snapshot_hash != (provenance["TABERO_CONFIG_SNAPSHOT_SHA256"])
@@ -376,11 +414,11 @@ def _validate_provenance(
         raise ValueError("base model path does not match formal provenance")
     if provenance["TABERO_BASE_MODEL_SHA256"] != actual_base_hash:
         raise ValueError("base model SHA-256 does not match formal provenance")
-    _validate_config_snapshot(config_snapshot, base_model, metadata)
-    _require_artifact_unchanged(
+    _validate_config_snapshot(
         config_snapshot,
-        snapshot_hash,
-        "formal config snapshot",
+        base_model,
+        metadata,
+        captured_content=snapshot_content,
     )
 
     legacy_source_config = None
@@ -391,7 +429,10 @@ def _validate_provenance(
             raise ValueError(
                 f"legacy source config does not exist: {legacy_source_config}"
             )
-        legacy_source_hash = checkpoint_sha256(legacy_source_config)
+        _, legacy_source_hash = _capture_artifact(
+            legacy_source_config,
+            "legacy source config",
+        )
         if legacy_source_hash != provenance["TABERO_SOURCE_CONFIG_SHA256"]:
             raise ValueError("legacy source config SHA-256 does not match provenance")
     return _ValidatedProvenance(
@@ -444,6 +485,50 @@ def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
     )
 
 
+def _publish_directory_noreplace(source: Path, target: Path) -> None:
+    if not sys.platform.startswith("linux"):
+        raise RuntimeError(
+            "atomic no-replace directory publish requires Linux renameat2"
+        )
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        renameat2 = libc.renameat2
+    except AttributeError as error:
+        raise RuntimeError(
+            "atomic no-replace directory publish requires libc renameat2"
+        ) from error
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        AT_FDCWD,
+        os.fsencode(source),
+        AT_FDCWD,
+        os.fsencode(target),
+        RENAME_NOREPLACE,
+    )
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number == errno.EEXIST:
+        raise FileExistsError(
+            error_number,
+            f"DSRL bundle output already exists: {target}",
+            str(target),
+        )
+    if error_number in {errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP}:
+        raise RuntimeError(
+            "atomic no-replace directory publish is unsupported by this Linux "
+            f"kernel/filesystem: {target}"
+        )
+    raise OSError(error_number, os.strerror(error_number), str(target))
+
+
 def export_tabero_dsrl_bundle(
     *,
     trainable_checkpoint: str | Path,
@@ -474,8 +559,15 @@ def export_tabero_dsrl_bundle(
             f"expected={expected_base_hash}, actual={actual_base_hash}"
         )
 
-    checkpoint_hash = checkpoint_sha256(checkpoint)
-    payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    checkpoint_content, checkpoint_hash = _capture_artifact(
+        checkpoint,
+        "source checkpoint",
+    )
+    payload = torch.load(
+        io.BytesIO(checkpoint_content),
+        map_location="cpu",
+        weights_only=True,
+    )
     _require_artifact_unchanged(checkpoint, checkpoint_hash, "source checkpoint")
     if not isinstance(payload, Mapping) or set(payload) != {"model", "metadata"}:
         raise ValueError("final DSRL sidecar must contain exactly model and metadata")
@@ -626,9 +718,7 @@ def export_tabero_dsrl_bundle(
             base_hash=actual_base_hash,
             provenance=provenance,
         )
-        if output_dir.exists():
-            raise FileExistsError(f"DSRL bundle output already exists: {output_dir}")
-        os.rename(temporary_dir, output_dir)
+        _publish_directory_noreplace(temporary_dir, output_dir)
     except Exception:
         shutil.rmtree(temporary_dir, ignore_errors=True)
         raise

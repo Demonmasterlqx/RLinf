@@ -6,6 +6,7 @@
 import hashlib
 import json
 from math import prod
+from pathlib import Path
 
 import pytest
 import torch
@@ -704,6 +705,96 @@ def test_export_rejects_source_artifact_changed_after_validation(
             expected_base_model_sha256=base_hash,
             task_id=0,
         )
+
+
+def test_export_uses_captured_checkpoint_bytes_during_aba_swap(
+    tmp_path,
+    monkeypatch,
+):
+    checkpoint = _checkpoint(tmp_path)
+    base_model = _base_model(tmp_path)
+    base_hash = _write_provenance(checkpoint, base_model)
+    original_bytes = checkpoint.read_bytes()
+    replacement_payload = torch.load(
+        checkpoint,
+        map_location="cpu",
+        weights_only=True,
+    )
+    replacement_payload["model"] = {
+        key: torch.ones_like(tensor)
+        for key, tensor in replacement_payload["model"].items()
+    }
+    replacement_checkpoint = tmp_path / "replacement.pt"
+    torch.save(replacement_payload, replacement_checkpoint)
+    replacement_bytes = replacement_checkpoint.read_bytes()
+    real_load = exporter.torch.load
+
+    def aba_load(source, *args, **kwargs):
+        checkpoint.write_bytes(replacement_bytes)
+        try:
+            return real_load(source, *args, **kwargs)
+        finally:
+            checkpoint.write_bytes(original_bytes)
+
+    monkeypatch.setattr(exporter.torch, "load", aba_load)
+
+    manifest = exporter.export_tabero_dsrl_bundle(
+        trainable_checkpoint=checkpoint,
+        output_dir=tmp_path / "bundle",
+        base_model=base_model,
+        expected_base_model_sha256=base_hash,
+        task_id=0,
+    )
+
+    actor = load_file(tmp_path / "bundle" / "dsrl_actor.safetensors")
+    assert all(torch.count_nonzero(tensor).item() == 0 for tensor in actor.values())
+    assert (
+        manifest["source_checkpoint_sha256"]
+        == hashlib.sha256(original_bytes).hexdigest()
+    )
+
+
+def test_export_atomic_publish_rejects_racing_empty_target(tmp_path, monkeypatch):
+    checkpoint = _checkpoint(tmp_path)
+    base_model = _base_model(tmp_path)
+    base_hash = _write_provenance(checkpoint, base_model)
+    output_dir = (tmp_path / "bundle").resolve()
+    real_require_sources_unchanged = exporter._require_sources_unchanged
+    real_exists = Path.exists
+
+    def validate_sources_then_create_target(**kwargs):
+        real_require_sources_unchanged(**kwargs)
+        output_dir.mkdir()
+
+    def stale_exists(path):
+        if path == output_dir:
+            return False
+        return real_exists(path)
+
+    monkeypatch.setattr(
+        exporter,
+        "_require_sources_unchanged",
+        validate_sources_then_create_target,
+    )
+    monkeypatch.setattr(Path, "exists", stale_exists)
+
+    with pytest.raises(FileExistsError, match="already exists"):
+        exporter.export_tabero_dsrl_bundle(
+            trainable_checkpoint=checkpoint,
+            output_dir=output_dir,
+            base_model=base_model,
+            expected_base_model_sha256=base_hash,
+            task_id=0,
+        )
+
+    assert output_dir.is_dir()
+    assert list(output_dir.iterdir()) == []
+
+
+@pytest.mark.parametrize("value", [None, 123, b"0" * 64])
+def test_require_sha256_rejects_non_string_values(value):
+    with pytest.raises(TypeError, match="SHA-256.*string"):
+        exporter._require_sha256(value, "test SHA-256")
 
 
 def test_export_loads_sidecar_in_weights_only_mode(tmp_path, monkeypatch):
