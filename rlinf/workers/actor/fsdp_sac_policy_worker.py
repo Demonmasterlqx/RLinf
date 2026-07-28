@@ -14,6 +14,7 @@
 
 
 import os
+from collections.abc import Mapping
 from typing import Optional
 
 import numpy as np
@@ -35,7 +36,13 @@ from rlinf.models.embodiment.modules.entropy_tunning import EntropyTemperature
 from rlinf.scheduler import Channel, Worker
 from rlinf.utils import drq
 from rlinf.utils.distributed import all_reduce_dict
+from rlinf.utils.dsrl_checkpoint import (
+    build_compact_target_payload,
+    restore_target_payload,
+    select_dsrl_trainable_state,
+)
 from rlinf.utils.dsrl_rollout_sync import (
+    normalize_fsdp_parameter_name,
     select_named_parameters_by_prefix,
     validate_dsrl_rollout_state_dict,
     validate_dsrl_rollout_sync_config,
@@ -312,7 +319,87 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                 module_name in name.split(".")
                 for module_name in self._dsrl_critic_param_filters()
             ):
-                self._target_shadow_f32[name] = param.data.float().clone()
+                normalized_name = normalize_fsdp_parameter_name(name)
+                if normalized_name in self._target_shadow_f32:
+                    raise ValueError(
+                        "OpenPI DSRL target shadow has duplicate normalized key "
+                        f"{normalized_name!r}."
+                    )
+                self._target_shadow_f32[normalized_name] = param.data.float().clone()
+
+    def _save_trainable_model_weights(self, save_path: str, step: int) -> None:
+        """Save the compact DSRL sidecar without a full FSDP state gather."""
+        if not self.use_dsrl:
+            return super()._save_trainable_model_weights(save_path, step)
+        if not self._cfg.fsdp_config.get("save_trainable_model_weights", False):
+            return
+
+        rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
+        if rank == 0:
+            state_dict = select_dsrl_trainable_state(self.model)
+            metadata = {
+                "step": step,
+                "rank": rank,
+                "world_size": world_size,
+                "format": "trainable_weights",
+                "parameter_count": len(state_dict),
+            }
+            configured_metadata = self._cfg.fsdp_config.get(
+                "trainable_checkpoint_metadata", None
+            )
+            if configured_metadata is not None:
+                if not isinstance(configured_metadata, Mapping):
+                    raise ValueError(
+                        "fsdp_config.trainable_checkpoint_metadata must be a mapping"
+                    )
+                target_global_step = configured_metadata.get("target_global_step")
+                if (
+                    isinstance(target_global_step, bool)
+                    or not isinstance(target_global_step, int)
+                    or target_global_step <= 0
+                ):
+                    raise ValueError(
+                        "trainable checkpoint target_global_step must be a positive integer"
+                    )
+                metadata = dict(configured_metadata) | metadata
+                metadata["global_step"] = step
+                metadata["is_final"] = step == target_global_step
+
+            sidecar_dir = os.path.join(save_path, "model_state_dict")
+            os.makedirs(sidecar_dir, exist_ok=True)
+            sidecar_path = os.path.join(sidecar_dir, "trainable_weights.pt")
+            torch.save({"model": state_dict, "metadata": metadata}, sidecar_path)
+            self._logger.info(
+                f"[FSDP] Saved {len(state_dict)} DSRL trainable tensors to "
+                f"{sidecar_path}"
+            )
+        torch.distributed.barrier()
+
+    def _save_dsrl_target_checkpoint(self, save_path: str, step: int) -> None:
+        if not hasattr(self, "_target_shadow_f32"):
+            raise ValueError(
+                "OpenPI DSRL target shadow must be initialized before checkpointing."
+            )
+        payload = build_compact_target_payload(
+            self.target_model,
+            self._target_shadow_f32,
+            step=step,
+            rank=self._rank,
+            world_size=torch.distributed.get_world_size(),
+        )
+        torch.save(payload, save_path)
+
+    def _load_dsrl_target_checkpoint(self, load_path: str) -> dict:
+        payload = torch.load(load_path, map_location="cpu", weights_only=True)
+        self._target_shadow_f32, receipt = restore_target_payload(
+            payload,
+            self.target_model,
+            rank=self._rank,
+            world_size=torch.distributed.get_world_size(),
+        )
+        self._logger.info(f"[FSDP] Restored OpenPI DSRL target: {receipt}")
+        return receipt
 
     def soft_update_target_model(self, tau: Optional[float] = None):
         """Soft update target model parameters.
@@ -351,14 +438,15 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                     self.target_model.named_parameters(),
                 ):
                     assert name1 == name2
-                    if name1 not in self._target_shadow_f32:
+                    shadow_name = normalize_fsdp_parameter_name(name1)
+                    if shadow_name not in self._target_shadow_f32:
                         continue
                     if "q_head" not in name1 and self.target_update_type != "all":
-                        shadow = self._target_shadow_f32[name1]
+                        shadow = self._target_shadow_f32[shadow_name]
                         shadow.copy_(online_param.data.float())
                         target_param.data.copy_(shadow.to(target_param.data.dtype))
                     else:
-                        shadow = self._target_shadow_f32[name1]
+                        shadow = self._target_shadow_f32[shadow_name]
                         shadow.mul_(1.0 - tau).add_(
                             online_param.data.float(), alpha=tau
                         )
@@ -853,13 +941,16 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             save_base_path, "sac_components/target_model"
         )
         os.makedirs(target_model_save_path, exist_ok=True)
-        target_model_state_dict = self._strategy.get_model_state_dict(
-            self.target_model, cpu_offload=False, full_state_dict=True
+        target_checkpoint_path = os.path.join(
+            target_model_save_path, f"checkpoint_rank_{self._rank}.pt"
         )
-        torch.save(
-            target_model_state_dict,
-            os.path.join(target_model_save_path, f"checkpoint_rank_{self._rank}.pt"),
-        )
+        if self.use_dsrl:
+            self._save_dsrl_target_checkpoint(target_checkpoint_path, step)
+        else:
+            target_model_state_dict = self._strategy.get_model_state_dict(
+                self.target_model, cpu_offload=False, full_state_dict=True
+            )
+            torch.save(target_model_state_dict, target_checkpoint_path)
 
         # save replay buffer
         buffer_save_path = os.path.join(
@@ -893,17 +984,22 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         target_model_load_path = os.path.join(
             load_base_path, "sac_components/target_model"
         )
-        target_model_state_dict = torch.load(
-            os.path.join(target_model_load_path, f"checkpoint_rank_{self._rank}.pt")
-        )
-        self._strategy.load_model_with_state_dict(
-            self.target_model,
-            target_model_state_dict,
-            cpu_offload=False,
-            full_state_dict=True,
+        target_checkpoint_path = os.path.join(
+            target_model_load_path, f"checkpoint_rank_{self._rank}.pt"
         )
         if self.use_dsrl:
-            self._init_target_shadow()
+            target_restore_receipt = self._load_dsrl_target_checkpoint(
+                target_checkpoint_path
+            )
+        else:
+            target_model_state_dict = torch.load(target_checkpoint_path)
+            self._strategy.load_model_with_state_dict(
+                self.target_model,
+                target_model_state_dict,
+                cpu_offload=False,
+                full_state_dict=True,
+            )
+            target_restore_receipt = "loaded"
 
         # load replay buffer
         buffer_load_path = os.path.join(
@@ -919,7 +1015,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             "model": "loaded",
             "optimizers": ["actor", "critic"],
             "alpha": "loaded" if self.alpha_optimizer is not None else "disabled",
-            "target_model": "loaded",
+            "target_model": target_restore_receipt,
             "replay_buffer": {
                 "size": int(self.replay_buffer.size),
                 "total_samples": int(self.replay_buffer.total_samples),

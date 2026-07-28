@@ -431,16 +431,21 @@ def _checkpoint_worker(tmp_path):
     worker.is_weight_offloaded = False
     worker.is_optimizer_offloaded = False
     worker.use_dsrl = True
+    worker._logger = SimpleNamespace(info=lambda *_args: None)
     worker.replay_buffer = SimpleNamespace(
         size=0,
         total_samples=0,
         save_checkpoint=lambda path: None,
         load_checkpoint=lambda path: None,
     )
+    worker._init_target_shadow()
     return worker
 
 
-def test_dsrl_checkpoint_honors_fsdp_config_and_exports_trainable_weights(tmp_path):
+def test_dsrl_checkpoint_honors_fsdp_config_and_exports_trainable_weights(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 1)
     worker = _checkpoint_worker(tmp_path)
     trainable_exports = []
     worker._save_trainable_model_weights = MethodType(
@@ -456,7 +461,10 @@ def test_dsrl_checkpoint_honors_fsdp_config_and_exports_trainable_weights(tmp_pa
     assert trainable_exports == [(str(tmp_path), 1)]
 
 
-def test_dsrl_checkpoint_load_rebuilds_target_shadow_from_restored_weights(tmp_path):
+def test_dsrl_checkpoint_load_rebuilds_target_shadow_from_restored_weights(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 1)
     worker = _checkpoint_worker(tmp_path)
     with torch.no_grad():
         for parameter in worker.target_model.parameters():
@@ -488,15 +496,18 @@ def test_dsrl_checkpoint_load_rebuilds_target_shadow_from_restored_weights(tmp_p
     }
     assert set(worker._target_shadow_f32) == expected_shadow_names
     for name, parameter in worker.target_model.named_parameters():
-        torch.testing.assert_close(parameter, torch.full_like(parameter, 3.0))
         if name in expected_shadow_names:
+            torch.testing.assert_close(parameter, torch.full_like(parameter, 3.0))
             torch.testing.assert_close(
                 worker._target_shadow_f32[name],
                 torch.full_like(worker._target_shadow_f32[name], 3.0),
             )
+        else:
+            torch.testing.assert_close(parameter, torch.full_like(parameter, -1.0))
 
 
-def test_dsrl_checkpoint_load_returns_component_receipt(tmp_path):
+def test_dsrl_checkpoint_load_returns_component_receipt(monkeypatch, tmp_path):
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 1)
     worker = _checkpoint_worker(tmp_path)
     worker.entropy_temp = object()
     worker.alpha_optimizer = object()
@@ -527,15 +538,26 @@ def test_dsrl_checkpoint_load_returns_component_receipt(tmp_path):
     ]
     assert worker._strategy.load_calls[1]["optimizers"] is worker.alpha_optimizer
     assert replay_loads == [str(tmp_path / "sac_components/replay_buffer/rank_0")]
-    for parameter in worker.target_model.parameters():
-        torch.testing.assert_close(parameter, torch.full_like(parameter, 4.0))
+    for name, parameter in worker.target_model.named_parameters():
+        if name.split(".")[0] in {
+            "critic_image_encoder",
+            "critic_state_encoder",
+            "critic_tactile_encoder",
+            "q_head",
+        }:
+            torch.testing.assert_close(parameter, torch.full_like(parameter, 4.0))
     assert receipt == {
         "rank": 0,
         "checkpoint_format": "local_shard",
         "model": "loaded",
         "optimizers": ["actor", "critic"],
         "alpha": "loaded",
-        "target_model": "loaded",
+        "target_model": {
+            "format": "legacy_full",
+            "tensor_count": 8,
+            "parameter_count": 24,
+            "shadow_tensor_count": 8,
+        },
         "replay_buffer": {"size": 1, "total_samples": 1512},
     }
 
