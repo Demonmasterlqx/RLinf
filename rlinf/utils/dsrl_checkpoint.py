@@ -87,12 +87,21 @@ def _build_dsrl_trainable_manifest() -> Mapping[str, tuple[int, ...]]:
 
 
 DSRL_TRAINABLE_MANIFEST_V1 = _build_dsrl_trainable_manifest()
+DSRL_TARGET_MANIFEST_V1: Mapping[str, tuple[int, ...]] = MappingProxyType(
+    {
+        name: shape
+        for name, shape in DSRL_TRAINABLE_MANIFEST_V1.items()
+        if name.startswith(DSRL_TARGET_PREFIXES)
+    }
+)
 
 assert len(DSRL_TRAINABLE_MANIFEST_V1) == DSRL_TRAINABLE_TENSOR_COUNT
 assert (
     sum(prod(shape) for shape in DSRL_TRAINABLE_MANIFEST_V1.values())
     == DSRL_TRAINABLE_PARAMETER_COUNT
 )
+assert len(DSRL_TARGET_MANIFEST_V1) == 172
+assert sum(prod(shape) for shape in DSRL_TARGET_MANIFEST_V1.values()) == 2_872_106
 
 
 def _require_strict_int(
@@ -139,6 +148,30 @@ def select_target_parameters(model: nn.Module) -> dict[str, nn.Parameter]:
     selected = _normalized_named_parameters(model, prefixes=DSRL_TARGET_PREFIXES)
     if not selected:
         raise ValueError("OpenPI DSRL target has no critic/Q parameters.")
+    return selected
+
+
+def select_compact_target_parameters(model: nn.Module) -> dict[str, nn.Parameter]:
+    """Return target parameters matching the canonical DSRL critic/Q manifest."""
+    selected = select_target_parameters(model)
+    expected_keys = set(DSRL_TARGET_MANIFEST_V1)
+    actual_keys = set(selected)
+    missing_keys = sorted(expected_keys - actual_keys)
+    unexpected_keys = sorted(actual_keys - expected_keys)
+    shape_mismatches = {
+        name: {
+            "expected": DSRL_TARGET_MANIFEST_V1[name],
+            "actual": tuple(selected[name].shape),
+        }
+        for name in expected_keys & actual_keys
+        if tuple(selected[name].shape) != DSRL_TARGET_MANIFEST_V1[name]
+    }
+    if missing_keys or unexpected_keys or shape_mismatches:
+        raise ValueError(
+            "OpenPI DSRL target does not match canonical manifest v1; "
+            f"missing keys: {missing_keys}; unexpected keys: {unexpected_keys}; "
+            f"shape mismatches: {shape_mismatches}."
+        )
     return selected
 
 

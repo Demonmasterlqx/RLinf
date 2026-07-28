@@ -21,6 +21,7 @@ import torch
 from omegaconf import OmegaConf
 from torch import nn
 
+import rlinf.workers.actor.fsdp_sac_policy_worker as sac_worker_module
 from rlinf.models.embodiment.openpi.openpi_action_model import (
     OpenPi0ForRLActionPrediction,
 )
@@ -29,7 +30,10 @@ from rlinf.utils.dsrl_checkpoint import (
     restore_target_payload,
     select_dsrl_trainable_state,
 )
-from rlinf.utils.dsrl_rollout_sync import DSRL_ROLLOUT_SYNC_MANIFEST_V1
+from rlinf.utils.dsrl_rollout_sync import (
+    DSRL_ROLLOUT_SYNC_MANIFEST_V1,
+    DSRL_ROLLOUT_SYNC_PREFIXES,
+)
 from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
 from rlinf.workers.actor.fsdp_sac_policy_worker import EmbodiedSACFSDPPolicy
 
@@ -86,22 +90,26 @@ class _CheckpointModel(nn.Module):
         self.q_head = nn.Linear(2, 2)
 
 
-def _worker(*, use_dsrl=True, save_trainable=False):
+def _worker(*, use_dsrl=True, compact=True, save_trainable=False):
     worker = EmbodiedSACFSDPPolicy.__new__(EmbodiedSACFSDPPolicy)
     worker.cfg = OmegaConf.create(
         {
             "actor": {
+                "training_backend": "fsdp",
+                "model": {"openpi": {"dsrl_use_tactile": True}},
                 "fsdp_config": {
                     "use_orig_params": True,
                     "sharding_strategy": "no_shard",
                     "checkpoint_format": "local_shard",
                     "save_full_model_weights": False,
                     "save_trainable_model_weights": save_trainable,
-                }
+                },
             },
             "algorithm": {"tau": 0.005},
         }
     )
+    if use_dsrl and compact:
+        worker.cfg.actor.rollout_sync_prefixes = list(DSRL_ROLLOUT_SYNC_PREFIXES)
     worker._cfg = worker.cfg.actor
     worker._rank = 0
     worker._strategy = _CheckpointStrategy()
@@ -117,6 +125,9 @@ def _worker(*, use_dsrl=True, save_trainable=False):
     worker.is_weight_offloaded = False
     worker.is_optimizer_offloaded = False
     worker.use_dsrl = use_dsrl
+    worker._rollout_sync_prefixes = (
+        DSRL_ROLLOUT_SYNC_PREFIXES if use_dsrl and compact else None
+    )
     worker.replay_buffer = SimpleNamespace(
         size=0,
         total_samples=0,
@@ -127,13 +138,34 @@ def _worker(*, use_dsrl=True, save_trainable=False):
     return worker
 
 
+def _init_small_target_shadow(worker):
+    worker._target_shadow_f32 = {
+        name: parameter.detach().float().clone()
+        for name, parameter in _critic_named_parameters(worker.target_model).items()
+    }
+
+
 @pytest.fixture
 def distributed(monkeypatch):
-    barriers = []
+    calls = SimpleNamespace(barriers=[], gathers=[], broadcasts=[])
     monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 4)
-    monkeypatch.setattr(torch.distributed, "barrier", lambda: barriers.append(True))
-    return barriers
+    monkeypatch.setattr(
+        torch.distributed, "barrier", lambda: calls.barriers.append(True)
+    )
+
+    def all_gather_object(output, local_error):
+        calls.gathers.append(local_error)
+        output[:] = [None, None, None, None]
+
+    def broadcast_object_list(status, src):
+        calls.broadcasts.append((list(status), src))
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", all_gather_object)
+    monkeypatch.setattr(
+        torch.distributed, "broadcast_object_list", broadcast_object_list
+    )
+    return calls
 
 
 def _target_path(base_path):
@@ -153,7 +185,7 @@ def _save_compact_target(tmp_path, distributed):
     with torch.no_grad():
         for index, parameter in enumerate(worker.target_model.parameters(), start=1):
             parameter.fill_(index)
-    worker._init_target_shadow()
+    _init_small_target_shadow(worker)
     for index, shadow in enumerate(worker._target_shadow_f32.values(), start=1):
         shadow.add_(index / 1000)
 
@@ -222,7 +254,7 @@ def test_compact_target_round_trip_restores_parameters_and_shadow_exactly(
 
 
 def _valid_compact_payload(worker):
-    worker._init_target_shadow()
+    _init_small_target_shadow(worker)
     model = {
         name: parameter.detach().cpu().contiguous().clone()
         for name, parameter in _critic_named_parameters(worker.target_model).items()
@@ -498,13 +530,133 @@ def test_dsrl_sidecar_saves_exact_direct_trainable_manifest(tmp_path, distribute
     assert all(tensor.device.type == "cpu" for tensor in payload["model"].values())
     assert all(tensor.is_contiguous() for tensor in payload["model"].values())
     assert payload["metadata"]["parameter_count"] == 220
+    assert payload["metadata"]["tensor_count"] == 220
+    assert payload["metadata"]["total_parameter_count"] == 5_183_754
     assert payload["metadata"]["global_step"] == 50
     assert payload["metadata"]["is_final"] is True
-    assert distributed == [True]
+    assert distributed.gathers == [None]
+    assert distributed.broadcasts == [([None], 0)]
+    assert distributed.barriers == []
     assert worker._strategy.full_state_dict_calls == 0
 
 
-def test_dsrl_trainable_manifest_matches_representative_runtime_components():
+def _install_fake_object_collectives(monkeypatch, current_rank, gathered_errors):
+    calls = SimpleNamespace(gathers=[], broadcasts=[], broadcast_value=None)
+
+    def all_gather_object(output, local_error):
+        calls.gathers.append((current_rank[0], local_error))
+        output[:] = list(gathered_errors)
+
+    def broadcast_object_list(status, src):
+        calls.broadcasts.append((current_rank[0], list(status), src))
+        if current_rank[0] == src:
+            calls.broadcast_value = status[0]
+        else:
+            status[0] = calls.broadcast_value
+
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: current_rank[0])
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 4)
+    monkeypatch.setattr(torch.distributed, "all_gather_object", all_gather_object)
+    monkeypatch.setattr(
+        torch.distributed, "broadcast_object_list", broadcast_object_list
+    )
+    monkeypatch.setattr(
+        torch.distributed,
+        "barrier",
+        lambda: pytest.fail("coordinated sidecar save must not use a barrier"),
+    )
+    return calls
+
+
+@pytest.mark.parametrize("bad_rank", [0, 2])
+def test_dsrl_sidecar_validation_failure_is_identical_on_all_ranks(
+    monkeypatch, tmp_path, bad_rank
+):
+    current_rank = [0]
+    gathered_errors = [None] * 4
+    gathered_errors[bad_rank] = "ValueError: selection exploded"
+    calls = _install_fake_object_collectives(monkeypatch, current_rank, gathered_errors)
+    selected_ranks = []
+
+    def select_state(_model):
+        selected_ranks.append(current_rank[0])
+        if current_rank[0] == bad_rank:
+            raise ValueError("selection exploded")
+        return {}
+
+    monkeypatch.setattr(sac_worker_module, "select_dsrl_trainable_state", select_state)
+    messages = set()
+    for rank in range(4):
+        current_rank[0] = rank
+        worker = _sidecar_worker(nn.Linear(1, 1))
+        with pytest.raises(RuntimeError, match="selection exploded") as error:
+            worker._save_trainable_model_weights(str(tmp_path), step=1)
+        messages.add(str(error.value))
+
+    assert selected_ranks == [0, 1, 2, 3]
+    assert len(messages) == 1
+    assert len(calls.gathers) == 4
+    assert calls.broadcasts == []
+
+
+def test_dsrl_sidecar_rank0_save_failure_is_identical_on_all_ranks(
+    monkeypatch, tmp_path
+):
+    current_rank = [0]
+    calls = _install_fake_object_collectives(
+        monkeypatch, current_rank, [None, None, None, None]
+    )
+    monkeypatch.setattr(
+        sac_worker_module, "select_dsrl_trainable_state", lambda _model: {}
+    )
+
+    def fail_save(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(torch, "save", fail_save)
+    messages = set()
+    for rank in range(4):
+        current_rank[0] = rank
+        worker = _sidecar_worker(nn.Linear(1, 1))
+        with pytest.raises(RuntimeError, match="disk full") as error:
+            worker._save_trainable_model_weights(str(tmp_path), step=1)
+        messages.add(str(error.value))
+
+    assert len(messages) == 1
+    assert len(calls.gathers) == 4
+    assert len(calls.broadcasts) == 4
+
+
+def test_dsrl_sidecar_success_selects_and_synchronizes_all_ranks(monkeypatch, tmp_path):
+    current_rank = [0]
+    calls = _install_fake_object_collectives(
+        monkeypatch, current_rank, [None, None, None, None]
+    )
+    selected_ranks = []
+    saved_ranks = []
+    monkeypatch.setattr(
+        sac_worker_module,
+        "select_dsrl_trainable_state",
+        lambda _model: selected_ranks.append(current_rank[0]) or {},
+    )
+    monkeypatch.setattr(
+        torch,
+        "save",
+        lambda *_args, **_kwargs: saved_ranks.append(current_rank[0]),
+    )
+
+    for rank in range(4):
+        current_rank[0] = rank
+        worker = _sidecar_worker(nn.Linear(1, 1))
+        worker._save_trainable_model_weights(str(tmp_path), step=1)
+
+    assert selected_ranks == [0, 1, 2, 3]
+    assert saved_ranks == [0]
+    assert len(calls.gathers) == 4
+    assert len(calls.broadcasts) == 4
+
+
+def _representative_runtime_components():
     model = OpenPi0ForRLActionPrediction.__new__(OpenPi0ForRLActionPrediction)
     nn.Module.__init__(model)
     model.config = SimpleNamespace(
@@ -520,6 +672,11 @@ def test_dsrl_trainable_manifest_matches_representative_runtime_components():
         action_horizon=2,
     )
     model._init_dsrl_components()
+    return model
+
+
+def test_dsrl_trainable_manifest_matches_representative_runtime_components():
+    model = _representative_runtime_components()
 
     state = select_dsrl_trainable_state(model)
 
@@ -529,17 +686,38 @@ def test_dsrl_trainable_manifest_matches_representative_runtime_components():
     )
 
 
-def test_dsrl_sidecar_nonzero_rank_only_synchronizes(monkeypatch, tmp_path):
-    barriers = []
-    worker = _sidecar_worker(nn.Linear(1, 1))
-    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 1)
-    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 4)
-    monkeypatch.setattr(torch.distributed, "barrier", lambda: barriers.append(True))
+def test_opted_in_dsrl_shadow_uses_complete_canonical_target_selection():
+    worker = _worker(compact=True)
+    worker.target_model = _representative_runtime_components()
 
-    worker._save_trainable_model_weights(str(tmp_path), step=1)
+    worker._init_target_shadow()
 
-    assert barriers == [True]
-    assert not (tmp_path / "model_state_dict").exists()
+    expected = {
+        name for name in DSRL_TRAINABLE_MANIFEST_V1 if name.startswith(CRITIC_PREFIXES)
+    }
+    assert set(worker._target_shadow_f32) == expected
+    assert all(
+        tensor.dtype == torch.float32 for tensor in worker._target_shadow_f32.values()
+    )
+
+
+@pytest.mark.parametrize("target_model", [nn.Linear(1, 1), _CheckpointModel()])
+def test_opted_in_dsrl_shadow_rejects_empty_or_incomplete_target(target_model):
+    worker = _worker(compact=True)
+    worker.target_model = target_model
+
+    with pytest.raises(ValueError, match="target.*canonical manifest|no critic/Q"):
+        worker._init_target_shadow()
+
+
+def test_nonselected_dsrl_shadow_preserves_legacy_partial_selection():
+    worker = _worker(compact=False)
+
+    worker._init_target_shadow()
+
+    assert set(worker._target_shadow_f32) == set(
+        _critic_named_parameters(worker.target_model)
+    )
 
 
 @pytest.mark.parametrize(
@@ -611,6 +789,22 @@ def test_non_dsrl_sidecar_routes_to_inherited_implementation(monkeypatch, tmp_pa
     assert calls == [(worker, str(tmp_path), 9)]
 
 
+def test_nonselected_dsrl_sidecar_routes_to_inherited_implementation(
+    monkeypatch, tmp_path
+):
+    worker = _worker(use_dsrl=True, compact=False, save_trainable=True)
+    calls = []
+    monkeypatch.setattr(
+        EmbodiedFSDPActor,
+        "_save_trainable_model_weights",
+        lambda self, path, step: calls.append((self, path, step)),
+    )
+
+    worker._save_trainable_model_weights(str(tmp_path), step=9)
+
+    assert calls == [(worker, str(tmp_path), 9)]
+
+
 def test_non_dsrl_target_uses_prior_full_state_apis(tmp_path, monkeypatch):
     worker = _worker(use_dsrl=False)
     state = worker.target_model.state_dict()
@@ -624,6 +818,25 @@ def test_non_dsrl_target_uses_prior_full_state_apis(tmp_path, monkeypatch):
 
     assert _target_path(tmp_path).exists()
     assert worker._strategy.full_load_calls == 1
+
+
+def test_nonselected_dsrl_target_uses_prior_full_state_apis(tmp_path):
+    worker = _worker(use_dsrl=True, compact=False)
+    worker._init_target_shadow()
+    state = worker.target_model.state_dict()
+    worker._strategy.get_model_state_dict = lambda *_args, **_kwargs: state
+    worker._strategy.load_model_with_state_dict = lambda *_args, **_kwargs: setattr(
+        worker._strategy, "full_load_calls", 1
+    )
+
+    worker.save_checkpoint(str(tmp_path), step=2)
+    receipt = worker.load_checkpoint(str(tmp_path))
+
+    assert worker._strategy.full_load_calls == 1
+    assert receipt["target_model"] == "loaded"
+    assert set(worker._target_shadow_f32) == set(
+        _critic_named_parameters(worker.target_model)
+    )
 
 
 @pytest.mark.parametrize("rank", range(4))
@@ -641,7 +854,7 @@ def test_high_level_checkpoint_preserves_component_calls(tmp_path, distributed, 
         save_checkpoint=replay_saves.append,
         load_checkpoint=replay_loads.append,
     )
-    worker._init_target_shadow()
+    _init_small_target_shadow(worker)
 
     worker.save_checkpoint(str(tmp_path), step=3)
     receipt = worker.load_checkpoint(str(tmp_path))

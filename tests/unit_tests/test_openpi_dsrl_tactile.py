@@ -503,7 +503,7 @@ def test_dsrl_checkpoint_load_rebuilds_target_shadow_from_restored_weights(
                 torch.full_like(worker._target_shadow_f32[name], 3.0),
             )
         else:
-            torch.testing.assert_close(parameter, torch.full_like(parameter, -1.0))
+            torch.testing.assert_close(parameter, torch.full_like(parameter, 3.0))
 
 
 def test_dsrl_checkpoint_load_returns_component_receipt(monkeypatch, tmp_path):
@@ -552,12 +552,7 @@ def test_dsrl_checkpoint_load_returns_component_receipt(monkeypatch, tmp_path):
         "model": "loaded",
         "optimizers": ["actor", "critic"],
         "alpha": "loaded",
-        "target_model": {
-            "format": "legacy_full",
-            "tensor_count": 8,
-            "parameter_count": 24,
-            "shadow_tensor_count": 8,
-        },
+        "target_model": "loaded",
         "replay_buffer": {"size": 1, "total_samples": 1512},
     }
 

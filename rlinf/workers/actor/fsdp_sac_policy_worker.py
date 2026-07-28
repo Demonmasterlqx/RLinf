@@ -37,8 +37,10 @@ from rlinf.scheduler import Channel, Worker
 from rlinf.utils import drq
 from rlinf.utils.distributed import all_reduce_dict
 from rlinf.utils.dsrl_checkpoint import (
+    DSRL_TRAINABLE_PARAMETER_COUNT,
     build_compact_target_payload,
     restore_target_payload,
+    select_compact_target_parameters,
     select_dsrl_trainable_state,
 )
 from rlinf.utils.dsrl_rollout_sync import (
@@ -72,6 +74,12 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             "critic_tactile_encoder",
             "q_head",
         ]
+
+    def _compact_dsrl_checkpointing_enabled(self) -> bool:
+        """Return whether the approved tactile selective DSRL mode is active."""
+        if not self.use_dsrl:
+            return False
+        return validate_dsrl_rollout_sync_config(self.cfg.actor) is not None
 
     def get_rollout_state_dict(self) -> dict:
         """Return only actor-side DSRL parameters for rollout synchronization."""
@@ -313,6 +321,14 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         SAC_Q, so shadowing the frozen Pi0 backbone and actor encoders wastes
         enough memory to OOM the no-shard configuration.
         """
+        if self._compact_dsrl_checkpointing_enabled():
+            target_parameters = select_compact_target_parameters(self.target_model)
+            self._target_shadow_f32 = {
+                name: parameter.detach().float().clone()
+                for name, parameter in target_parameters.items()
+            }
+            return
+
         self._target_shadow_f32 = {}
         for name, param in self.target_model.named_parameters():
             if any(
@@ -329,52 +345,84 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
 
     def _save_trainable_model_weights(self, save_path: str, step: int) -> None:
         """Save the compact DSRL sidecar without a full FSDP state gather."""
-        if not self.use_dsrl:
+        if not self._compact_dsrl_checkpointing_enabled():
             return super()._save_trainable_model_weights(save_path, step)
         if not self._cfg.fsdp_config.get("save_trainable_model_weights", False):
             return
 
         rank = torch.distributed.get_rank()
         world_size = torch.distributed.get_world_size()
-        if rank == 0:
+        state_dict = None
+        local_error = None
+        try:
             state_dict = select_dsrl_trainable_state(self.model)
-            metadata = {
-                "step": step,
-                "rank": rank,
-                "world_size": world_size,
-                "format": "trainable_weights",
-                "parameter_count": len(state_dict),
-            }
-            configured_metadata = self._cfg.fsdp_config.get(
-                "trainable_checkpoint_metadata", None
-            )
-            if configured_metadata is not None:
-                if not isinstance(configured_metadata, Mapping):
-                    raise ValueError(
-                        "fsdp_config.trainable_checkpoint_metadata must be a mapping"
-                    )
-                target_global_step = configured_metadata.get("target_global_step")
-                if (
-                    isinstance(target_global_step, bool)
-                    or not isinstance(target_global_step, int)
-                    or target_global_step <= 0
-                ):
-                    raise ValueError(
-                        "trainable checkpoint target_global_step must be a positive integer"
-                    )
-                metadata = dict(configured_metadata) | metadata
-                metadata["global_step"] = step
-                metadata["is_final"] = step == target_global_step
+        except Exception as error:  # noqa: BLE001
+            local_error = f"{type(error).__name__}: {error}"
 
-            sidecar_dir = os.path.join(save_path, "model_state_dict")
-            os.makedirs(sidecar_dir, exist_ok=True)
-            sidecar_path = os.path.join(sidecar_dir, "trainable_weights.pt")
-            torch.save({"model": state_dict, "metadata": metadata}, sidecar_path)
-            self._logger.info(
-                f"[FSDP] Saved {len(state_dict)} DSRL trainable tensors to "
-                f"{sidecar_path}"
+        gathered_errors: list[str | None] = [None] * world_size
+        torch.distributed.all_gather_object(gathered_errors, local_error)
+        rank_errors = [
+            f"rank {error_rank}: {error}"
+            for error_rank, error in enumerate(gathered_errors)
+            if error is not None
+        ]
+        if rank_errors:
+            raise RuntimeError(
+                "OpenPI DSRL trainable sidecar validation failed across actor "
+                f"ranks: {'; '.join(rank_errors)}"
             )
-        torch.distributed.barrier()
+
+        write_error = None
+        if rank == 0:
+            try:
+                assert state_dict is not None
+                metadata = {
+                    "step": step,
+                    "rank": rank,
+                    "world_size": world_size,
+                    "format": "trainable_weights",
+                    "parameter_count": len(state_dict),
+                    "tensor_count": len(state_dict),
+                    "total_parameter_count": DSRL_TRAINABLE_PARAMETER_COUNT,
+                }
+                configured_metadata = self._cfg.fsdp_config.get(
+                    "trainable_checkpoint_metadata", None
+                )
+                if configured_metadata is not None:
+                    if not isinstance(configured_metadata, Mapping):
+                        raise ValueError(
+                            "fsdp_config.trainable_checkpoint_metadata must be a mapping"
+                        )
+                    target_global_step = configured_metadata.get("target_global_step")
+                    if (
+                        isinstance(target_global_step, bool)
+                        or not isinstance(target_global_step, int)
+                        or target_global_step <= 0
+                    ):
+                        raise ValueError(
+                            "trainable checkpoint target_global_step must be a positive integer"
+                        )
+                    metadata = dict(configured_metadata) | metadata
+                    metadata["global_step"] = step
+                    metadata["is_final"] = step == target_global_step
+
+                sidecar_dir = os.path.join(save_path, "model_state_dict")
+                os.makedirs(sidecar_dir, exist_ok=True)
+                sidecar_path = os.path.join(sidecar_dir, "trainable_weights.pt")
+                torch.save({"model": state_dict, "metadata": metadata}, sidecar_path)
+                self._logger.info(
+                    f"[FSDP] Saved {len(state_dict)} DSRL trainable tensors to "
+                    f"{sidecar_path}"
+                )
+            except Exception as error:  # noqa: BLE001
+                write_error = f"{type(error).__name__}: {error}"
+
+        write_status = [write_error]
+        torch.distributed.broadcast_object_list(write_status, src=0)
+        if write_status[0] is not None:
+            raise RuntimeError(
+                f"OpenPI DSRL rank-0 trainable sidecar write failed: {write_status[0]}"
+            )
 
     def _save_dsrl_target_checkpoint(self, save_path: str, step: int) -> None:
         if not hasattr(self, "_target_shadow_f32"):
@@ -944,7 +992,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         target_checkpoint_path = os.path.join(
             target_model_save_path, f"checkpoint_rank_{self._rank}.pt"
         )
-        if self.use_dsrl:
+        if self._compact_dsrl_checkpointing_enabled():
             self._save_dsrl_target_checkpoint(target_checkpoint_path, step)
         else:
             target_model_state_dict = self._strategy.get_model_state_dict(
@@ -987,7 +1035,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         target_checkpoint_path = os.path.join(
             target_model_load_path, f"checkpoint_rank_{self._rank}.pt"
         )
-        if self.use_dsrl:
+        if self._compact_dsrl_checkpointing_enabled():
             target_restore_receipt = self._load_dsrl_target_checkpoint(
                 target_checkpoint_path
             )
@@ -1000,6 +1048,8 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                 full_state_dict=True,
             )
             target_restore_receipt = "loaded"
+            if self.use_dsrl:
+                self._init_target_shadow()
 
         # load replay buffer
         buffer_load_path = os.path.join(
