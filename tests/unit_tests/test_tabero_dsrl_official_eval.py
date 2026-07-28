@@ -1069,6 +1069,7 @@ def test_launcher_fails_and_releases_leases_if_guardian_supervisor_dies(
     )
     supervisor_pid = None
     guardian_pid = None
+    preflight_seen = False
     contender = None
     try:
         helper = _load_helper()
@@ -1082,6 +1083,8 @@ def test_launcher_fails_and_releases_leases_if_guardian_supervisor_dies(
                     )
                 except OSError:
                     continue
+                if b"preflight" in command_line:
+                    preflight_seen = True
                 if b"hold-gpu-locks" not in command_line:
                     continue
                 if b"supervise" in command_line:
@@ -1103,11 +1106,17 @@ def test_launcher_fails_and_releases_leases_if_guardian_supervisor_dies(
                     pass
                 leases_held = False
                 break
-            if supervisor_pid is not None and guardian_pid is not None and leases_held:
+            if (
+                supervisor_pid is not None
+                and guardian_pid is not None
+                and leases_held
+                and preflight_seen
+            ):
                 break
             time.sleep(0.05)
         assert supervisor_pid is not None
         assert guardian_pid is not None
+        assert preflight_seen
 
         os.kill(supervisor_pid, signal.SIGKILL)
 
