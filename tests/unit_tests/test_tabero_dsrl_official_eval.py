@@ -3,6 +3,7 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 
+import argparse
 import hashlib
 import importlib.util
 import json
@@ -27,6 +28,9 @@ from rlinf.utils.dsrl_rollout_sync import (
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HELPER_PATH = REPO_ROOT / "examples/embodiment/tabero_dsrl_official_eval.py"
 LAUNCHER_PATH = REPO_ROOT / "examples/embodiment/run_tabero_firm_official_eval.sh"
+FORMAL_PROFILE = "formal_8gpu_50step"
+SMALL4GPU40_PROFILE = "task5_4gpu_40step_small"
+SMALL4GPU40_CONFIG = "isaaclab_pi0_dsrl_tacfield_tabero_task5_firm_4gpu_40step_small"
 
 
 def _load_helper():
@@ -193,6 +197,45 @@ def _rewrite_bundle_json(bundle, name, payload):
     (bundle / name).write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
+def _retask_bundle_to_small4gpu40(bundle, manifest, audit):
+    old_checkpoint = Path(manifest["source_checkpoint"])
+    new_checkpoint = old_checkpoint.parents[1] / "global_step_40/trainable_weights.pt"
+    new_checkpoint.parent.mkdir()
+    old_checkpoint.rename(new_checkpoint)
+    actor_path = bundle / "dsrl_actor.safetensors"
+    save_file(
+        {
+            key: torch.zeros(shape, dtype=torch.bfloat16)
+            for key, shape in DSRL_ROLLOUT_SYNC_MANIFEST_V1.items()
+        },
+        actor_path,
+        metadata={
+            "format": "tabero_dsrl_t2vla",
+            "format_version": "1",
+            "task_id": "5",
+            "global_step": "40",
+            "dtype": "bfloat16",
+        },
+    )
+    manifest.update(
+        task_id=5,
+        global_step=40,
+        training_config=SMALL4GPU40_CONFIG,
+        source_checkpoint=str(new_checkpoint),
+        source_checkpoint_sha256=_sha256(new_checkpoint),
+        actor_weights_sha256=_sha256(actor_path),
+    )
+    _rewrite_bundle_json(bundle, "manifest.json", manifest)
+    audit.update(
+        task_id=5,
+        global_step=40,
+        source_checkpoint_sha256=manifest["source_checkpoint_sha256"],
+        actor_weights_sha256=manifest["actor_weights_sha256"],
+        manifest_sha256=_sha256(bundle / "manifest.json"),
+    )
+    _rewrite_bundle_json(bundle, "artifact_audit.json", audit)
+
+
 def test_validate_bundle_accepts_final_task0_and_captures_hashes(bundle_fixture):
     helper = _load_helper()
     bundle, base_model, manifest, _ = bundle_fixture
@@ -205,6 +248,43 @@ def test_validate_bundle_accepts_final_task0_and_captures_hashes(bundle_fixture)
     assert result["audit_sha256"] == _sha256(bundle / "artifact_audit.json")
     assert result["base_model_sha256"] == manifest["base_model_sha256"]
     assert len(result["bundle_sha256"]) == 64
+
+
+def test_validate_bundle_accepts_explicit_task5_small4gpu40_profile(bundle_fixture):
+    helper = _load_helper()
+    bundle, base_model, manifest, audit = bundle_fixture
+    _retask_bundle_to_small4gpu40(bundle, manifest, audit)
+
+    result = helper.validate_bundle(
+        bundle,
+        5,
+        base_model,
+        training_profile=SMALL4GPU40_PROFILE,
+    )
+
+    assert result["bundle_path"] == str(bundle.resolve())
+
+
+def test_validate_bundle_does_not_auto_select_small4gpu40_profile(bundle_fixture):
+    helper = _load_helper()
+    bundle, base_model, manifest, audit = bundle_fixture
+    _retask_bundle_to_small4gpu40(bundle, manifest, audit)
+
+    with pytest.raises(ValueError, match="global_step|training profile"):
+        helper.validate_bundle(bundle, 5, base_model)
+
+
+def test_validate_bundle_rejects_task0_small4gpu40_profile(bundle_fixture):
+    helper = _load_helper()
+    bundle, base_model, _, _ = bundle_fixture
+
+    with pytest.raises(ValueError, match="Task 5|task_id"):
+        helper.validate_bundle(
+            bundle,
+            0,
+            base_model,
+            training_profile=SMALL4GPU40_PROFILE,
+        )
 
 
 @pytest.mark.parametrize(
@@ -551,8 +631,12 @@ def test_normalize_result_requires_unique_raw_json(tmp_path):
         helper.normalize_result(raw_dir, tmp_path / "normalized.json", tmp_path, 0)
 
 
-def test_write_receipts_logs_tensorboard_and_wandb_at_step50(tmp_path):
+def test_write_receipts_logs_tensorboard_and_wandb_at_step50(
+    tmp_path,
+    bundle_fixture,
+):
     helper = _load_helper()
+    bundle, base_model, _, _ = bundle_fixture
     logged = []
 
     class FakeWriter:
@@ -596,6 +680,10 @@ def test_write_receipts_logs_tensorboard_and_wandb_at_step50(tmp_path):
         normalized,
         output,
         run_id,
+        bundle_path=bundle,
+        base_model_path=base_model,
+        expected_task_id=0,
+        training_profile=FORMAL_PROFILE,
         summary_writer_cls=FakeWriter,
         wandb_module=FakeWandb(),
     )
@@ -622,13 +710,167 @@ def test_write_receipts_logs_tensorboard_and_wandb_at_step50(tmp_path):
             normalized,
             output,
             run_id,
+            bundle_path=bundle,
+            base_model_path=base_model,
+            expected_task_id=0,
+            training_profile=FORMAL_PROFILE,
             summary_writer_cls=FakeWriter,
             wandb_module=FakeWandb(),
         )
 
 
-def test_write_receipts_propagates_backend_failure_without_receipt(tmp_path):
+def test_write_receipts_logs_custom_profile_at_step40(tmp_path, bundle_fixture):
     helper = _load_helper()
+    bundle, base_model, manifest, audit = bundle_fixture
+    _retask_bundle_to_small4gpu40(bundle, manifest, audit)
+    logged_steps = []
+
+    class FakeWriter:
+        def __init__(self, log_dir):
+            Path(log_dir).mkdir(parents=True)
+
+        def add_scalar(self, name, value, step):
+            logged_steps.append(step)
+
+        def flush(self):
+            pass
+
+        def close(self):
+            pass
+
+    class FakeRun:
+        url = "https://wandb.example/custom"
+
+        def log(self, values, step, commit):
+            logged_steps.append(step)
+
+        def finish(self, exit_code):
+            pass
+
+    class FakeWandb:
+        def init(self, **kwargs):
+            return FakeRun()
+
+    receipt = helper.write_receipts(
+        {"success_count": 1, "success_rate": 2.0, "total_episodes": 50},
+        tmp_path / "output",
+        "tabero-official-dsrl-task5-20260730-120000-formal",
+        bundle_path=bundle,
+        base_model_path=base_model,
+        expected_task_id=5,
+        training_profile=SMALL4GPU40_PROFILE,
+        summary_writer_cls=FakeWriter,
+        wandb_module=FakeWandb(),
+    )
+
+    assert logged_steps == [40, 40, 40, 40]
+    assert receipt["step"] == 40
+
+
+def test_write_receipts_revalidates_bundle_and_rejects_profile_mismatch(
+    tmp_path,
+    bundle_fixture,
+):
+    helper = _load_helper()
+    bundle, base_model, _, _ = bundle_fixture
+    _retask_bundle(bundle, 5)
+
+    with pytest.raises(ValueError, match="global_step|training_config"):
+        helper.write_receipts(
+            {"success_count": 1, "success_rate": 2.0, "total_episodes": 50},
+            tmp_path / "output",
+            "tabero-official-dsrl-task5-20260730-120000-formal",
+            bundle_path=bundle,
+            base_model_path=base_model,
+            expected_task_id=5,
+            training_profile=SMALL4GPU40_PROFILE,
+        )
+
+
+def test_finalize_revalidates_bundle_before_writing_receipts(
+    tmp_path,
+    bundle_fixture,
+    monkeypatch,
+):
+    helper = _load_helper()
+    bundle, base_model, _, _ = bundle_fixture
+    _retask_bundle(bundle, 5)
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    (raw_dir / "success_rates_openpi_tactile_1.json").write_text(
+        json.dumps(_raw_payload(task_id=5))
+    )
+    calls = []
+
+    def reject_mismatch(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise ValueError("bundle profile mismatch")
+
+    class FakeWriter:
+        def __init__(self, log_dir):
+            Path(log_dir).mkdir(parents=True)
+
+        def add_scalar(self, name, value, step):
+            pass
+
+        def flush(self):
+            pass
+
+        def close(self):
+            pass
+
+    class FakeRun:
+        url = "https://wandb.example/isolated"
+
+        def log(self, values, step, commit):
+            pass
+
+        def finish(self, exit_code):
+            pass
+
+    class FakeWandb:
+        def init(self, **kwargs):
+            return FakeRun()
+
+    real_write_receipts = helper.write_receipts
+
+    def isolated_write_receipts(*args, **kwargs):
+        kwargs.update(
+            summary_writer_cls=FakeWriter,
+            wandb_module=FakeWandb(),
+        )
+        return real_write_receipts(*args, **kwargs)
+
+    monkeypatch.setattr(helper, "validate_bundle", reject_mismatch)
+    monkeypatch.setattr(helper, "write_receipts", isolated_write_receipts)
+    args = argparse.Namespace(
+        raw_dir=raw_dir,
+        output_dir=tmp_path / "eval",
+        bundle=bundle,
+        task_id=5,
+        base_model=base_model,
+        training_profile=SMALL4GPU40_PROFILE,
+        run_id="tabero-official-dsrl-task5-20260730-120000-formal",
+    )
+
+    with pytest.raises(ValueError, match="bundle profile mismatch"):
+        helper._finalize(args)
+
+    assert calls == [
+        (
+            (bundle, 5, base_model),
+            {"training_profile": SMALL4GPU40_PROFILE},
+        )
+    ]
+    assert not (tmp_path / "eval/normalized_result.json").exists()
+
+
+def test_write_receipts_propagates_backend_failure_without_receipt(
+    tmp_path,
+    bundle_fixture,
+):
+    helper = _load_helper()
+    bundle, base_model, _, _ = bundle_fixture
 
     class BrokenWandb:
         def init(self, **kwargs):
@@ -652,6 +894,10 @@ def test_write_receipts_propagates_backend_failure_without_receipt(tmp_path):
             {"success_count": 1, "success_rate": 2.0, "total_episodes": 50},
             tmp_path / "output",
             "tabero-official-dsrl-task0-20260728-120000-formal",
+            bundle_path=bundle,
+            base_model_path=base_model,
+            expected_task_id=0,
+            training_profile=FORMAL_PROFILE,
             summary_writer_cls=FakeWriter,
             wandb_module=BrokenWandb(),
         )
@@ -661,7 +907,11 @@ def test_write_receipts_propagates_backend_failure_without_receipt(tmp_path):
 def test_launcher_public_contract_is_present():
     launcher = LAUNCHER_PATH.read_text()
     assert "Usage:" in launcher
-    assert "dsrl <0|5> formal --dsrl-bundle ABS_PATH [--dry-run]" in launcher
+    assert (
+        "dsrl <0|5> formal --dsrl-bundle ABS_PATH --training-profile PROFILE"
+        in launcher
+    )
+    assert launcher.count('--training-profile "${TRAINING_PROFILE}"') == 3
     assert "CUDA_VISIBLE_DEVICES=0" in launcher
     assert "unset CUDA_VISIBLE_DEVICES" in launcher
     assert "CUDA_DEVICE_ORDER=PCI_BUS_ID" in launcher
@@ -848,7 +1098,14 @@ esac
     return env, project_root, results
 
 
-def _run_launcher(bundle, task_id, env, *, dry_run=True):
+def _run_launcher(
+    bundle,
+    task_id,
+    env,
+    *,
+    dry_run=True,
+    training_profile=FORMAL_PROFILE,
+):
     command = [
         "bash",
         str(LAUNCHER_PATH),
@@ -857,6 +1114,8 @@ def _run_launcher(bundle, task_id, env, *, dry_run=True):
         "formal",
         "--dsrl-bundle",
         str(bundle.resolve()),
+        "--training-profile",
+        training_profile,
     ]
     if dry_run:
         command.append("--dry-run")
@@ -867,6 +1126,29 @@ def _run_launcher(bundle, task_id, env, *, dry_run=True):
         text=True,
         capture_output=True,
     )
+
+
+def test_launcher_dry_run_accepts_explicit_task5_small4gpu40_profile(
+    tmp_path,
+    bundle_fixture,
+):
+    bundle, base_model, manifest, audit = bundle_fixture
+    _retask_bundle_to_small4gpu40(bundle, manifest, audit)
+    env, _, results = _launcher_environment(tmp_path, bundle, base_model)
+
+    result = _run_launcher(
+        bundle,
+        5,
+        env,
+        training_profile=SMALL4GPU40_PROFILE,
+    )
+
+    assert result.returncode == 0, result.stderr
+    output = (
+        results / "tabero_task5_firm_dsrl_official_eval_formal_20260728_120000_formal"
+    )
+    run_env = (output / "run.env").read_text()
+    assert f"TABERO_DSRL_TRAINING_PROFILE={SMALL4GPU40_PROFILE}\n" in run_env
 
 
 @pytest.mark.parametrize("task_id", [0, 5])
@@ -1057,6 +1339,8 @@ def test_launcher_fails_and_releases_leases_if_guardian_supervisor_dies(
         "formal",
         "--dsrl-bundle",
         str(bundle.resolve()),
+        "--training-profile",
+        FORMAL_PROFILE,
         "--dry-run",
     ]
     launcher = subprocess.Popen(

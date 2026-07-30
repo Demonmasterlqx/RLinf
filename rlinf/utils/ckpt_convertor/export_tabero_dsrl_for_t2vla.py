@@ -37,10 +37,15 @@ from rlinf.utils.dsrl_rollout_sync import (
     DSRL_ROLLOUT_SYNC_TENSOR_COUNT,
     validate_dsrl_rollout_state_dict,
 )
+from rlinf.utils.tabero_dsrl_profiles import (
+    FORMAL_8GPU_50STEP_PROFILE,
+    TABERO_DSRL_TRAINING_PROFILE_CHOICES,
+    TaberoDSRLTrainingProfile,
+    resolve_tabero_dsrl_training_profile,
+)
 
 FORMAT = "tabero_dsrl_t2vla"
 FORMAT_VERSION = 1
-FINAL_GLOBAL_STEP = 50
 ACTOR_WEIGHTS_NAME = "dsrl_actor.safetensors"
 MANIFEST_NAME = "manifest.json"
 AUDIT_NAME = "artifact_audit.json"
@@ -169,10 +174,13 @@ def _load_provenance(
     return values
 
 
-def _validate_checkpoint_path(checkpoint: Path) -> Path:
+def _validate_checkpoint_path(
+    checkpoint: Path,
+    profile: TaberoDSRLTrainingProfile,
+) -> Path:
     checkpoint = checkpoint.resolve()
     expected_suffix = (
-        "global_step_50",
+        f"global_step_{profile.global_step}",
         "actor",
         "model_state_dict",
         "trainable_weights.pt",
@@ -181,7 +189,8 @@ def _validate_checkpoint_path(checkpoint: Path) -> Path:
     if actual_suffix != expected_suffix:
         raise ValueError(
             "final DSRL checkpoint path must end with "
-            "global_step_50/actor/model_state_dict/trainable_weights.pt; "
+            f"global_step_{profile.global_step}/actor/model_state_dict/"
+            "trainable_weights.pt; "
             f"got {checkpoint}"
         )
     if not checkpoint.is_file():
@@ -189,12 +198,14 @@ def _validate_checkpoint_path(checkpoint: Path) -> Path:
     return checkpoint
 
 
-def _validate_metadata(metadata: Any, task_id: int) -> dict[str, Any]:
+def _validate_metadata(
+    metadata: Any,
+    task_id: int,
+    profile: TaberoDSRLTrainingProfile,
+) -> dict[str, Any]:
     if not isinstance(metadata, Mapping):
         raise ValueError("final DSRL checkpoint metadata must be a mapping")
-    expected_config = (
-        f"isaaclab_pi0_dsrl_tacfield_tabero_task{task_id}_firm_8gpu_50step"
-    )
+    expected_config = profile.training_config(task_id)
     if metadata.get("format") != "trainable_weights":
         raise ValueError("final DSRL checkpoint format must be trainable_weights")
     if metadata.get("method") != "dsrl":
@@ -204,17 +215,19 @@ def _validate_metadata(metadata: Any, task_id: int) -> dict[str, Any]:
         raise ValueError(
             f"final DSRL checkpoint training_config must be {expected_config!r}"
         )
-    _require_strict_int(metadata.get("step"), FINAL_GLOBAL_STEP, "step")
-    _require_strict_int(metadata.get("global_step"), FINAL_GLOBAL_STEP, "global_step")
+    _require_strict_int(metadata.get("step"), profile.global_step, "step")
+    _require_strict_int(metadata.get("global_step"), profile.global_step, "global_step")
     _require_strict_int(
         metadata.get("target_global_step"),
-        FINAL_GLOBAL_STEP,
+        profile.global_step,
         "target_global_step",
     )
     if metadata.get("is_final") is not True:
         raise ValueError("final DSRL checkpoint is_final must be true")
     _require_strict_int(metadata.get("rank"), 0, "rank")
-    _require_strict_int(metadata.get("world_size"), 4, "world_size")
+    _require_strict_int(
+        metadata.get("world_size"), profile.actor_world_size, "world_size"
+    )
     _require_strict_int(
         metadata.get("parameter_count"),
         DSRL_TRAINABLE_TENSOR_COUNT,
@@ -288,6 +301,7 @@ def _validate_config_snapshot(
     config_snapshot: Path,
     base_model: Path,
     metadata: Mapping[str, Any],
+    profile: TaberoDSRLTrainingProfile,
     *,
     captured_content: bytes | None = None,
 ) -> None:
@@ -317,13 +331,8 @@ def _validate_config_snapshot(
 
     task_id = metadata["task_id"]
     require_value("env.train.init_params.task_id", task_id)
-    require_value("runner.max_epochs", FINAL_GLOBAL_STEP)
-    require_value("runner.save_interval", 10)
-    require_value("env.train.total_num_envs", 84)
-    require_value("env.train.rollout_epoch", 2)
-    require_value("algorithm.update_epoch", 200)
-    require_value("algorithm.gamma", 0.999)
-    require_value("algorithm.tau", 0.005)
+    for path, expected in profile.config_requirements:
+        require_value(path, expected)
     require_value("actor.model.openpi.use_dsrl", True)
     require_value("actor.model.openpi.dsrl_use_tactile", True)
     require_value("actor.model.openpi.dsrl_state_dim", 7)
@@ -385,6 +394,7 @@ def _validate_provenance(
     base_model: Path,
     actual_base_hash: str,
     metadata: Mapping[str, Any],
+    profile: TaberoDSRLTrainingProfile,
 ) -> _ValidatedProvenance:
     output_root = checkpoint.parents[5]
     provenance_path = output_root / "provenance.env"
@@ -418,6 +428,7 @@ def _validate_provenance(
         config_snapshot,
         base_model,
         metadata,
+        profile,
         captured_content=snapshot_content,
     )
 
@@ -536,11 +547,13 @@ def export_tabero_dsrl_bundle(
     base_model: str | Path,
     expected_base_model_sha256: str,
     task_id: int,
+    training_profile: str = FORMAL_8GPU_50STEP_PROFILE,
 ) -> dict[str, Any]:
     """Validate and export one final Task 0/5 DSRL actor bundle."""
     if type(task_id) is not int or task_id not in {0, 5}:
         raise ValueError(f"task_id must be exactly 0 or 5; got {task_id!r}")
-    checkpoint = _validate_checkpoint_path(Path(trainable_checkpoint))
+    profile = resolve_tabero_dsrl_training_profile(training_profile, task_id)
+    checkpoint = _validate_checkpoint_path(Path(trainable_checkpoint), profile)
     output_dir = Path(output_dir).resolve()
     if output_dir.exists():
         raise FileExistsError(f"DSRL bundle output already exists: {output_dir}")
@@ -571,7 +584,7 @@ def export_tabero_dsrl_bundle(
     _require_artifact_unchanged(checkpoint, checkpoint_hash, "source checkpoint")
     if not isinstance(payload, Mapping) or set(payload) != {"model", "metadata"}:
         raise ValueError("final DSRL sidecar must contain exactly model and metadata")
-    metadata = _validate_metadata(payload["metadata"], task_id)
+    metadata = _validate_metadata(payload["metadata"], task_id, profile)
     trainable_state = _validate_trainable_state(payload["model"])
     actor_state = {
         key: trainable_state[key].detach().cpu().contiguous()
@@ -583,6 +596,7 @@ def export_tabero_dsrl_bundle(
         base_model,
         actual_base_hash,
         metadata,
+        profile,
     )
 
     output_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -598,7 +612,7 @@ def export_tabero_dsrl_bundle(
                 "format": FORMAT,
                 "format_version": str(FORMAT_VERSION),
                 "task_id": str(task_id),
-                "global_step": str(FINAL_GLOBAL_STEP),
+                "global_step": str(profile.global_step),
                 "dtype": "bfloat16",
             },
         )
@@ -617,7 +631,7 @@ def export_tabero_dsrl_bundle(
             "format_version": FORMAT_VERSION,
             "algorithm": "dsrl-sac",
             "task_id": task_id,
-            "global_step": FINAL_GLOBAL_STEP,
+            "global_step": profile.global_step,
             "is_final": True,
             "training_config": metadata["training_config"],
             "base_model": str(base_model),
@@ -693,7 +707,7 @@ def export_tabero_dsrl_bundle(
             "format_version": 1,
             "status": "passed",
             "task_id": task_id,
-            "global_step": FINAL_GLOBAL_STEP,
+            "global_step": profile.global_step,
             "source_checkpoint_sha256": checkpoint_hash,
             "base_model_sha256": actual_base_hash,
             "actor_weights_sha256": actor_hash,
@@ -732,6 +746,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--base-model", type=Path, required=True)
     parser.add_argument("--expected-base-model-sha256", required=True)
     parser.add_argument("--task-id", type=int, choices=(0, 5), required=True)
+    parser.add_argument(
+        "--training-profile",
+        choices=TABERO_DSRL_TRAINING_PROFILE_CHOICES,
+        default=FORMAL_8GPU_50STEP_PROFILE,
+    )
     return parser.parse_args()
 
 
@@ -743,6 +762,7 @@ def main() -> None:
         base_model=args.base_model,
         expected_base_model_sha256=args.expected_base_model_sha256,
         task_id=args.task_id,
+        training_profile=args.training_profile,
     )
     print(json.dumps(manifest, indent=2, sort_keys=True))
 

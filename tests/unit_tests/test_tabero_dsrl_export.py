@@ -5,6 +5,7 @@
 
 import hashlib
 import json
+import sys
 from math import prod
 from pathlib import Path
 
@@ -37,7 +38,18 @@ def _state_dict():
     }
 
 
-def _checkpoint(tmp_path, *, task_id=0, step=50, metadata_overrides=None):
+SMALL4GPU40_CONFIG = "isaaclab_pi0_dsrl_tacfield_tabero_task5_firm_4gpu_40step_small"
+SMALL4GPU40_PROFILE = "task5_4gpu_40step_small"
+
+
+def _checkpoint(
+    tmp_path,
+    *,
+    task_id=0,
+    step=50,
+    metadata_overrides=None,
+    profile="formal",
+):
     experiment = f"tabero_firm_matrix_dsrl_task{task_id}_formal_test"
     output_root = tmp_path / experiment
     checkpoint = (
@@ -50,19 +62,31 @@ def _checkpoint(tmp_path, *, task_id=0, step=50, metadata_overrides=None):
         / "trainable_weights.pt"
     )
     checkpoint.parent.mkdir(parents=True)
+    profile_metadata = {
+        "formal": {
+            "training_config": (
+                f"isaaclab_pi0_dsrl_tacfield_tabero_task{task_id}_firm_8gpu_50step"
+            ),
+            "target_global_step": 50,
+            "world_size": 4,
+        },
+        "small4gpu40": {
+            "training_config": SMALL4GPU40_CONFIG,
+            "target_global_step": 40,
+            "world_size": 2,
+        },
+    }[profile]
     metadata = {
         "format": "trainable_weights",
         "method": "dsrl",
         "task_id": task_id,
-        "training_config": (
-            f"isaaclab_pi0_dsrl_tacfield_tabero_task{task_id}_firm_8gpu_50step"
-        ),
-        "target_global_step": 50,
+        "training_config": profile_metadata["training_config"],
+        "target_global_step": profile_metadata["target_global_step"],
         "step": step,
         "global_step": step,
-        "is_final": step == 50,
+        "is_final": step == profile_metadata["target_global_step"],
         "rank": 0,
-        "world_size": 4,
+        "world_size": profile_metadata["world_size"],
         "parameter_count": DSRL_TRAINABLE_TENSOR_COUNT,
         "tensor_count": DSRL_TRAINABLE_TENSOR_COUNT,
         "total_parameter_count": DSRL_TRAINABLE_PARAMETER_COUNT,
@@ -80,49 +104,90 @@ def _base_model(tmp_path):
     return base_model
 
 
-def _formal_config(task_id, base_model):
-    return f"""
-runner:
-  max_epochs: 50
-  save_interval: 10
-  logger:
-    logger_backends: [tensorboard, wandb]
-algorithm:
-  update_epoch: 200
-  gamma: 0.999
-  tau: 0.005
-env:
-  train:
-    total_num_envs: 84
-    rollout_epoch: 2
-    init_params:
-      task_id: {task_id}
-      prompt_conditions:
-        condition_cycle: [firm]
-        firm_adverbs: [firmly, tightly]
-rollout:
-  model:
-    model_path: {base_model.resolve()}
-actor:
-  rollout_sync_prefixes:
-    - dsrl_action_noise_net.
-    - actor_image_encoder.
-    - actor_state_encoder.
-    - actor_tactile_encoder.
-  model:
-    model_path: {base_model.resolve()}
-    openpi:
-      use_dsrl: true
-      dsrl_use_tactile: true
-      dsrl_state_dim: 7
-      dsrl_action_noise_dim: 32
-  fsdp_config:
-    trainable_checkpoint_metadata:
-      method: dsrl
-      task_id: {task_id}
-      training_config: isaaclab_pi0_dsrl_tacfield_tabero_task{task_id}_firm_8gpu_50step
-      target_global_step: 50
-""".lstrip()
+def _formal_config(task_id, base_model, *, profile="formal"):
+    is_custom = profile == "small4gpu40"
+    training_config = (
+        SMALL4GPU40_CONFIG
+        if is_custom
+        else f"isaaclab_pi0_dsrl_tacfield_tabero_task{task_id}_firm_8gpu_50step"
+    )
+    config = {
+        "runner": {
+            "max_epochs": 40 if is_custom else 50,
+            "save_interval": 10,
+            "logger": {"logger_backends": ["tensorboard", "wandb"]},
+        },
+        "algorithm": {
+            "update_epoch": 20 if is_custom else 200,
+            "gamma": 0.999,
+            "tau": 0.005,
+        },
+        "env": {
+            "train": {
+                "total_num_envs": 20 if is_custom else 84,
+                "rollout_epoch": 1 if is_custom else 2,
+                "init_params": {
+                    "task_id": task_id,
+                    "prompt_conditions": {
+                        "condition_cycle": ["firm"],
+                        "firm_adverbs": ["firmly", "tightly"],
+                    },
+                },
+            }
+        },
+        "rollout": {"model": {"model_path": str(base_model.resolve())}},
+        "actor": {
+            "rollout_sync_prefixes": [
+                "dsrl_action_noise_net.",
+                "actor_image_encoder.",
+                "actor_state_encoder.",
+                "actor_tactile_encoder.",
+            ],
+            "model": {
+                "model_path": str(base_model.resolve()),
+                "openpi": {
+                    "use_dsrl": True,
+                    "dsrl_use_tactile": True,
+                    "dsrl_state_dim": 7,
+                    "dsrl_action_noise_dim": 32,
+                },
+            },
+            "fsdp_config": {
+                "trainable_checkpoint_metadata": {
+                    "method": "dsrl",
+                    "task_id": task_id,
+                    "training_config": training_config,
+                    "target_global_step": 40 if is_custom else 50,
+                }
+            },
+        },
+    }
+    if profile == "small4gpu40":
+        config["cluster"] = {
+            "component_placement": {
+                "actor": "2-3",
+                "rollout": "0-1",
+                "env": "0-1",
+            }
+        }
+        config["algorithm"].update(
+            train_actor_steps=10,
+            replay_buffer={"min_buffer_size": 5},
+        )
+        config["env"]["train"].update(
+            max_steps_per_rollout_epoch=360,
+            max_episode_steps=360,
+        )
+        config["env"]["train"]["init_params"].update(
+            max_episode_steps=360,
+            marker_history_len=8,
+            combined_marker_count=198,
+            main_image_key="agentview_rgb",
+            wrist_image_key="eye_in_hand_rgb",
+            marker_motion_key="gripper_marker_motion",
+        )
+        config["actor"].update(micro_batch_size=2, global_batch_size=20)
+    return OmegaConf.to_yaml(OmegaConf.create(config))
 
 
 def _write_provenance(
@@ -131,6 +196,7 @@ def _write_provenance(
     *,
     snapshot_task_id=None,
     mode="fresh",
+    profile="formal",
 ):
     output_root = checkpoint.parents[5]
     checkpoint_task_id = int(
@@ -142,7 +208,9 @@ def _write_provenance(
         checkpoint_task_id if snapshot_task_id is None else snapshot_task_id
     )
     config_snapshot = output_root / "config_snapshot.yaml"
-    config_snapshot.write_text(_formal_config(snapshot_task_id, base_model))
+    config_snapshot.write_text(
+        _formal_config(snapshot_task_id, base_model, profile=profile)
+    )
     config_hash = _sha256(config_snapshot)
     base_hash = _sha256(base_model / "model.safetensors")
     source_hash = "none"
@@ -209,6 +277,23 @@ def _export(tmp_path, *, task_id=0, checkpoint=None, **kwargs):
         **kwargs,
     )
     return manifest, checkpoint, base_model, output_dir
+
+
+def test_export_formal_profile_accepts_original_minimal_snapshot_contract(tmp_path):
+    manifest, checkpoint, _, _ = _export(tmp_path, task_id=0)
+    config = OmegaConf.load(checkpoint.parents[5] / "config_snapshot.yaml")
+
+    assert manifest["global_step"] == 50
+    for path in (
+        "cluster.component_placement.actor",
+        "env.train.max_steps_per_rollout_epoch",
+        "env.train.max_episode_steps",
+        "algorithm.replay_buffer.min_buffer_size",
+        "algorithm.train_actor_steps",
+        "actor.global_batch_size",
+        "actor.micro_batch_size",
+    ):
+        assert OmegaConf.select(config, path, default=None) is None
 
 
 def test_export_writes_strict_actor_bundle_and_audit(tmp_path):
@@ -289,6 +374,206 @@ def test_export_writes_strict_actor_bundle_and_audit(tmp_path):
         "manifest.json",
         "artifact_audit.json",
     }
+
+
+def test_export_accepts_final_task5_small4gpu40_profile(tmp_path):
+    checkpoint = _checkpoint(
+        tmp_path,
+        task_id=5,
+        step=40,
+        profile="small4gpu40",
+    )
+    base_model = _base_model(tmp_path)
+    base_hash = _write_provenance(
+        checkpoint,
+        base_model,
+        profile="small4gpu40",
+    )
+
+    manifest = exporter.export_tabero_dsrl_bundle(
+        trainable_checkpoint=checkpoint,
+        output_dir=tmp_path / "bundle",
+        base_model=base_model,
+        expected_base_model_sha256=base_hash,
+        task_id=5,
+        training_profile=SMALL4GPU40_PROFILE,
+    )
+
+    assert manifest["task_id"] == 5
+    assert manifest["global_step"] == 40
+    assert manifest["is_final"] is True
+    assert manifest["training_config"] == SMALL4GPU40_CONFIG
+    audit = json.loads((tmp_path / "bundle/artifact_audit.json").read_text())
+    assert audit["task_id"] == 5
+    assert audit["global_step"] == 40
+
+
+@pytest.mark.parametrize(
+    ("metadata_overrides", "message"),
+    [
+        ({"method": "pirl"}, "method"),
+        ({"task_id": 0}, "task_id"),
+        ({"step": 39}, "step"),
+        ({"global_step": 39}, "global_step"),
+        ({"target_global_step": 50}, "target_global_step"),
+        ({"is_final": False}, "final"),
+        (
+            {
+                "training_config": (
+                    "isaaclab_pi0_dsrl_tacfield_tabero_task5_firm_8gpu_50step"
+                )
+            },
+            "training_config",
+        ),
+        ({"world_size": 4}, "world_size"),
+    ],
+)
+def test_export_rejects_wrong_small4gpu40_metadata(
+    tmp_path,
+    metadata_overrides,
+    message,
+):
+    checkpoint = _checkpoint(
+        tmp_path,
+        task_id=5,
+        step=40,
+        profile="small4gpu40",
+        metadata_overrides=metadata_overrides,
+    )
+    base_model = _base_model(tmp_path)
+    base_hash = _write_provenance(
+        checkpoint,
+        base_model,
+        profile="small4gpu40",
+    )
+
+    with pytest.raises(ValueError, match=message):
+        exporter.export_tabero_dsrl_bundle(
+            trainable_checkpoint=checkpoint,
+            output_dir=tmp_path / "bundle",
+            base_model=base_model,
+            expected_base_model_sha256=base_hash,
+            task_id=5,
+            training_profile=SMALL4GPU40_PROFILE,
+        )
+
+
+@pytest.mark.parametrize(
+    ("path", "invalid_value"),
+    [
+        ("runner.max_epochs", 50),
+        ("cluster.component_placement.actor", "0-1"),
+        ("cluster.component_placement.rollout", "2-3"),
+        ("cluster.component_placement.env", "2-3"),
+        ("env.train.total_num_envs", 84),
+        ("env.train.rollout_epoch", 2),
+        ("env.train.max_steps_per_rollout_epoch", 180),
+        ("env.train.max_episode_steps", 180),
+        ("env.train.init_params.max_episode_steps", 180),
+        ("env.train.init_params.marker_history_len", 7),
+        ("env.train.init_params.combined_marker_count", 197),
+        ("env.train.init_params.main_image_key", "wrong"),
+        ("env.train.init_params.wrist_image_key", "wrong"),
+        ("env.train.init_params.marker_motion_key", "wrong"),
+        ("algorithm.update_epoch", 200),
+        ("algorithm.replay_buffer.min_buffer_size", 10),
+        ("algorithm.train_actor_steps", 9),
+        ("actor.global_batch_size", 40),
+        ("actor.micro_batch_size", 4),
+    ],
+)
+def test_export_rejects_small4gpu40_config_snapshot_mutation(
+    tmp_path,
+    path,
+    invalid_value,
+):
+    checkpoint = _checkpoint(
+        tmp_path,
+        task_id=5,
+        step=40,
+        profile="small4gpu40",
+    )
+    base_model = _base_model(tmp_path)
+    base_hash = _write_provenance(
+        checkpoint,
+        base_model,
+        profile="small4gpu40",
+    )
+    _rewrite_config_snapshot(checkpoint, path, invalid_value)
+
+    with pytest.raises(ValueError, match="config snapshot"):
+        exporter.export_tabero_dsrl_bundle(
+            trainable_checkpoint=checkpoint,
+            output_dir=tmp_path / "bundle",
+            base_model=base_model,
+            expected_base_model_sha256=base_hash,
+            task_id=5,
+            training_profile=SMALL4GPU40_PROFILE,
+        )
+
+
+def test_export_rejects_task5_small4gpu40_without_explicit_profile(tmp_path):
+    checkpoint = _checkpoint(
+        tmp_path,
+        task_id=5,
+        step=40,
+        profile="small4gpu40",
+    )
+    base_model = _base_model(tmp_path)
+    base_hash = _write_provenance(
+        checkpoint,
+        base_model,
+        profile="small4gpu40",
+    )
+
+    with pytest.raises(ValueError, match="global_step_50|training profile"):
+        exporter.export_tabero_dsrl_bundle(
+            trainable_checkpoint=checkpoint,
+            output_dir=tmp_path / "bundle",
+            base_model=base_model,
+            expected_base_model_sha256=base_hash,
+            task_id=5,
+        )
+
+
+def test_export_rejects_task0_with_small4gpu40_profile(tmp_path):
+    checkpoint = _checkpoint(tmp_path, task_id=0, step=40)
+    base_model = _base_model(tmp_path)
+    base_hash = _write_provenance(checkpoint, base_model)
+
+    with pytest.raises(ValueError, match="Task 5|task_id"):
+        exporter.export_tabero_dsrl_bundle(
+            trainable_checkpoint=checkpoint,
+            output_dir=tmp_path / "bundle",
+            base_model=base_model,
+            expected_base_model_sha256=base_hash,
+            task_id=0,
+            training_profile=SMALL4GPU40_PROFILE,
+        )
+
+
+def test_export_cli_defaults_to_formal_profile(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "export_tabero_dsrl_for_t2vla.py",
+            "--trainable-checkpoint",
+            str(tmp_path / "checkpoint.pt"),
+            "--output-dir",
+            str(tmp_path / "bundle"),
+            "--base-model",
+            str(tmp_path / "base"),
+            "--expected-base-model-sha256",
+            "f" * 64,
+            "--task-id",
+            "0",
+        ],
+    )
+
+    args = exporter._parse_args()
+
+    assert args.training_profile == "formal_8gpu_50step"
 
 
 @pytest.mark.parametrize(

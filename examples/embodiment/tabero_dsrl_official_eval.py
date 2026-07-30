@@ -32,10 +32,15 @@ from rlinf.utils.dsrl_rollout_sync import (
     DSRL_ROLLOUT_SYNC_PARAMETER_COUNT,
     DSRL_ROLLOUT_SYNC_TENSOR_COUNT,
 )
+from rlinf.utils.tabero_dsrl_profiles import (
+    FORMAL_8GPU_50STEP_PROFILE,
+    TABERO_DSRL_TRAINING_PROFILE_CHOICES,
+    TaberoDSRLTrainingProfile,
+    resolve_tabero_dsrl_training_profile,
+)
 
 FORMAT = "tabero_dsrl_t2vla"
 FORMAT_VERSION = 1
-FINAL_GLOBAL_STEP = 50
 BASE_WEIGHTS_NAME = "model.safetensors"
 ACTOR_NAME = "dsrl_actor.safetensors"
 MANIFEST_NAME = "manifest.json"
@@ -249,7 +254,11 @@ def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
     _atomic_write(path, json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
 
-def _validate_actor(actor_path: Path, task_id: int) -> None:
+def _validate_actor(
+    actor_path: Path,
+    task_id: int,
+    profile: TaberoDSRLTrainingProfile,
+) -> None:
     try:
         with safe_open(actor_path, framework="pt", device="cpu") as actor:
             metadata = actor.metadata()
@@ -257,7 +266,7 @@ def _validate_actor(actor_path: Path, task_id: int) -> None:
                 "format": FORMAT,
                 "format_version": str(FORMAT_VERSION),
                 "task_id": str(task_id),
-                "global_step": str(FINAL_GLOBAL_STEP),
+                "global_step": str(profile.global_step),
                 "dtype": "bfloat16",
             }
             if metadata != expected_metadata:
@@ -358,10 +367,13 @@ def validate_bundle(
     bundle: str | Path,
     task_id: int,
     base_model: str | Path,
-) -> dict[str, str]:
+    *,
+    training_profile: str = FORMAL_8GPU_50STEP_PROFILE,
+) -> dict[str, Any]:
     """Strictly validate one final Task 0/5 audited DSRL bundle."""
     if type(task_id) is not int or task_id not in {0, 5}:
         raise ValueError(f"task_id must be exactly 0 or 5; got {task_id!r}")
+    profile = resolve_tabero_dsrl_training_profile(training_profile, task_id)
     bundle_path = Path(bundle).resolve()
     if not bundle_path.is_dir():
         raise ValueError(f"DSRL bundle must be a directory: {bundle_path}")
@@ -390,12 +402,12 @@ def validate_bundle(
     _require_exact(manifest.get("algorithm"), "dsrl-sac", "manifest algorithm")
     _require_exact(manifest.get("task_id"), task_id, "manifest task_id")
     _require_exact(
-        manifest.get("global_step"), FINAL_GLOBAL_STEP, "manifest global_step"
+        manifest.get("global_step"), profile.global_step, "manifest global_step"
     )
     _require_exact(manifest.get("is_final"), True, "manifest is_final final flag")
     _require_exact(
         manifest.get("training_config"),
-        f"isaaclab_pi0_dsrl_tacfield_tabero_task{task_id}_firm_8gpu_50step",
+        profile.training_config(task_id),
         "manifest training_config",
     )
     _require_exact(manifest.get("actor_weights"), ACTOR_NAME, "manifest actor_weights")
@@ -490,7 +502,7 @@ def validate_bundle(
     _require_exact(audit.get("format_version"), 1, "audit format_version")
     _require_exact(audit.get("status"), "passed", "audit status")
     _require_exact(audit.get("task_id"), task_id, "audit task_id")
-    _require_exact(audit.get("global_step"), FINAL_GLOBAL_STEP, "audit global_step")
+    _require_exact(audit.get("global_step"), profile.global_step, "audit global_step")
     checks = audit.get("checks")
     if (
         not isinstance(checks, dict)
@@ -512,7 +524,7 @@ def validate_bundle(
     if audit_source_hash != manifest.get("source_checkpoint_sha256"):
         raise ValueError("audit source checkpoint hash mismatch")
 
-    _validate_actor(actor_path, task_id)
+    _validate_actor(actor_path, task_id, profile)
     bundle_digest = hashlib.sha256(
         f"{actor_hash}\n{manifest_hash}\n{audit_hash}\n".encode()
     ).hexdigest()
@@ -524,6 +536,8 @@ def validate_bundle(
         "audit_sha256": audit_hash,
         "base_model_path": str(base_model_path),
         "base_model_sha256": base_hash,
+        "training_profile": profile.name,
+        "global_step": profile.global_step,
     }
 
 
@@ -696,10 +710,21 @@ def write_receipts(
     output_dir: str | Path,
     run_id: str,
     *,
+    bundle_path: str | Path,
+    base_model_path: str | Path,
+    expected_task_id: int,
+    training_profile: str = FORMAL_8GPU_50STEP_PROFILE,
     summary_writer_cls: Any | None = None,
     wandb_module: Any | None = None,
 ) -> dict[str, Any]:
     """Log official metrics to TensorBoard and W&B and write a URL receipt."""
+    bundle = validate_bundle(
+        bundle_path,
+        expected_task_id,
+        base_model_path,
+        training_profile=training_profile,
+    )
+    global_step = bundle["global_step"]
     output = Path(output_dir)
     receipt_path = output / "wandb_eval.json"
     if receipt_path.exists():
@@ -720,7 +745,7 @@ def write_receipts(
     writer = summary_writer_cls(log_dir=output / "tensorboard")
     try:
         for name, value in metrics.items():
-            writer.add_scalar(name, value, FINAL_GLOBAL_STEP)
+            writer.add_scalar(name, value, global_step)
         writer.flush()
     finally:
         writer.close()
@@ -737,9 +762,13 @@ def write_receipts(
             name=run_id,
             resume="never",
             mode="online",
-            config={"method": "dsrl", "official_eval": True},
+            config={
+                "method": "dsrl",
+                "official_eval": True,
+                "source_global_step": global_step,
+            },
         )
-        run.log(metrics, step=FINAL_GLOBAL_STEP, commit=True)
+        run.log(metrics, step=global_step, commit=True)
         url = run.url
         if not isinstance(url, str) or not url:
             raise RuntimeError("W&B did not return a run URL")
@@ -752,7 +781,7 @@ def write_receipts(
         "id": run_id,
         "project": "tabero-rlinf",
         "run_id": run_id,
-        "step": FINAL_GLOBAL_STEP,
+        "step": global_step,
         "url": url,
     }
     _atomic_write_json(receipt_path, receipt)
@@ -1083,7 +1112,7 @@ def _hold_gpu_locks(args: argparse.Namespace) -> None:
 
 
 def _metadata_lines(
-    bundle: Mapping[str, str], repos: Mapping[str, Mapping[str, Any]]
+    bundle: Mapping[str, Any], repos: Mapping[str, Mapping[str, Any]]
 ) -> list[str]:
     values = {
         "TABERO_DSRL_BUNDLE": bundle["bundle_path"],
@@ -1093,6 +1122,7 @@ def _metadata_lines(
         "TABERO_DSRL_AUDIT_SHA256": bundle["audit_sha256"],
         "TABERO_BASE_MODEL_PATH": bundle["base_model_path"],
         "TABERO_BASE_MODEL_SHA256": bundle["base_model_sha256"],
+        "TABERO_DSRL_TRAINING_PROFILE": bundle["training_profile"],
     }
     for name, state in repos.items():
         prefix = name.upper()
@@ -1106,7 +1136,12 @@ def _metadata_lines(
 
 
 def _preflight(args: argparse.Namespace) -> None:
-    bundle = validate_bundle(args.bundle, args.task_id, args.base_model)
+    bundle = validate_bundle(
+        args.bundle,
+        args.task_id,
+        args.base_model,
+        training_profile=args.training_profile,
+    )
     repos = capture_repo_provenance(
         {"rlinf": args.rlinf_repo, "t2_vla": args.t2_repo, "tabero": args.tabero_repo},
         allow_dirty=args.allow_dirty,
@@ -1119,7 +1154,15 @@ def _finalize(args: argparse.Namespace) -> None:
     if normalized_path.exists():
         raise FileExistsError(f"output already exists: {normalized_path}")
     normalized = _parse_normalized_result(args.raw_dir, args.bundle, args.task_id)
-    write_receipts(normalized, args.output_dir / "output", args.run_id)
+    write_receipts(
+        normalized,
+        args.output_dir / "output",
+        args.run_id,
+        bundle_path=args.bundle,
+        base_model_path=args.base_model,
+        expected_task_id=args.task_id,
+        training_profile=args.training_profile,
+    )
     _atomic_write_json(normalized_path, normalized)
 
 
@@ -1130,6 +1173,11 @@ def _parser() -> argparse.ArgumentParser:
     preflight.add_argument("--bundle", type=Path, required=True)
     preflight.add_argument("--task-id", type=int, choices=(0, 5), required=True)
     preflight.add_argument("--base-model", type=Path, required=True)
+    preflight.add_argument(
+        "--training-profile",
+        choices=TABERO_DSRL_TRAINING_PROFILE_CHOICES,
+        required=True,
+    )
     preflight.add_argument("--rlinf-repo", type=Path, required=True)
     preflight.add_argument("--t2-repo", type=Path, required=True)
     preflight.add_argument("--tabero-repo", type=Path, required=True)
@@ -1140,6 +1188,12 @@ def _parser() -> argparse.ArgumentParser:
     finalize.add_argument("--output-dir", type=Path, required=True)
     finalize.add_argument("--bundle", type=Path, required=True)
     finalize.add_argument("--task-id", type=int, choices=(0, 5), required=True)
+    finalize.add_argument("--base-model", type=Path, required=True)
+    finalize.add_argument(
+        "--training-profile",
+        choices=TABERO_DSRL_TRAINING_PROFILE_CHOICES,
+        required=True,
+    )
     finalize.add_argument("--run-id", required=True)
     listener = commands.add_parser("listener-owned")
     listener.add_argument("--pid", type=int, required=True)

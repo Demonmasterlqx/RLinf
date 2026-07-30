@@ -8,7 +8,8 @@ readonly DEFAULT_GPU_LOCK_DIR="/run/lock"
 readonly MIN_FREE_DISK_KIB=52428800
 
 usage() {
-  echo "Usage: $0 dsrl <0|5> formal --dsrl-bundle ABS_PATH [--dry-run]" >&2
+  echo "Usage: $0 dsrl <0|5> formal --dsrl-bundle ABS_PATH --training-profile PROFILE [--dry-run]" >&2
+  echo "Profiles: formal_8gpu_50step | task5_4gpu_40step_small" >&2
 }
 
 die() {
@@ -16,7 +17,7 @@ die() {
   exit 1
 }
 
-[[ $# -ge 5 ]] || { usage; die "missing required arguments"; }
+[[ $# -ge 7 ]] || { usage; die "missing required arguments"; }
 METHOD="$1"
 TASK_ID="$2"
 RUN_MODE="$3"
@@ -26,6 +27,7 @@ shift 3
 [[ "${RUN_MODE}" == "formal" ]] || die "run mode must be exactly formal"
 
 DSRL_BUNDLE=""
+TRAINING_PROFILE=""
 DRY_RUN=false
 while (($#)); do
   case "$1" in
@@ -33,6 +35,12 @@ while (($#)); do
       (($# >= 2)) || die "--dsrl-bundle requires an absolute path"
       [[ -z "${DSRL_BUNDLE}" ]] || die "--dsrl-bundle may be specified only once"
       DSRL_BUNDLE="$2"
+      shift 2
+      ;;
+    --training-profile)
+      (($# >= 2)) || die "--training-profile requires a profile name"
+      [[ -z "${TRAINING_PROFILE}" ]] || die "--training-profile may be specified only once"
+      TRAINING_PROFILE="$2"
       shift 2
       ;;
     --dry-run)
@@ -48,6 +56,13 @@ while (($#)); do
   esac
 done
 [[ -n "${DSRL_BUNDLE}" ]] || die "--dsrl-bundle is required"
+[[ -n "${TRAINING_PROFILE}" ]] || die "--training-profile is required"
+[[ "${TRAINING_PROFILE}" == "formal_8gpu_50step" || \
+   "${TRAINING_PROFILE}" == "task5_4gpu_40step_small" ]] || \
+  die "unsupported --training-profile: ${TRAINING_PROFILE}"
+if [[ "${TRAINING_PROFILE}" == "task5_4gpu_40step_small" && "${TASK_ID}" != "5" ]]; then
+  die "task5_4gpu_40step_small training profile supports only Task 5"
+fi
 [[ "${DSRL_BUNDLE}" == /* ]] || die "--dsrl-bundle must be an absolute path"
 [[ -d "${DSRL_BUNDLE}" ]] || die "DSRL bundle must be a directory: ${DSRL_BUNDLE}"
 DSRL_BUNDLE="$(cd "${DSRL_BUNDLE}" && pwd -P)"
@@ -262,6 +277,7 @@ preflight_command=(
   "${RLINF_PYTHON}" "${HELPER}" preflight
   --bundle "${DSRL_BUNDLE}"
   --task-id "${TASK_ID}"
+  --training-profile "${TRAINING_PROFILE}"
   --base-model "${BASE_MODEL}"
   --rlinf-repo "${RLINF_ROOT}"
   --t2-repo "${T2_ROOT}"
@@ -384,6 +400,7 @@ RUN_ENV_TEMP="$(mktemp "${OUTPUT_DIR}/.run.env.XXXXXX")"
   printf 'TABERO_METHOD=dsrl\n'
   printf 'TABERO_TASK_ID=%s\n' "${TASK_ID}"
   printf 'TABERO_RUN_MODE=formal\n'
+  printf 'TABERO_DSRL_TRAINING_PROFILE=%s\n' "${TRAINING_PROFILE}"
   printf 'TABERO_EXPECTED_EPISODES=50\n'
   printf 'TABERO_DSRL_BUNDLE=%s\n' "${DSRL_BUNDLE}"
   printf 'TABERO_OUTPUT_DIR=%s\n' "${OUTPUT_DIR}"
@@ -522,6 +539,7 @@ runtime_preflight_command=(
   "${RLINF_PYTHON}" "${HELPER}" preflight
   --bundle "${DSRL_BUNDLE}"
   --task-id "${TASK_ID}"
+  --training-profile "${TRAINING_PROFILE}"
   --base-model "${BASE_MODEL}"
   --rlinf-repo "${RLINF_ROOT}"
   --t2-repo "${T2_ROOT}"
@@ -540,6 +558,8 @@ PYTHONPATH="${RLINF_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" run_supervised_with_gpu_
   --output-dir "${OUTPUT_DIR}" \
   --bundle "${DSRL_BUNDLE}" \
   --task-id "${TASK_ID}" \
+  --base-model "${BASE_MODEL}" \
+  --training-profile "${TRAINING_PROFILE}" \
   --run-id "${WANDB_RUN_ID}"
 require_gpu_lease_guardian
 stop_supervised_process "${GPU_LOCK_GUARDIAN_PID}" || die "GPU lease guardian did not stop cleanly"
