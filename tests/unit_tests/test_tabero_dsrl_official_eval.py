@@ -31,6 +31,7 @@ LAUNCHER_PATH = REPO_ROOT / "examples/embodiment/run_tabero_firm_official_eval.s
 FORMAL_PROFILE = "formal_8gpu_50step"
 SMALL4GPU40_PROFILE = "task5_4gpu_40step_small"
 SMALL4GPU40_CONFIG = "isaaclab_pi0_dsrl_tacfield_tabero_task5_firm_4gpu_40step_small"
+SELECTED_STEP10_PROFILE = "task0_selected_step10"
 
 
 def _load_helper():
@@ -236,6 +237,43 @@ def _retask_bundle_to_small4gpu40(bundle, manifest, audit):
     _rewrite_bundle_json(bundle, "artifact_audit.json", audit)
 
 
+def _retask_bundle_to_selected_step10(bundle, manifest, audit):
+    old_checkpoint = Path(manifest["source_checkpoint"])
+    new_checkpoint = old_checkpoint.parents[1] / "global_step_10/trainable_weights.pt"
+    new_checkpoint.parent.mkdir()
+    old_checkpoint.rename(new_checkpoint)
+    actor_path = bundle / "dsrl_actor.safetensors"
+    save_file(
+        {
+            key: torch.zeros(shape, dtype=torch.bfloat16)
+            for key, shape in DSRL_ROLLOUT_SYNC_MANIFEST_V1.items()
+        },
+        actor_path,
+        metadata={
+            "format": "tabero_dsrl_t2vla",
+            "format_version": "1",
+            "task_id": "0",
+            "global_step": "10",
+            "dtype": "bfloat16",
+        },
+    )
+    manifest.update(
+        global_step=10,
+        is_final=False,
+        source_checkpoint=str(new_checkpoint),
+        source_checkpoint_sha256=_sha256(new_checkpoint),
+        actor_weights_sha256=_sha256(actor_path),
+    )
+    _rewrite_bundle_json(bundle, "manifest.json", manifest)
+    audit.update(
+        global_step=10,
+        source_checkpoint_sha256=manifest["source_checkpoint_sha256"],
+        actor_weights_sha256=manifest["actor_weights_sha256"],
+        manifest_sha256=_sha256(bundle / "manifest.json"),
+    )
+    _rewrite_bundle_json(bundle, "artifact_audit.json", audit)
+
+
 def test_validate_bundle_accepts_final_task0_and_captures_hashes(bundle_fixture):
     helper = _load_helper()
     bundle, base_model, manifest, _ = bundle_fixture
@@ -263,6 +301,42 @@ def test_validate_bundle_accepts_explicit_task5_small4gpu40_profile(bundle_fixtu
     )
 
     assert result["bundle_path"] == str(bundle.resolve())
+
+
+def test_validate_bundle_accepts_explicit_task0_selected_step10_profile(
+    bundle_fixture,
+):
+    helper = _load_helper()
+    bundle, base_model, manifest, audit = bundle_fixture
+    _retask_bundle_to_selected_step10(bundle, manifest, audit)
+
+    result = helper.validate_bundle(
+        bundle,
+        0,
+        base_model,
+        training_profile=SELECTED_STEP10_PROFILE,
+    )
+
+    assert result["global_step"] == 10
+    assert result["is_final"] is False
+
+
+def test_validate_selected_step10_rejects_wrong_finality(bundle_fixture):
+    helper = _load_helper()
+    bundle, base_model, manifest, audit = bundle_fixture
+    _retask_bundle_to_selected_step10(bundle, manifest, audit)
+    manifest["is_final"] = True
+    _rewrite_bundle_json(bundle, "manifest.json", manifest)
+    audit["manifest_sha256"] = _sha256(bundle / "manifest.json")
+    _rewrite_bundle_json(bundle, "artifact_audit.json", audit)
+
+    with pytest.raises(ValueError, match="is_final"):
+        helper.validate_bundle(
+            bundle,
+            0,
+            base_model,
+            training_profile=SELECTED_STEP10_PROFILE,
+        )
 
 
 def test_validate_bundle_does_not_auto_select_small4gpu40_profile(bundle_fixture):
@@ -533,6 +607,9 @@ def test_normalize_result_matches_prior_schema_and_is_no_clobber(tmp_path):
     raw_path.write_text(json.dumps(_raw_payload()))
     bundle = tmp_path / "bundle"
     bundle.mkdir()
+    (bundle / "manifest.json").write_text(
+        json.dumps({"global_step": 50, "is_final": True})
+    )
     output = tmp_path / "normalized_result.json"
 
     result = helper.normalize_result(raw_dir, output, bundle, 0)
@@ -544,7 +621,11 @@ def test_normalize_result_matches_prior_schema_and_is_no_clobber(tmp_path):
     assert result["success_count"] == 41
     assert result["success_rate"] == 82.0
     assert result["total_episodes"] == 50
-    assert result["checkpoint"] == {"path": str(bundle.resolve())}
+    assert result["checkpoint"] == {
+        "global_step": 50,
+        "is_final": True,
+        "path": str(bundle.resolve()),
+    }
     assert result["protocol"] == {
         "action_horizon": 10,
         "consecutive_success_steps": 8,
@@ -564,6 +645,33 @@ def test_normalize_result_matches_prior_schema_and_is_no_clobber(tmp_path):
     }
     with pytest.raises(FileExistsError):
         helper.normalize_result(raw_dir, output, bundle, 0)
+
+
+def test_normalize_result_records_selected_non_final_checkpoint(
+    tmp_path,
+    bundle_fixture,
+):
+    helper = _load_helper()
+    bundle, _, manifest, audit = bundle_fixture
+    _retask_bundle_to_selected_step10(bundle, manifest, audit)
+    raw_dir = tmp_path / "raw"
+    raw_dir.mkdir()
+    (raw_dir / "success_rates_openpi_tactile_1.json").write_text(
+        json.dumps(_raw_payload())
+    )
+
+    result = helper.normalize_result(
+        raw_dir,
+        tmp_path / "normalized_result.json",
+        bundle,
+        0,
+    )
+
+    assert result["checkpoint"] == {
+        "global_step": 10,
+        "is_final": False,
+        "path": str(bundle.resolve()),
+    }
 
 
 @pytest.mark.parametrize(
@@ -699,9 +807,11 @@ def test_write_receipts_logs_tensorboard_and_wandb_at_step50(
     } in [entry[0] for entry in logged if isinstance(entry, tuple) and entry]
     assert receipt == {
         "id": run_id,
+        "is_final": True,
         "project": "tabero-rlinf",
         "run_id": run_id,
         "step": 50,
+        "training_profile": FORMAL_PROFILE,
         "url": "https://wandb.example/run",
     }
     assert json.loads((output / "wandb_eval.json").read_text()) == receipt
@@ -765,6 +875,82 @@ def test_write_receipts_logs_custom_profile_at_step40(tmp_path, bundle_fixture):
 
     assert logged_steps == [40, 40, 40, 40]
     assert receipt["step"] == 40
+
+
+def test_write_receipts_marks_selected_step10_as_non_final(tmp_path, bundle_fixture):
+    helper = _load_helper()
+    bundle, base_model, manifest, audit = bundle_fixture
+    _retask_bundle_to_selected_step10(bundle, manifest, audit)
+    wandb_configs = []
+
+    class FakeWriter:
+        def __init__(self, log_dir):
+            Path(log_dir).mkdir(parents=True)
+
+        def add_scalar(self, name, value, step):
+            pass
+
+        def flush(self):
+            pass
+
+        def close(self):
+            pass
+
+    class FakeRun:
+        url = "https://wandb.example/selected"
+
+        def log(self, values, step, commit):
+            pass
+
+        def finish(self, exit_code):
+            pass
+
+    class FakeWandb:
+        def init(self, **kwargs):
+            wandb_configs.append(kwargs["config"])
+            return FakeRun()
+
+    receipt = helper.write_receipts(
+        {"success_count": 1, "success_rate": 2.0, "total_episodes": 50},
+        tmp_path / "output",
+        "tabero-official-dsrl-task0-20260730-120000-formal",
+        bundle_path=bundle,
+        base_model_path=base_model,
+        expected_task_id=0,
+        training_profile=SELECTED_STEP10_PROFILE,
+        summary_writer_cls=FakeWriter,
+        wandb_module=FakeWandb(),
+    )
+
+    assert receipt["is_final"] is False
+    assert receipt["step"] == 10
+    assert receipt["training_profile"] == SELECTED_STEP10_PROFILE
+    assert wandb_configs == [
+        {
+            "is_final": False,
+            "method": "dsrl",
+            "official_eval": True,
+            "source_global_step": 10,
+            "training_profile": SELECTED_STEP10_PROFILE,
+        }
+    ]
+
+
+def test_metadata_lines_mark_selected_step10_as_non_final(bundle_fixture):
+    helper = _load_helper()
+    bundle, base_model, manifest, audit = bundle_fixture
+    _retask_bundle_to_selected_step10(bundle, manifest, audit)
+    validated = helper.validate_bundle(
+        bundle,
+        0,
+        base_model,
+        training_profile=SELECTED_STEP10_PROFILE,
+    )
+
+    lines = helper._metadata_lines(validated, {})
+
+    assert "TABERO_DSRL_GLOBAL_STEP=10" in lines
+    assert "TABERO_DSRL_IS_FINAL=false" in lines
 
 
 def test_write_receipts_revalidates_bundle_and_rejects_profile_mismatch(

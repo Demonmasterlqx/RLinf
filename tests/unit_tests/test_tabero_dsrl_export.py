@@ -40,6 +40,7 @@ def _state_dict():
 
 SMALL4GPU40_CONFIG = "isaaclab_pi0_dsrl_tacfield_tabero_task5_firm_4gpu_40step_small"
 SMALL4GPU40_PROFILE = "task5_4gpu_40step_small"
+TASK0_SELECTED_STEP10_PROFILE = "task0_selected_step10"
 
 
 def _checkpoint(
@@ -574,6 +575,96 @@ def test_export_cli_defaults_to_formal_profile(monkeypatch, tmp_path):
     args = exporter._parse_args()
 
     assert args.training_profile == "formal_8gpu_50step"
+
+
+def test_export_task0_selected_step10_preserves_non_final_source(tmp_path):
+    checkpoint = _checkpoint(tmp_path, task_id=0, step=10)
+    base_model = _base_model(tmp_path)
+    base_hash = _write_provenance(checkpoint, base_model)
+
+    manifest = exporter.export_tabero_dsrl_bundle(
+        trainable_checkpoint=checkpoint,
+        output_dir=tmp_path / "bundle",
+        base_model=base_model,
+        expected_base_model_sha256=base_hash,
+        task_id=0,
+        training_profile=TASK0_SELECTED_STEP10_PROFILE,
+    )
+
+    assert manifest["task_id"] == 0
+    assert manifest["global_step"] == 10
+    assert manifest["is_final"] is False
+    assert manifest["training_config"] == (
+        "isaaclab_pi0_dsrl_tacfield_tabero_task0_firm_8gpu_50step"
+    )
+    assert (
+        json.loads((tmp_path / "bundle" / "artifact_audit.json").read_text())["status"]
+        == "passed"
+    )
+
+
+@pytest.mark.parametrize(
+    ("metadata_overrides", "message"),
+    [
+        ({"target_global_step": 10}, "target_global_step"),
+        ({"is_final": True}, "is_final"),
+        ({"training_config": "wrong"}, "training_config"),
+        ({"world_size": 2}, "world_size"),
+    ],
+)
+def test_export_task0_selected_step10_rejects_wrong_metadata(
+    tmp_path,
+    metadata_overrides,
+    message,
+):
+    checkpoint = _checkpoint(
+        tmp_path,
+        task_id=0,
+        step=10,
+        metadata_overrides=metadata_overrides,
+    )
+    base_model = _base_model(tmp_path)
+    base_hash = _write_provenance(checkpoint, base_model)
+
+    with pytest.raises(ValueError, match=message):
+        exporter.export_tabero_dsrl_bundle(
+            trainable_checkpoint=checkpoint,
+            output_dir=tmp_path / "bundle",
+            base_model=base_model,
+            expected_base_model_sha256=base_hash,
+            task_id=0,
+            training_profile=TASK0_SELECTED_STEP10_PROFILE,
+        )
+
+
+@pytest.mark.parametrize(
+    ("task_id", "step", "profile", "message"),
+    [
+        (0, 10, "formal_8gpu_50step", "global_step_50"),
+        (0, 20, TASK0_SELECTED_STEP10_PROFILE, "global_step_10"),
+        (5, 10, TASK0_SELECTED_STEP10_PROFILE, "Task 0|task_id"),
+    ],
+)
+def test_export_rejects_non_allowlisted_selected_checkpoint_paths(
+    tmp_path,
+    task_id,
+    step,
+    profile,
+    message,
+):
+    checkpoint = _checkpoint(tmp_path, task_id=task_id, step=step)
+    base_model = _base_model(tmp_path)
+    base_hash = _write_provenance(checkpoint, base_model)
+
+    with pytest.raises(ValueError, match=message):
+        exporter.export_tabero_dsrl_bundle(
+            trainable_checkpoint=checkpoint,
+            output_dir=tmp_path / "bundle",
+            base_model=base_model,
+            expected_base_model_sha256=base_hash,
+            task_id=task_id,
+            training_profile=profile,
+        )
 
 
 @pytest.mark.parametrize(

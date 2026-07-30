@@ -10,15 +10,18 @@ from typing import Any
 
 FORMAL_8GPU_50STEP_PROFILE = "formal_8gpu_50step"
 TASK5_4GPU_40STEP_SMALL_PROFILE = "task5_4gpu_40step_small"
+TASK0_SELECTED_STEP10_PROFILE = "task0_selected_step10"
 
 
 @dataclass(frozen=True)
 class TaberoDSRLTrainingProfile:
-    """Immutable final-checkpoint and resolved-config contract."""
+    """Immutable checkpoint identity and resolved-config contract."""
 
     name: str
     allowed_task_ids: tuple[int, ...]
     global_step: int
+    target_global_step: int
+    is_final: bool
     actor_world_size: int
     training_config_template: str
     config_requirements: tuple[tuple[str, Any], ...]
@@ -33,6 +36,8 @@ _PROFILES = {
         name=FORMAL_8GPU_50STEP_PROFILE,
         allowed_task_ids=(0, 5),
         global_step=50,
+        target_global_step=50,
+        is_final=True,
         actor_world_size=4,
         training_config_template=(
             "isaaclab_pi0_dsrl_tacfield_tabero_task{task_id}_firm_8gpu_50step"
@@ -51,6 +56,8 @@ _PROFILES = {
         name=TASK5_4GPU_40STEP_SMALL_PROFILE,
         allowed_task_ids=(5,),
         global_step=40,
+        target_global_step=40,
+        is_final=True,
         actor_world_size=2,
         training_config_template=(
             "isaaclab_pi0_dsrl_tacfield_tabero_task5_firm_4gpu_40step_small"
@@ -81,6 +88,26 @@ _PROFILES = {
             ("algorithm.train_actor_steps", 10),
             ("actor.global_batch_size", 20),
             ("actor.micro_batch_size", 2),
+        ),
+    ),
+    TASK0_SELECTED_STEP10_PROFILE: TaberoDSRLTrainingProfile(
+        name=TASK0_SELECTED_STEP10_PROFILE,
+        allowed_task_ids=(0,),
+        global_step=10,
+        target_global_step=50,
+        is_final=False,
+        actor_world_size=4,
+        training_config_template=(
+            "isaaclab_pi0_dsrl_tacfield_tabero_task0_firm_8gpu_50step"
+        ),
+        config_requirements=(
+            ("runner.max_epochs", 50),
+            ("runner.save_interval", 10),
+            ("env.train.total_num_envs", 84),
+            ("env.train.rollout_epoch", 2),
+            ("algorithm.update_epoch", 200),
+            ("algorithm.gamma", 0.999),
+            ("algorithm.tau", 0.005),
         ),
     ),
 }

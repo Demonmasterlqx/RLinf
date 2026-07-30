@@ -46,6 +46,8 @@ ACTOR_NAME = "dsrl_actor.safetensors"
 MANIFEST_NAME = "manifest.json"
 AUDIT_NAME = "artifact_audit.json"
 EXPECTED_AUDIT_CHECKS = {
+    # Kept as the v1 artifact-audit key for compatibility; the check means the
+    # source path matches the checkpoint selected by the explicit profile.
     "final_checkpoint_path",
     "source_metadata",
     "source_trainable_manifest",
@@ -370,7 +372,7 @@ def validate_bundle(
     *,
     training_profile: str = FORMAL_8GPU_50STEP_PROFILE,
 ) -> dict[str, Any]:
-    """Strictly validate one final Task 0/5 audited DSRL bundle."""
+    """Strictly validate one allowlisted Task 0/5 audited DSRL bundle."""
     if type(task_id) is not int or task_id not in {0, 5}:
         raise ValueError(f"task_id must be exactly 0 or 5; got {task_id!r}")
     profile = resolve_tabero_dsrl_training_profile(training_profile, task_id)
@@ -404,7 +406,11 @@ def validate_bundle(
     _require_exact(
         manifest.get("global_step"), profile.global_step, "manifest global_step"
     )
-    _require_exact(manifest.get("is_final"), True, "manifest is_final final flag")
+    _require_exact(
+        manifest.get("is_final"),
+        profile.is_final,
+        "manifest is_final profile flag",
+    )
     _require_exact(
         manifest.get("training_config"),
         profile.training_config(task_id),
@@ -538,6 +544,7 @@ def validate_bundle(
         "base_model_sha256": base_hash,
         "training_profile": profile.name,
         "global_step": profile.global_step,
+        "is_final": profile.is_final,
     }
 
 
@@ -649,8 +656,19 @@ def _parse_normalized_result(
             f"raw result rate/count mismatch: rate={success_rate}, count={success_count}"
         )
     normalized_rate = float(success_rate)
+    manifest = _read_json(bundle / MANIFEST_NAME, "bundle manifest")
+    global_step = manifest.get("global_step")
+    if type(global_step) is not int or global_step <= 0:
+        raise ValueError("bundle manifest global_step must be a positive integer")
+    is_final = manifest.get("is_final")
+    if type(is_final) is not bool:
+        raise ValueError("bundle manifest is_final must be a boolean")
     return {
-        "checkpoint": {"path": str(bundle.resolve())},
+        "checkpoint": {
+            "global_step": global_step,
+            "is_final": is_final,
+            "path": str(bundle.resolve()),
+        },
         "condition": "firm",
         "config": {"name": f"tabero_task{task_id}_firm_dsrl_official_eval"},
         "method": "dsrl",
@@ -763,9 +781,11 @@ def write_receipts(
             resume="never",
             mode="online",
             config={
+                "is_final": bundle["is_final"],
                 "method": "dsrl",
                 "official_eval": True,
                 "source_global_step": global_step,
+                "training_profile": bundle["training_profile"],
             },
         )
         run.log(metrics, step=global_step, commit=True)
@@ -779,9 +799,11 @@ def write_receipts(
         raise
     receipt = {
         "id": run_id,
+        "is_final": bundle["is_final"],
         "project": "tabero-rlinf",
         "run_id": run_id,
         "step": global_step,
+        "training_profile": bundle["training_profile"],
         "url": url,
     }
     _atomic_write_json(receipt_path, receipt)
@@ -1122,6 +1144,8 @@ def _metadata_lines(
         "TABERO_DSRL_AUDIT_SHA256": bundle["audit_sha256"],
         "TABERO_BASE_MODEL_PATH": bundle["base_model_path"],
         "TABERO_BASE_MODEL_SHA256": bundle["base_model_sha256"],
+        "TABERO_DSRL_GLOBAL_STEP": bundle["global_step"],
+        "TABERO_DSRL_IS_FINAL": str(bundle["is_final"]).lower(),
         "TABERO_DSRL_TRAINING_PROFILE": bundle["training_profile"],
     }
     for name, state in repos.items():

@@ -119,7 +119,7 @@ def _require_sha256(value: str, label: str) -> str:
 def _require_strict_int(value: Any, expected: int, label: str) -> None:
     if type(value) is not int or value != expected:
         raise ValueError(
-            f"final DSRL checkpoint {label} must be {expected}; got {value!r}"
+            f"selected DSRL checkpoint {label} must be {expected}; got {value!r}"
         )
 
 
@@ -188,13 +188,13 @@ def _validate_checkpoint_path(
     actual_suffix = tuple(checkpoint.parts[-4:])
     if actual_suffix != expected_suffix:
         raise ValueError(
-            "final DSRL checkpoint path must end with "
+            "selected DSRL checkpoint path must end with "
             f"global_step_{profile.global_step}/actor/model_state_dict/"
             "trainable_weights.pt; "
             f"got {checkpoint}"
         )
     if not checkpoint.is_file():
-        raise ValueError(f"final DSRL checkpoint does not exist: {checkpoint}")
+        raise ValueError(f"selected DSRL checkpoint does not exist: {checkpoint}")
     return checkpoint
 
 
@@ -204,26 +204,29 @@ def _validate_metadata(
     profile: TaberoDSRLTrainingProfile,
 ) -> dict[str, Any]:
     if not isinstance(metadata, Mapping):
-        raise ValueError("final DSRL checkpoint metadata must be a mapping")
+        raise ValueError("selected DSRL checkpoint metadata must be a mapping")
     expected_config = profile.training_config(task_id)
     if metadata.get("format") != "trainable_weights":
-        raise ValueError("final DSRL checkpoint format must be trainable_weights")
+        raise ValueError("selected DSRL checkpoint format must be trainable_weights")
     if metadata.get("method") != "dsrl":
-        raise ValueError("final DSRL checkpoint method must be dsrl")
+        raise ValueError("selected DSRL checkpoint method must be dsrl")
     _require_strict_int(metadata.get("task_id"), task_id, "task_id")
     if metadata.get("training_config") != expected_config:
         raise ValueError(
-            f"final DSRL checkpoint training_config must be {expected_config!r}"
+            f"selected DSRL checkpoint training_config must be {expected_config!r}"
         )
     _require_strict_int(metadata.get("step"), profile.global_step, "step")
     _require_strict_int(metadata.get("global_step"), profile.global_step, "global_step")
     _require_strict_int(
         metadata.get("target_global_step"),
-        profile.global_step,
+        profile.target_global_step,
         "target_global_step",
     )
-    if metadata.get("is_final") is not True:
-        raise ValueError("final DSRL checkpoint is_final must be true")
+    if metadata.get("is_final") is not profile.is_final:
+        raise ValueError(
+            "DSRL checkpoint is_final must be "
+            f"{profile.is_final!r} for profile {profile.name!r}"
+        )
     _require_strict_int(metadata.get("rank"), 0, "rank")
     _require_strict_int(
         metadata.get("world_size"), profile.actor_world_size, "world_size"
@@ -248,7 +251,7 @@ def _validate_metadata(
 
 def _validate_trainable_state(state: Any) -> dict[str, torch.Tensor]:
     if not isinstance(state, Mapping):
-        raise ValueError("final DSRL checkpoint model must be a tensor mapping")
+        raise ValueError("selected DSRL checkpoint model must be a tensor mapping")
     expected_keys = set(DSRL_TRAINABLE_MANIFEST_V1)
     actual_keys = set(state)
     missing = sorted(expected_keys - actual_keys)
@@ -281,18 +284,18 @@ def _validate_trainable_state(state: Any) -> dict[str, torch.Tensor]:
     )
     if missing or unexpected or non_tensors or shape_mismatches:
         raise ValueError(
-            "final DSRL trainable tensor manifest mismatch; "
+            "selected DSRL trainable tensor manifest mismatch; "
             f"missing={missing}; unexpected={unexpected}; non_tensors={non_tensors}; "
             f"shape_mismatches={shape_mismatches}"
         )
     if dtype_mismatches:
         raise ValueError(
-            "final DSRL trainable tensor dtype mismatch; expected bfloat16; "
+            "selected DSRL trainable tensor dtype mismatch; expected bfloat16; "
             f"actual={dtype_mismatches}"
         )
     if nonfinite:
         raise ValueError(
-            f"final DSRL trainable tensors must be finite; keys={nonfinite}"
+            f"selected DSRL trainable tensors must be finite; keys={nonfinite}"
         )
     return {key: state[key] for key in DSRL_TRAINABLE_MANIFEST_V1}
 
@@ -549,7 +552,7 @@ def export_tabero_dsrl_bundle(
     task_id: int,
     training_profile: str = FORMAL_8GPU_50STEP_PROFILE,
 ) -> dict[str, Any]:
-    """Validate and export one final Task 0/5 DSRL actor bundle."""
+    """Validate and export one allowlisted Task 0/5 DSRL actor bundle."""
     if type(task_id) is not int or task_id not in {0, 5}:
         raise ValueError(f"task_id must be exactly 0 or 5; got {task_id!r}")
     profile = resolve_tabero_dsrl_training_profile(training_profile, task_id)
@@ -583,7 +586,7 @@ def export_tabero_dsrl_bundle(
     )
     _require_artifact_unchanged(checkpoint, checkpoint_hash, "source checkpoint")
     if not isinstance(payload, Mapping) or set(payload) != {"model", "metadata"}:
-        raise ValueError("final DSRL sidecar must contain exactly model and metadata")
+        raise ValueError("selected DSRL sidecar must contain exactly model and metadata")
     metadata = _validate_metadata(payload["metadata"], task_id, profile)
     trainable_state = _validate_trainable_state(payload["model"])
     actor_state = {
@@ -632,7 +635,7 @@ def export_tabero_dsrl_bundle(
             "algorithm": "dsrl-sac",
             "task_id": task_id,
             "global_step": profile.global_step,
-            "is_final": True,
+            "is_final": metadata["is_final"],
             "training_config": metadata["training_config"],
             "base_model": str(base_model),
             "base_model_sha256": actual_base_hash,
