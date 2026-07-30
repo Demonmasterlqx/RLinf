@@ -11,6 +11,7 @@ from typing import Any
 FORMAL_8GPU_50STEP_PROFILE = "formal_8gpu_50step"
 TASK5_4GPU_40STEP_SMALL_PROFILE = "task5_4gpu_40step_small"
 TASK0_SELECTED_STEP10_PROFILE = "task0_selected_step10"
+TASK0_8GPU_60STEP_PROFILE = "task0_8gpu_60step"
 
 
 @dataclass(frozen=True)
@@ -32,6 +33,26 @@ class TaberoDSRLTrainingProfile:
 
 
 _PROFILES = {
+    TASK0_8GPU_60STEP_PROFILE: TaberoDSRLTrainingProfile(
+        name=TASK0_8GPU_60STEP_PROFILE,
+        allowed_task_ids=(0,),
+        global_step=60,
+        target_global_step=60,
+        is_final=True,
+        actor_world_size=4,
+        training_config_template=(
+            "isaaclab_pi0_dsrl_tacfield_tabero_task0_firm_8gpu_60step"
+        ),
+        config_requirements=(
+            ("runner.max_epochs", 60),
+            ("runner.save_interval", 10),
+            ("env.train.total_num_envs", 84),
+            ("env.train.rollout_epoch", 2),
+            ("algorithm.update_epoch", 200),
+            ("algorithm.gamma", 0.999),
+            ("algorithm.tau", 0.005),
+        ),
+    ),
     FORMAL_8GPU_50STEP_PROFILE: TaberoDSRLTrainingProfile(
         name=FORMAL_8GPU_50STEP_PROFILE,
         allowed_task_ids=(0, 5),

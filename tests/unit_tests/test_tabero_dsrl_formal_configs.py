@@ -252,6 +252,34 @@ def test_matrix_launcher_builds_exact_dsrl_formal_command(tmp_path, task_id):
     assert (output_dir / "config_snapshot.yaml").is_file()
 
 
+def test_matrix_launcher_builds_task0_dsrl_60step_command(tmp_path):
+    result = _dry_run(tmp_path, 0, "--target-steps", "60")
+
+    assert result.returncode == 0, result.stderr
+    config_name = "isaaclab_pi0_dsrl_tacfield_tabero_task0_firm_8gpu_60step"
+    assert f"--config-name {config_name}" in result.stdout
+    output_dir = (
+        tmp_path
+        / "results"
+        / "tabero_firm_matrix_dsrl_task0_formal_20260728_120000_formal"
+    )
+    run_env = (output_dir / "run.env").read_text()
+    assert f"TABERO_CONFIG_NAME={config_name}" in run_env
+    snapshot = OmegaConf.load(output_dir / "config_snapshot.yaml")
+    assert snapshot.runner.max_epochs == 60
+    assert snapshot.runner.save_interval == 10
+    metadata = snapshot.actor.fsdp_config.trainable_checkpoint_metadata
+    assert metadata.training_config == config_name
+    assert metadata.target_global_step == 60
+
+
+def test_matrix_launcher_rejects_task5_dsrl_60step_profile(tmp_path):
+    result = _dry_run(tmp_path, 5, "--target-steps", "60")
+
+    assert result.returncode != 0
+    assert "60-step formal training supports only DSRL Task 0" in result.stderr
+
+
 def test_matrix_launcher_restore_only_requires_resume(tmp_path):
     result = _dry_run(tmp_path, 0, "--restore-only")
     assert result.returncode != 0

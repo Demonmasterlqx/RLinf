@@ -2,7 +2,7 @@
 set -euo pipefail
 
 usage() {
-  echo "Usage: $0 <rlt|pirl|dsrl> <0|5> <smoke|formal> [--resume-dir PATH] [--restore-only] [--dry-run]" >&2
+  echo "Usage: $0 <rlt|pirl|dsrl> <0|5> <smoke|formal> [--target-steps 50|60] [--resume-dir PATH] [--restore-only] [--dry-run]" >&2
 }
 
 die() {
@@ -30,8 +30,15 @@ shift 3
 RESUME_DIR=""
 RESTORE_ONLY=false
 DRY_RUN=false
+TARGET_STEPS=50
 while (($#)); do
   case "$1" in
+    --target-steps)
+      (($# >= 2)) || die "--target-steps requires 50 or 60"
+      [[ "$2" == "50" || "$2" == "60" ]] || die "--target-steps must be 50 or 60"
+      TARGET_STEPS="$2"
+      shift 2
+      ;;
     --resume-dir)
       (($# >= 2)) || die "--resume-dir requires a path"
       RESUME_DIR="$2"
@@ -54,6 +61,10 @@ while (($#)); do
       ;;
   esac
 done
+if [[ "${TARGET_STEPS}" == "60" ]] && \
+   [[ "${METHOD}" != "dsrl" || "${TASK_ID}" != "0" || "${MODE}" != "formal" ]]; then
+  die "60-step formal training supports only DSRL Task 0"
+fi
 if [[ "${RESTORE_ONLY}" == true && -z "${RESUME_DIR}" ]]; then
   die "--restore-only requires --resume-dir"
 fi
@@ -68,7 +79,7 @@ case "${METHOD}" in
     CONFIG_DIR_REL="examples/embodiment/config"
     ;;
   dsrl)
-    CONFIG_NAME="isaaclab_pi0_dsrl_tacfield_tabero_task${TASK_ID}_firm_8gpu_50step"
+    CONFIG_NAME="isaaclab_pi0_dsrl_tacfield_tabero_task${TASK_ID}_firm_8gpu_${TARGET_STEPS}step"
     CONFIG_DIR_REL="examples/embodiment/config"
     ;;
 esac
