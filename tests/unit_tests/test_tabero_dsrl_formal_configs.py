@@ -273,6 +273,33 @@ def test_matrix_launcher_builds_task0_dsrl_60step_command(tmp_path):
     assert metadata.target_global_step == 60
 
 
+def test_matrix_launcher_can_trace_only_the_training_driver(tmp_path):
+    result = _dry_run(
+        tmp_path,
+        0,
+        "--target-steps",
+        "60",
+        env_overrides={"TABERO_TRACE_DRIVER_SIGNALS": "1"},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "/usr/bin/strace -qq -e trace=none" in result.stdout
+    assert "-e signal=SIGTERM\\,SIGINT\\,SIGHUP" in result.stdout
+    assert "driver_signals.log" in result.stdout
+    assert " -f " not in result.stdout
+
+
+def test_matrix_launcher_rejects_invalid_driver_signal_trace_setting(tmp_path):
+    result = _dry_run(
+        tmp_path,
+        0,
+        env_overrides={"TABERO_TRACE_DRIVER_SIGNALS": "yes"},
+    )
+
+    assert result.returncode != 0
+    assert "TABERO_TRACE_DRIVER_SIGNALS must be 0 or 1" in result.stderr
+
+
 def test_matrix_launcher_rejects_task5_dsrl_60step_profile(tmp_path):
     result = _dry_run(tmp_path, 5, "--target-steps", "60")
 

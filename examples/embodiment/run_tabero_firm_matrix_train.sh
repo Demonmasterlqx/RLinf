@@ -31,6 +31,9 @@ RESUME_DIR=""
 RESTORE_ONLY=false
 DRY_RUN=false
 TARGET_STEPS=50
+TRACE_DRIVER_SIGNALS="${TABERO_TRACE_DRIVER_SIGNALS:-0}"
+[[ "${TRACE_DRIVER_SIGNALS}" == "0" || "${TRACE_DRIVER_SIGNALS}" == "1" ]] || \
+  die "TABERO_TRACE_DRIVER_SIGNALS must be 0 or 1"
 while (($#)); do
   case "$1" in
     --target-steps)
@@ -357,6 +360,15 @@ if [[ -n "${RESUME_DIR}" ]]; then
 fi
 if [[ "${RESTORE_ONLY}" == true ]]; then
   command+=("runner.max_epochs=${CHECKPOINT_STEP}" "runner.save_interval=-1")
+fi
+if [[ "${TRACE_DRIVER_SIGNALS}" == "1" ]]; then
+  command=(
+    /usr/bin/strace -qq
+    -e trace=none
+    -e signal=SIGTERM,SIGINT,SIGHUP
+    -o "${OUTPUT_DIR}/driver_signals.log"
+    -- "${command[@]}"
+  )
 fi
 
 {
