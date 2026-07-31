@@ -42,6 +42,7 @@ SMALL4GPU40_CONFIG = "isaaclab_pi0_dsrl_tacfield_tabero_task5_firm_4gpu_40step_s
 SMALL4GPU40_PROFILE = "task5_4gpu_40step_small"
 TASK0_SELECTED_STEP10_PROFILE = "task0_selected_step10"
 TASK0_FORMAL60_PROFILE = "task0_8gpu_60step"
+TASK0_FORMAL60_SELECTED_PROFILE_TEMPLATE = "task0_8gpu_60step_selected_step{step}"
 
 
 def _checkpoint(
@@ -339,6 +340,40 @@ def test_export_accepts_final_task0_8gpu_60step_profile(tmp_path):
     assert manifest["task_id"] == 0
     assert manifest["global_step"] == 60
     assert manifest["is_final"] is True
+    assert manifest["training_config"].endswith("task0_firm_8gpu_60step")
+
+
+@pytest.mark.parametrize("step", [10, 20, 30, 40, 50])
+def test_export_accepts_selected_non_final_task0_8gpu_60step_profiles(
+    tmp_path,
+    step,
+):
+    checkpoint = _checkpoint(
+        tmp_path,
+        task_id=0,
+        step=step,
+        profile="formal60",
+    )
+    base_model = _base_model(tmp_path)
+    base_hash = _write_provenance(
+        checkpoint,
+        base_model,
+        profile="formal60",
+    )
+    output_dir = tmp_path / "bundle"
+
+    manifest = exporter.export_tabero_dsrl_bundle(
+        trainable_checkpoint=checkpoint,
+        output_dir=output_dir,
+        base_model=base_model,
+        expected_base_model_sha256=base_hash,
+        task_id=0,
+        training_profile=TASK0_FORMAL60_SELECTED_PROFILE_TEMPLATE.format(step=step),
+    )
+
+    assert manifest["task_id"] == 0
+    assert manifest["global_step"] == step
+    assert manifest["is_final"] is False
     assert manifest["training_config"].endswith("task0_firm_8gpu_60step")
 
 

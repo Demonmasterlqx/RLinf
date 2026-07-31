@@ -12,6 +12,8 @@ FORMAL_8GPU_50STEP_PROFILE = "formal_8gpu_50step"
 TASK5_4GPU_40STEP_SMALL_PROFILE = "task5_4gpu_40step_small"
 TASK0_SELECTED_STEP10_PROFILE = "task0_selected_step10"
 TASK0_8GPU_60STEP_PROFILE = "task0_8gpu_60step"
+TASK0_8GPU_60STEP_SELECTED_PROFILE_TEMPLATE = "task0_8gpu_60step_selected_step{step}"
+TASK0_8GPU_60STEP_SELECTED_STEPS = (10, 20, 30, 40, 50)
 
 
 @dataclass(frozen=True)
@@ -132,6 +134,21 @@ _PROFILES = {
         ),
     ),
 }
+_task0_60step_profile = _PROFILES[TASK0_8GPU_60STEP_PROFILE]
+for _selected_step in TASK0_8GPU_60STEP_SELECTED_STEPS:
+    _profile_name = TASK0_8GPU_60STEP_SELECTED_PROFILE_TEMPLATE.format(
+        step=_selected_step
+    )
+    _PROFILES[_profile_name] = TaberoDSRLTrainingProfile(
+        name=_profile_name,
+        allowed_task_ids=(0,),
+        global_step=_selected_step,
+        target_global_step=60,
+        is_final=False,
+        actor_world_size=4,
+        training_config_template=_task0_60step_profile.training_config_template,
+        config_requirements=_task0_60step_profile.config_requirements,
+    )
 TABERO_DSRL_TRAINING_PROFILE_CHOICES = tuple(_PROFILES)
 
 
