@@ -1098,6 +1098,9 @@ def test_launcher_public_contract_is_present():
         in launcher
     )
     assert launcher.count('--training-profile "${TRAINING_PROFILE}"') == 3
+    assert "task0_8gpu_60step" in launcher
+    for step in (10, 20, 30, 40, 50):
+        assert f"task0_8gpu_60step_selected_step{step}" in launcher
     assert "CUDA_VISIBLE_DEVICES=0" in launcher
     assert "unset CUDA_VISIBLE_DEVICES" in launcher
     assert "CUDA_DEVICE_ORDER=PCI_BUS_ID" in launcher
@@ -1335,6 +1338,58 @@ def test_launcher_dry_run_accepts_explicit_task5_small4gpu40_profile(
     )
     run_env = (output / "run.env").read_text()
     assert f"TABERO_DSRL_TRAINING_PROFILE={SMALL4GPU40_PROFILE}\n" in run_env
+
+
+@pytest.mark.parametrize(
+    "training_profile",
+    [
+        "task0_8gpu_60step",
+        "task0_8gpu_60step_selected_step10",
+        "task0_8gpu_60step_selected_step20",
+        "task0_8gpu_60step_selected_step30",
+        "task0_8gpu_60step_selected_step40",
+        "task0_8gpu_60step_selected_step50",
+    ],
+)
+def test_launcher_recognizes_task0_60step_profiles_before_preflight(
+    tmp_path,
+    bundle_fixture,
+    training_profile,
+):
+    bundle, base_model, _, _ = bundle_fixture
+    env, _, _ = _launcher_environment(tmp_path, bundle, base_model)
+
+    result = _run_launcher(
+        bundle,
+        5,
+        env,
+        training_profile=training_profile,
+    )
+
+    assert result.returncode != 0
+    assert (
+        f"{training_profile} training profile supports only Task 0" in result.stderr
+    )
+    assert "unsupported --training-profile" not in result.stderr
+
+
+def test_launcher_routes_task0_60step_profile_to_bundle_preflight(
+    tmp_path,
+    bundle_fixture,
+):
+    bundle, base_model, _, _ = bundle_fixture
+    env, _, _ = _launcher_environment(tmp_path, bundle, base_model)
+
+    result = _run_launcher(
+        bundle,
+        0,
+        env,
+        training_profile="task0_8gpu_60step",
+    )
+
+    assert result.returncode != 0
+    assert "global_step must be 60" in result.stderr
+    assert "unsupported --training-profile" not in result.stderr
 
 
 @pytest.mark.parametrize("task_id", [0, 5])

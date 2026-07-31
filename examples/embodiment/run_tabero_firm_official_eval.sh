@@ -9,7 +9,7 @@ readonly MIN_FREE_DISK_KIB=52428800
 
 usage() {
   echo "Usage: $0 dsrl <0|5> formal --dsrl-bundle ABS_PATH --training-profile PROFILE [--dry-run]" >&2
-  echo "Profiles: formal_8gpu_50step | task5_4gpu_40step_small" >&2
+  echo "Profiles: formal_8gpu_50step | task5_4gpu_40step_small | task0_8gpu_60step | task0_8gpu_60step_selected_step{10,20,30,40,50}" >&2
 }
 
 die() {
@@ -57,12 +57,26 @@ while (($#)); do
 done
 [[ -n "${DSRL_BUNDLE}" ]] || die "--dsrl-bundle is required"
 [[ -n "${TRAINING_PROFILE}" ]] || die "--training-profile is required"
-[[ "${TRAINING_PROFILE}" == "formal_8gpu_50step" || \
-   "${TRAINING_PROFILE}" == "task5_4gpu_40step_small" ]] || \
-  die "unsupported --training-profile: ${TRAINING_PROFILE}"
-if [[ "${TRAINING_PROFILE}" == "task5_4gpu_40step_small" && "${TASK_ID}" != "5" ]]; then
-  die "task5_4gpu_40step_small training profile supports only Task 5"
-fi
+case "${TRAINING_PROFILE}" in
+  formal_8gpu_50step)
+    ;;
+  task5_4gpu_40step_small)
+    [[ "${TASK_ID}" == "5" ]] || \
+      die "task5_4gpu_40step_small training profile supports only Task 5"
+    ;;
+  task0_8gpu_60step|\
+  task0_8gpu_60step_selected_step10|\
+  task0_8gpu_60step_selected_step20|\
+  task0_8gpu_60step_selected_step30|\
+  task0_8gpu_60step_selected_step40|\
+  task0_8gpu_60step_selected_step50)
+    [[ "${TASK_ID}" == "0" ]] || \
+      die "${TRAINING_PROFILE} training profile supports only Task 0"
+    ;;
+  *)
+    die "unsupported --training-profile: ${TRAINING_PROFILE}"
+    ;;
+esac
 [[ "${DSRL_BUNDLE}" == /* ]] || die "--dsrl-bundle must be an absolute path"
 [[ -d "${DSRL_BUNDLE}" ]] || die "DSRL bundle must be a directory: ${DSRL_BUNDLE}"
 DSRL_BUNDLE="$(cd "${DSRL_BUNDLE}" && pwd -P)"
