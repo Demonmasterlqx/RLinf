@@ -20,6 +20,13 @@ from omegaconf.errors import InterpolationResolutionError
 
 from rlinf.config import validate_embodied_cfg
 from rlinf.utils.dsrl_observation import DSRL_OBSERVATION_SEMANTICS
+from rlinf.utils.dsrl_replay import (
+    DSRL_REPLAY_BACKEND,
+    DSRL_REPLAY_CAPACITY_TRANSITIONS,
+    DSRL_REPLAY_CHECKPOINT_SHARD_TRANSITIONS,
+    DSRL_REPLAY_MAX_RESIDENT_GIB,
+    DSRL_REPLAY_SEMANTICS,
+)
 from rlinf.utils.dsrl_reward import DSRL_REWARD_SEMANTICS
 
 CONFIG_PATH = (
@@ -108,6 +115,17 @@ def test_dsrl_smoke_runs_one_complete_sac_update(monkeypatch):
     assert cfg.algorithm.gamma == 0.999
     assert cfg.algorithm.dsrl_reward_semantics == DSRL_REWARD_SEMANTICS
     assert cfg.algorithm.dsrl_observation_semantics == DSRL_OBSERVATION_SEMANTICS
+    assert cfg.algorithm.dsrl_replay_semantics == DSRL_REPLAY_SEMANTICS
+    assert cfg.algorithm.replay_buffer.backend == DSRL_REPLAY_BACKEND
+    assert (
+        cfg.algorithm.replay_buffer.capacity_transitions
+        == DSRL_REPLAY_CAPACITY_TRANSITIONS
+    )
+    assert (
+        cfg.algorithm.replay_buffer.checkpoint_shard_transitions
+        == DSRL_REPLAY_CHECKPOINT_SHARD_TRANSITIONS
+    )
+    assert cfg.algorithm.replay_buffer.max_resident_gib == DSRL_REPLAY_MAX_RESIDENT_GIB
     assert cfg.algorithm.tau == 0.005
     assert cfg.algorithm.replay_buffer.min_buffer_size == 1
     assert cfg.algorithm.train_actor_steps == 1
@@ -144,6 +162,42 @@ def test_dsrl_smoke_config_validation_rejects_wrong_observation_semantics(
         cfg.algorithm.dsrl_observation_semantics = semantics
 
     with pytest.raises(ValueError, match="dsrl_observation_semantics"):
+        validate_embodied_cfg(cfg)
+
+
+@pytest.mark.parametrize("semantics", [None, "trajectory_v0"])
+def test_dsrl_smoke_config_validation_rejects_wrong_replay_semantics(
+    monkeypatch,
+    semantics,
+):
+    cfg = _load(monkeypatch)
+    if semantics is None:
+        del cfg.algorithm.dsrl_replay_semantics
+    else:
+        cfg.algorithm.dsrl_replay_semantics = semantics
+
+    with pytest.raises(ValueError, match="dsrl_replay_semantics"):
+        validate_embodied_cfg(cfg)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("backend", "trajectory"),
+        ("capacity_transitions", 99_999),
+        ("checkpoint_shard_transitions", 2048),
+        ("max_resident_gib", 11.0),
+    ],
+)
+def test_dsrl_smoke_config_validation_rejects_wrong_compact_replay_contract(
+    monkeypatch,
+    field,
+    value,
+):
+    cfg = _load(monkeypatch)
+    cfg.algorithm.replay_buffer[field] = value
+
+    with pytest.raises(ValueError, match=field):
         validate_embodied_cfg(cfg)
 
 

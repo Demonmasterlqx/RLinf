@@ -24,6 +24,7 @@ from omegaconf import DictConfig
 from torch.utils.data import DataLoader
 
 from rlinf.config import SupportedModel
+from rlinf.data.dsrl_replay_buffer import CompactDSRLReplayBuffer
 from rlinf.data.embodied_buffer_dataset import (
     PreloadReplayBufferDataset,
     ReplayBufferDataset,
@@ -37,6 +38,7 @@ from rlinf.scheduler import Channel, Worker
 from rlinf.utils import drq
 from rlinf.utils.distributed import all_reduce_dict
 from rlinf.utils.dsrl_checkpoint import (
+    DSRL_TRAINABLE_CHECKPOINT_VERSION,
     DSRL_TRAINABLE_MANIFEST_VERSION,
     DSRL_TRAINABLE_PARAMETER_COUNT,
     build_compact_target_payload,
@@ -46,6 +48,7 @@ from rlinf.utils.dsrl_checkpoint import (
     validate_target_payload_contract,
 )
 from rlinf.utils.dsrl_observation import DSRL_OBSERVATION_SEMANTICS
+from rlinf.utils.dsrl_replay import DSRL_REPLAY_BACKEND, DSRL_REPLAY_SEMANTICS
 from rlinf.utils.dsrl_reward import (
     DSRL_REWARD_SEMANTICS,
     chunk_bootstrap_discount,
@@ -241,24 +244,43 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         """Initialize SAC-specific components"""
         # Initialize replay buffer
         seed = self.cfg.actor.get("seed", 1234)
-        auto_save_path = self.cfg.algorithm.replay_buffer.get("auto_save_path", None)
-        if auto_save_path is None:
-            auto_save_path = os.path.join(
-                self.cfg.runner.logger.log_path, f"replay_buffer/rank_{self._rank}"
+        replay_cfg = self.cfg.algorithm.replay_buffer
+        use_compact_dsrl_replay = (
+            self.use_dsrl
+            and self.cfg.algorithm.get("dsrl_replay_semantics") == DSRL_REPLAY_SEMANTICS
+        )
+        if use_compact_dsrl_replay:
+            if replay_cfg.get("backend") != DSRL_REPLAY_BACKEND:
+                raise ValueError(
+                    "Tabero compact DSRL replay requires backend "
+                    f"{DSRL_REPLAY_BACKEND!r}; got {replay_cfg.get('backend')!r}."
+                )
+            self.replay_buffer = CompactDSRLReplayBuffer(
+                seed=seed,
+                capacity_transitions=replay_cfg.capacity_transitions,
+                checkpoint_shard_transitions=replay_cfg.get(
+                    "checkpoint_shard_transitions", 4096
+                ),
+                max_resident_gib=replay_cfg.get("max_resident_gib", 12.0),
             )
         else:
-            auto_save_path = os.path.join(auto_save_path, f"rank_{self._rank}")
-        self.replay_buffer = TrajectoryReplayBuffer(
-            seed=seed,
-            enable_cache=self.cfg.algorithm.replay_buffer.enable_cache,
-            cache_size=self.cfg.algorithm.replay_buffer.cache_size,
-            sample_window_size=self.cfg.algorithm.replay_buffer.sample_window_size,
-            auto_save=self.cfg.algorithm.replay_buffer.get("auto_save", False),
-            auto_save_path=auto_save_path,
-            trajectory_format=self.cfg.algorithm.replay_buffer.get(
-                "trajectory_format", "pt"
-            ),
-        )
+            auto_save_path = replay_cfg.get("auto_save_path", None)
+            if auto_save_path is None:
+                auto_save_path = os.path.join(
+                    self.cfg.runner.logger.log_path,
+                    f"replay_buffer/rank_{self._rank}",
+                )
+            else:
+                auto_save_path = os.path.join(auto_save_path, f"rank_{self._rank}")
+            self.replay_buffer = TrajectoryReplayBuffer(
+                seed=seed,
+                enable_cache=replay_cfg.enable_cache,
+                cache_size=replay_cfg.cache_size,
+                sample_window_size=replay_cfg.sample_window_size,
+                auto_save=replay_cfg.get("auto_save", False),
+                auto_save_path=auto_save_path,
+                trajectory_format=replay_cfg.get("trajectory_format", "pt"),
+            )
 
         min_demo_buffer_size = 0
         if self.cfg.algorithm.get("demo_buffer", None) is not None:
@@ -391,6 +413,8 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                     "format": "trainable_weights",
                     "reward_semantics": DSRL_REWARD_SEMANTICS,
                     "observation_semantics": DSRL_OBSERVATION_SEMANTICS,
+                    "replay_semantics": DSRL_REPLAY_SEMANTICS,
+                    "checkpoint_version": DSRL_TRAINABLE_CHECKPOINT_VERSION,
                     "manifest_version": DSRL_TRAINABLE_MANIFEST_VERSION,
                     "parameter_count": len(state_dict),
                     "tensor_count": len(state_dict),
@@ -494,6 +518,20 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                 f"expected {DSRL_OBSERVATION_SEMANTICS!r}, got "
                 f"{observation_semantics!r}. Legacy checkpoints cannot be resumed."
             )
+        replay_semantics = payload["metadata"].get("replay_semantics")
+        if replay_semantics != DSRL_REPLAY_SEMANTICS:
+            raise ValueError(
+                "OpenPI DSRL checkpoint replay semantics mismatch: "
+                f"expected {DSRL_REPLAY_SEMANTICS!r}, got "
+                f"{replay_semantics!r}. Legacy checkpoints cannot be resumed."
+            )
+        checkpoint_version = payload["metadata"].get("checkpoint_version")
+        if checkpoint_version != DSRL_TRAINABLE_CHECKPOINT_VERSION:
+            raise ValueError(
+                "OpenPI DSRL trainable checkpoint version mismatch: expected "
+                f"{DSRL_TRAINABLE_CHECKPOINT_VERSION}, got "
+                f"{checkpoint_version!r}. Legacy checkpoints cannot be resumed."
+            )
         manifest_version = payload["metadata"].get("manifest_version")
         if manifest_version != DSRL_TRAINABLE_MANIFEST_VERSION:
             raise ValueError(
@@ -501,6 +539,16 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                 f"expected {DSRL_TRAINABLE_MANIFEST_VERSION}, got "
                 f"{manifest_version!r}. Legacy checkpoints cannot be resumed."
             )
+        replay_path = os.path.join(
+            load_path,
+            "sac_components",
+            "replay_buffer",
+            f"rank_{self._rank}",
+        )
+        CompactDSRLReplayBuffer.validate_checkpoint_metadata(
+            replay_path,
+            expected_capacity=self.cfg.algorithm.replay_buffer.capacity_transitions,
+        )
         target_path = os.path.join(
             load_path,
             "sac_components",

@@ -147,6 +147,28 @@ def test_dsrl_dual_camera_preprocessing_preserves_main_wrist_order_and_range():
     assert torch.equal(images[:, 1], torch.full_like(images[:, 1], 1.0))
 
 
+def test_dsrl_compact_replay_observation_matches_raw_actor_and_critic_inputs():
+    torch.manual_seed(19)
+    model = _runtime_model(use_tactile=True, num_images=2)
+    raw_obs = _obs(include_wrist=True)
+    normalized = model._normalize_dsrl_obs(raw_obs)
+    compact_obs = {
+        "dsrl_images": model._preprocess_dsrl_images(normalized["images"]).to(
+            torch.bfloat16
+        ),
+        "states": raw_obs["states"].to(torch.bfloat16),
+        "tactile_marker_motion": raw_obs["tactile_marker_motion"].to(torch.bfloat16),
+    }
+
+    raw_actions, _, _ = model.sac_forward(raw_obs, mode="eval")
+    compact_actions, _, _ = model.sac_forward(compact_obs, mode="eval")
+    raw_q = model.sac_q_forward(raw_obs, actions=raw_actions)
+    compact_q = model.sac_q_forward(compact_obs, actions=raw_actions[:, 0, :])
+
+    torch.testing.assert_close(raw_actions, compact_actions, rtol=2e-3, atol=2e-5)
+    torch.testing.assert_close(raw_q, compact_q, rtol=2e-2, atol=2e-4)
+
+
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [
@@ -251,6 +273,26 @@ def test_dsrl_drq_uses_independent_crop_offsets_for_main_and_wrist(monkeypatch):
     assert augmented["main_images"].shape == pixels.shape
     assert augmented["wrist_images"].shape == pixels.shape
     assert not torch.equal(augmented["main_images"], augmented["wrist_images"])
+
+
+def test_dsrl_drq_compact_views_use_independent_crop_offsets(monkeypatch):
+    offsets = iter(((0, 8), (0, 8)))
+
+    def fake_randint(_low, _high, size, *, device):
+        return torch.tensor(next(offsets), dtype=torch.long, device=device).reshape(
+            size
+        )
+
+    monkeypatch.setattr(torch, "randint", fake_randint)
+    pixels = torch.arange(8 * 8, dtype=torch.bfloat16).reshape(1, 1, 1, 8, 8)
+    pixels = pixels.expand(-1, 2, 3, -1, -1).contiguous()
+
+    augmented = apply_drq({"dsrl_images": pixels.clone()}, pad=4)
+
+    assert augmented["dsrl_images"].shape == pixels.shape
+    assert not torch.equal(
+        augmented["dsrl_images"][:, 0], augmented["dsrl_images"][:, 1]
+    )
 
 
 def test_dsrl_replay_round_trip_preserves_wrist_and_feeds_actor_and_critic():
@@ -396,6 +438,7 @@ def test_predict_action_batch_sends_tacfield_to_prefix_and_dsrl_paths():
         return torch.zeros(2, 2, 32), torch.zeros(2), None
 
     def sample_actions(self, observation, **kwargs):
+        captured["sample_kwargs"] = kwargs
         return {
             "actions": torch.zeros(2, 2, 13),
             "chains": torch.zeros(2, 2, 2, 32),
@@ -414,12 +457,17 @@ def test_predict_action_batch_sends_tacfield_to_prefix_and_dsrl_paths():
     )
     model.output_transform = MethodType(lambda self, outputs: outputs, model)
 
-    model.predict_action_batch(env_obs)
+    _, result = model.predict_action_batch(env_obs)
 
     assert captured["prefix_obs"]["tactile_marker_motion"] is tactile
     assert captured["dsrl_obs"]["tactile_marker_motion"] is tactile
     assert captured["dsrl_obs"]["images"][0] is env_obs["main_images"]
     assert captured["dsrl_obs"]["images"][1] is env_obs["wrist_images"]
+    assert captured["sample_kwargs"]["collect_forward_metadata"] is False
+    assert captured["sample_kwargs"]["compute_values"] is False
+    assert set(result["forward_inputs"]) == {"action"}
+    assert result["forward_inputs"]["action"].shape == (2, 32)
+    assert result["prev_values"] is None
 
 
 @pytest.mark.parametrize(

@@ -25,12 +25,20 @@ from omegaconf import OmegaConf
 from safetensors.torch import load_file, save_file
 
 from rlinf.utils.dsrl_checkpoint import (
+    DSRL_TRAINABLE_CHECKPOINT_VERSION,
     DSRL_TRAINABLE_MANIFEST_V2,
     DSRL_TRAINABLE_MANIFEST_VERSION,
     DSRL_TRAINABLE_PARAMETER_COUNT,
     DSRL_TRAINABLE_TENSOR_COUNT,
 )
 from rlinf.utils.dsrl_observation import DSRL_OBSERVATION_SEMANTICS
+from rlinf.utils.dsrl_replay import (
+    DSRL_REPLAY_BACKEND,
+    DSRL_REPLAY_CAPACITY_TRANSITIONS,
+    DSRL_REPLAY_CHECKPOINT_SHARD_TRANSITIONS,
+    DSRL_REPLAY_MAX_RESIDENT_GIB,
+    DSRL_REPLAY_SEMANTICS,
+)
 from rlinf.utils.dsrl_reward import DSRL_REWARD_SEMANTICS
 from rlinf.utils.dsrl_rollout_sync import (
     DSRL_ROLLOUT_SYNC_MANIFEST_V2,
@@ -223,6 +231,16 @@ def _validate_metadata(
             "selected DSRL checkpoint observation_semantics must be "
             f"{DSRL_OBSERVATION_SEMANTICS!r}"
         )
+    if metadata.get("replay_semantics") != DSRL_REPLAY_SEMANTICS:
+        raise ValueError(
+            "selected DSRL checkpoint replay_semantics must be "
+            f"{DSRL_REPLAY_SEMANTICS!r}"
+        )
+    _require_strict_int(
+        metadata.get("checkpoint_version"),
+        DSRL_TRAINABLE_CHECKPOINT_VERSION,
+        "checkpoint_version",
+    )
     _require_strict_int(
         metadata.get("manifest_version"),
         DSRL_TRAINABLE_MANIFEST_VERSION,
@@ -360,6 +378,20 @@ def _validate_config_snapshot(
     require_value("actor.model.openpi.dsrl_action_noise_dim", 32)
     require_value("algorithm.dsrl_reward_semantics", DSRL_REWARD_SEMANTICS)
     require_value("algorithm.dsrl_observation_semantics", DSRL_OBSERVATION_SEMANTICS)
+    require_value("algorithm.dsrl_replay_semantics", DSRL_REPLAY_SEMANTICS)
+    require_value("algorithm.replay_buffer.backend", DSRL_REPLAY_BACKEND)
+    require_value(
+        "algorithm.replay_buffer.capacity_transitions",
+        DSRL_REPLAY_CAPACITY_TRANSITIONS,
+    )
+    require_value(
+        "algorithm.replay_buffer.checkpoint_shard_transitions",
+        DSRL_REPLAY_CHECKPOINT_SHARD_TRANSITIONS,
+    )
+    require_value(
+        "algorithm.replay_buffer.max_resident_gib",
+        DSRL_REPLAY_MAX_RESIDENT_GIB,
+    )
     require_value("actor.model.openpi.dsrl_num_images", 2)
 
     logger_backends = OmegaConf.select(

@@ -93,6 +93,7 @@ def apply_drq(obs, pad=4):
       - "main_images": main camera images
       - "wrist_images": optional wrist camera images
       - "extra_view_images": optional multi-view images
+      - "dsrl_images": optional compact [B,2,3,64,64] replay images
 
     Args:
         obs (dict): Observation dictionary.
@@ -110,5 +111,15 @@ def apply_drq(obs, pad=4):
 
     if obs.get("extra_view_images", None) is not None:
         obs["extra_view_images"] = drq_crop_extra(obs["extra_view_images"], pad=pad)
+
+    if obs.get("dsrl_images", None) is not None:
+        if any(
+            obs.get(key, None) is not None
+            for key in ("main_images", "wrist_images", "extra_view_images")
+        ):
+            raise ValueError(
+                "dsrl_images cannot be augmented together with raw image fields."
+            )
+        obs["dsrl_images"] = drq_crop_extra(obs["dsrl_images"], pad=pad)
 
     return obs

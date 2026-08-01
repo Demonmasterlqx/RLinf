@@ -62,6 +62,7 @@ algorithm:
   gamma: 0.999
   dsrl_reward_semantics: discounted_alive_masked_v1
   dsrl_observation_semantics: main_wrist_shared_encoder_concat_v1
+  dsrl_replay_semantics: main_wrist_bf16_64_transition_ring_v1
   tau: 0.005
   entropy_tuning:
     alpha_type: softplus
@@ -72,11 +73,11 @@ algorithm:
       lr_scheduler: torch_constant
       clip_grad: 10.0
   replay_buffer:
-    enable_cache: True
-    cache_size: 1024
-    sample_window_size: 1024
+    backend: compact_dsrl_ring
+    capacity_transitions: 100000
+    checkpoint_shard_transitions: 4096
+    max_resident_gib: 12.0
     min_buffer_size: 1
-    auto_save: False
   target_update_freq: 1
   target_update_type: all
   train_actor_steps: 1

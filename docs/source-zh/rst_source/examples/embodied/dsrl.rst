@@ -144,6 +144,28 @@ DSRL 使用与 Pi0 相同的环境和模型依赖。请参考 :doc:`pi0` 获取�
        total_num_envs: 500
        use_step_penalty: True
 
+**2.4 Tabero 触觉 Replay 契约**
+
+Tabero 触觉 DSRL 使用每个 rank 独立的有界 transition ring。观测进入 replay
+前即完成投影：主相机与腕部相机分别缩放到 64×64，并按固定顺序保存为一个
+``[2, 3, 64, 64]`` bfloat16 张量。state、触觉 marker motion 和单个 32 维
+SAC latent action 同样保存为 bfloat16；十个 primitive reward 保持 float32，
+done 字段保持布尔类型。冻结 Pi0 的 diffusion chain、token、model action 以及
+256×256 原图均不会写入 replay。
+
+.. code:: yaml
+
+   algorithm:
+     dsrl_replay_semantics: main_wrist_bf16_64_transition_ring_v1
+     replay_buffer:
+       backend: compact_dsrl_ring
+       capacity_transitions: 100000
+       checkpoint_shard_transitions: 4096
+       max_resident_gib: 12.0
+
+ring checkpoint 按 shard 串行写入。上述语义属于 resume/export 的前置校验
+契约；旧 trajectory replay checkpoint 会在恢复 model 或 optimizer 前被拒绝。
+
 **3. 启动命令**
 
 ::

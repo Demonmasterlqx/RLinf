@@ -145,6 +145,30 @@ Run It
        total_num_envs: 500
        use_step_penalty: True
 
+**2.4 Tabero Tactile Replay Contract**
+
+Tabero tactile DSRL uses a bounded, rank-local transition ring. The rollout
+worker projects each observation before it enters replay: main and wrist RGB
+images are independently resized to 64×64 and stored as one ordered
+``[2, 3, 64, 64]`` bfloat16 tensor. State, tactile marker motion and the single
+32-dimensional latent SAC action are also stored in bfloat16; ten primitive
+rewards remain float32 and done flags remain boolean. Frozen-Pi0 diffusion
+chains, tokens, model actions and raw 256×256 images are not replay fields.
+
+.. code:: yaml
+
+   algorithm:
+     dsrl_replay_semantics: main_wrist_bf16_64_transition_ring_v1
+     replay_buffer:
+       backend: compact_dsrl_ring
+       capacity_transitions: 100000
+       checkpoint_shard_transitions: 4096
+       max_resident_gib: 12.0
+
+The ring checkpoint is written one shard at a time. These semantics are part of
+the resume/export preflight contract; legacy trajectory replay checkpoints are
+rejected before model or optimizer restore.
+
 **3. Launch Command**
 
 ::

@@ -16,11 +16,19 @@ from safetensors.torch import load_file
 
 from rlinf.utils.ckpt_convertor import export_tabero_dsrl_for_t2vla as exporter
 from rlinf.utils.dsrl_checkpoint import (
+    DSRL_TRAINABLE_CHECKPOINT_VERSION,
     DSRL_TRAINABLE_MANIFEST_V2,
     DSRL_TRAINABLE_PARAMETER_COUNT,
     DSRL_TRAINABLE_TENSOR_COUNT,
 )
 from rlinf.utils.dsrl_observation import DSRL_OBSERVATION_SEMANTICS
+from rlinf.utils.dsrl_replay import (
+    DSRL_REPLAY_BACKEND,
+    DSRL_REPLAY_CAPACITY_TRANSITIONS,
+    DSRL_REPLAY_CHECKPOINT_SHARD_TRANSITIONS,
+    DSRL_REPLAY_MAX_RESIDENT_GIB,
+    DSRL_REPLAY_SEMANTICS,
+)
 from rlinf.utils.dsrl_reward import DSRL_REWARD_SEMANTICS
 from rlinf.utils.dsrl_rollout_sync import (
     DSRL_ROLLOUT_SYNC_MANIFEST_V2,
@@ -93,6 +101,8 @@ def _checkpoint(
         "method": "dsrl",
         "reward_semantics": DSRL_REWARD_SEMANTICS,
         "observation_semantics": DSRL_OBSERVATION_SEMANTICS,
+        "replay_semantics": DSRL_REPLAY_SEMANTICS,
+        "checkpoint_version": DSRL_TRAINABLE_CHECKPOINT_VERSION,
         "manifest_version": 2,
         "task_id": task_id,
         "training_config": profile_metadata["training_config"],
@@ -142,6 +152,15 @@ def _formal_config(task_id, base_model, *, profile="formal"):
             "gamma": 0.999,
             "dsrl_reward_semantics": DSRL_REWARD_SEMANTICS,
             "dsrl_observation_semantics": DSRL_OBSERVATION_SEMANTICS,
+            "dsrl_replay_semantics": DSRL_REPLAY_SEMANTICS,
+            "replay_buffer": {
+                "backend": DSRL_REPLAY_BACKEND,
+                "capacity_transitions": DSRL_REPLAY_CAPACITY_TRANSITIONS,
+                "checkpoint_shard_transitions": (
+                    DSRL_REPLAY_CHECKPOINT_SHARD_TRANSITIONS
+                ),
+                "max_resident_gib": DSRL_REPLAY_MAX_RESIDENT_GIB,
+            },
             "tau": 0.005,
         },
         "env": {
@@ -195,10 +214,8 @@ def _formal_config(task_id, base_model, *, profile="formal"):
                 "env": "0-1",
             }
         }
-        config["algorithm"].update(
-            train_actor_steps=10,
-            replay_buffer={"min_buffer_size": 5},
-        )
+        config["algorithm"].update(train_actor_steps=10)
+        config["algorithm"]["replay_buffer"]["min_buffer_size"] = 5
         config["env"]["train"].update(
             max_steps_per_rollout_epoch=360,
             max_episode_steps=360,
@@ -515,6 +532,8 @@ def test_export_accepts_final_task5_small4gpu40_profile(tmp_path):
         ({"method": "pirl"}, "method"),
         ({"reward_semantics": None}, "reward_semantics"),
         ({"observation_semantics": None}, "observation_semantics"),
+        ({"replay_semantics": None}, "replay_semantics"),
+        ({"checkpoint_version": 2}, "checkpoint_version"),
         ({"manifest_version": 1}, "manifest_version"),
         ({"task_id": 0}, "task_id"),
         ({"step": 39}, "step"),
@@ -582,6 +601,11 @@ def test_export_rejects_wrong_small4gpu40_metadata(
         ("algorithm.update_epoch", 200),
         ("algorithm.dsrl_reward_semantics", "legacy"),
         ("algorithm.dsrl_observation_semantics", "single_camera_v1"),
+        ("algorithm.dsrl_replay_semantics", "trajectory_v0"),
+        ("algorithm.replay_buffer.backend", "trajectory"),
+        ("algorithm.replay_buffer.capacity_transitions", 99_999),
+        ("algorithm.replay_buffer.checkpoint_shard_transitions", 2048),
+        ("algorithm.replay_buffer.max_resident_gib", 16.0),
         ("actor.model.openpi.dsrl_num_images", 1),
         ("algorithm.replay_buffer.min_buffer_size", 10),
         ("algorithm.train_actor_steps", 9),
@@ -778,6 +802,8 @@ def test_export_rejects_non_allowlisted_selected_checkpoint_paths(
     [
         ({"method": "pirl"}, "method"),
         ({"observation_semantics": "single_camera_v1"}, "observation_semantics"),
+        ({"replay_semantics": "trajectory_v0"}, "replay_semantics"),
+        ({"checkpoint_version": 2}, "checkpoint_version"),
         ({"manifest_version": 1}, "manifest_version"),
         ({"task_id": 5}, "task"),
         ({"step": 40}, "step"),
@@ -903,6 +929,11 @@ def test_export_rejects_config_snapshot_for_other_task(tmp_path):
         ("algorithm.update_epoch", 199),
         ("algorithm.gamma", 0.99),
         ("algorithm.dsrl_observation_semantics", "single_camera_v1"),
+        ("algorithm.dsrl_replay_semantics", "trajectory_v0"),
+        ("algorithm.replay_buffer.backend", "trajectory"),
+        ("algorithm.replay_buffer.capacity_transitions", 99_999),
+        ("algorithm.replay_buffer.checkpoint_shard_transitions", 2048),
+        ("algorithm.replay_buffer.max_resident_gib", 16.0),
         ("algorithm.tau", 0.01),
         ("actor.rollout_sync_prefixes", ["dsrl_action_noise_net."]),
         ("actor.model.openpi.use_dsrl", False),

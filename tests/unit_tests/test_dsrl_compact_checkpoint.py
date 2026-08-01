@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 from copy import deepcopy
 from math import prod
 from types import SimpleNamespace
@@ -22,15 +23,18 @@ from omegaconf import OmegaConf
 from torch import nn
 
 import rlinf.workers.actor.fsdp_sac_policy_worker as sac_worker_module
+from rlinf.data.dsrl_replay_buffer import CompactDSRLReplayBuffer
 from rlinf.models.embodiment.openpi.openpi_action_model import (
     OpenPi0ForRLActionPrediction,
 )
 from rlinf.utils.dsrl_checkpoint import (
+    DSRL_TRAINABLE_CHECKPOINT_VERSION,
     DSRL_TRAINABLE_MANIFEST_V2,
     restore_target_payload,
     select_dsrl_trainable_state,
 )
 from rlinf.utils.dsrl_observation import DSRL_OBSERVATION_SEMANTICS
+from rlinf.utils.dsrl_replay import DSRL_REPLAY_FIELD_SPECS, DSRL_REPLAY_SEMANTICS
 from rlinf.utils.dsrl_reward import DSRL_REWARD_SEMANTICS
 from rlinf.utils.dsrl_rollout_sync import (
     DSRL_ROLLOUT_SYNC_MANIFEST_V2,
@@ -107,7 +111,10 @@ def _worker(*, use_dsrl=True, compact=True, save_trainable=False):
                     "save_trainable_model_weights": save_trainable,
                 },
             },
-            "algorithm": {"tau": 0.005},
+            "algorithm": {
+                "tau": 0.005,
+                "replay_buffer": {"capacity_transitions": 8},
+            },
         }
     )
     if use_dsrl and compact:
@@ -179,6 +186,8 @@ def _write_reward_semantics_sidecar(
     *,
     semantics=DSRL_REWARD_SEMANTICS,
     observation_semantics=DSRL_OBSERVATION_SEMANTICS,
+    replay_semantics=DSRL_REPLAY_SEMANTICS,
+    checkpoint_version=DSRL_TRAINABLE_CHECKPOINT_VERSION,
     manifest_version=2,
 ):
     sidecar = base_path / "model_state_dict" / "trainable_weights.pt"
@@ -189,12 +198,33 @@ def _write_reward_semantics_sidecar(
             "metadata": {
                 "reward_semantics": semantics,
                 "observation_semantics": observation_semantics,
+                "replay_semantics": replay_semantics,
+                "checkpoint_version": checkpoint_version,
                 "manifest_version": manifest_version,
             },
         },
         sidecar,
     )
     return sidecar
+
+
+def _write_compact_replay_metadata(base_path, *, rank=0, samples=0):
+    replay = CompactDSRLReplayBuffer(
+        seed=1,
+        capacity_transitions=8,
+        checkpoint_shard_transitions=2,
+        max_resident_gib=0.01,
+    )
+    if samples:
+        replay._append_flat(
+            {
+                name: torch.zeros((samples, *shape), dtype=dtype)
+                for name, (shape, dtype) in DSRL_REPLAY_FIELD_SPECS.items()
+            }
+        )
+    replay_path = base_path / "sac_components" / "replay_buffer" / f"rank_{rank}"
+    replay.save_checkpoint(str(replay_path))
+    return replay_path
 
 
 def _critic_named_parameters(model):
@@ -216,6 +246,7 @@ def _save_compact_target(tmp_path, distributed):
 
     worker.save_checkpoint(str(tmp_path), step=17)
     _write_reward_semantics_sidecar(tmp_path)
+    _write_compact_replay_metadata(tmp_path)
     payload = torch.load(_target_path(tmp_path), map_location="cpu", weights_only=True)
     return worker, payload
 
@@ -530,6 +561,11 @@ def test_dsrl_sidecar_saves_exact_direct_trainable_manifest(tmp_path, distribute
     assert payload["metadata"]["tensor_count"] == 220
     assert payload["metadata"]["total_parameter_count"] == 5_273_866
     assert payload["metadata"]["reward_semantics"] == DSRL_REWARD_SEMANTICS
+    assert payload["metadata"]["observation_semantics"] == DSRL_OBSERVATION_SEMANTICS
+    assert payload["metadata"]["replay_semantics"] == DSRL_REPLAY_SEMANTICS
+    assert (
+        payload["metadata"]["checkpoint_version"] == DSRL_TRAINABLE_CHECKPOINT_VERSION
+    )
     assert payload["metadata"]["global_step"] == 50
     assert payload["metadata"]["is_final"] is True
     assert distributed.gathers == [None]
@@ -877,6 +913,42 @@ def test_compact_dsrl_resume_rejects_wrong_observation_semantics_before_any_rest
     assert worker.replay_buffer.total_samples == 0
 
 
+@pytest.mark.parametrize("replay_semantics", [None, "trajectory_v0"])
+def test_compact_dsrl_resume_rejects_wrong_replay_semantics_before_any_restore(
+    tmp_path,
+    replay_semantics,
+):
+    worker = _worker()
+    _write_reward_semantics_sidecar(
+        tmp_path,
+        replay_semantics=replay_semantics,
+    )
+
+    with pytest.raises(ValueError, match="replay semantics mismatch"):
+        worker.load_checkpoint(str(tmp_path))
+
+    assert worker._strategy.load_calls == []
+    assert worker.replay_buffer.total_samples == 0
+
+
+@pytest.mark.parametrize("checkpoint_version", [None, 2])
+def test_compact_dsrl_resume_rejects_old_trainable_checkpoint_version(
+    tmp_path,
+    checkpoint_version,
+):
+    worker = _worker()
+    _write_reward_semantics_sidecar(
+        tmp_path,
+        checkpoint_version=checkpoint_version,
+    )
+
+    with pytest.raises(ValueError, match="trainable checkpoint version mismatch"):
+        worker.load_checkpoint(str(tmp_path))
+
+    assert worker._strategy.load_calls == []
+    assert worker.replay_buffer.total_samples == 0
+
+
 @pytest.mark.parametrize("manifest_version", [None, 1])
 def test_compact_dsrl_resume_rejects_wrong_manifest_version_before_any_restore(
     tmp_path,
@@ -895,9 +967,56 @@ def test_compact_dsrl_resume_rejects_wrong_manifest_version_before_any_restore(
     assert worker.replay_buffer.total_samples == 0
 
 
+def test_compact_dsrl_resume_rejects_missing_replay_before_any_restore(tmp_path):
+    worker = _worker()
+    _write_reward_semantics_sidecar(tmp_path)
+
+    with pytest.raises(FileNotFoundError, match="replay metadata not found"):
+        worker.load_checkpoint(str(tmp_path))
+
+    assert worker._strategy.load_calls == []
+    assert worker.replay_buffer.total_samples == 0
+
+
+@pytest.mark.parametrize(
+    ("corruption", "message"),
+    [
+        ("missing_shard", "shard not found"),
+        ("truncated_shard", "shard size mismatch"),
+        ("wrong_sample_count", "sample count mismatch"),
+    ],
+)
+def test_compact_dsrl_resume_rejects_corrupt_replay_shards_before_any_restore(
+    tmp_path,
+    corruption,
+    message,
+):
+    worker = _worker()
+    _write_reward_semantics_sidecar(tmp_path)
+    replay_path = _write_compact_replay_metadata(tmp_path, samples=3)
+    first_shard = replay_path / "shard_00000.pt"
+
+    if corruption == "missing_shard":
+        first_shard.unlink()
+    elif corruption == "truncated_shard":
+        first_shard.write_bytes(first_shard.read_bytes()[:32])
+    else:
+        metadata_path = replay_path / "metadata.json"
+        metadata = json.loads(metadata_path.read_text())
+        metadata["shards"][0]["num_samples"] += 1
+        metadata_path.write_text(json.dumps(metadata))
+
+    with pytest.raises((FileNotFoundError, ValueError), match=message):
+        worker.load_checkpoint(str(tmp_path))
+
+    assert worker._strategy.load_calls == []
+    assert worker.replay_buffer.total_samples == 0
+
+
 def test_compact_dsrl_resume_rejects_old_target_version_before_any_restore(tmp_path):
     worker = _worker()
     _write_reward_semantics_sidecar(tmp_path)
+    _write_compact_replay_metadata(tmp_path)
     target_path = _target_path(tmp_path)
     target_path.parent.mkdir(parents=True)
     torch.save(
@@ -935,6 +1054,7 @@ def test_high_level_checkpoint_preserves_component_calls(tmp_path, distributed, 
 
     worker.save_checkpoint(str(tmp_path), step=3)
     _write_reward_semantics_sidecar(tmp_path)
+    _write_compact_replay_metadata(tmp_path, rank=rank)
     receipt = worker.load_checkpoint(str(tmp_path))
 
     assert len(worker._strategy.save_calls) == 2

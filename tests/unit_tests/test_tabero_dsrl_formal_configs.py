@@ -13,6 +13,13 @@ import pytest
 from omegaconf import OmegaConf
 
 from rlinf.utils.dsrl_observation import DSRL_OBSERVATION_SEMANTICS
+from rlinf.utils.dsrl_replay import (
+    DSRL_REPLAY_BACKEND,
+    DSRL_REPLAY_CAPACITY_TRANSITIONS,
+    DSRL_REPLAY_CHECKPOINT_SHARD_TRANSITIONS,
+    DSRL_REPLAY_MAX_RESIDENT_GIB,
+    DSRL_REPLAY_SEMANTICS,
+)
 from rlinf.utils.dsrl_reward import DSRL_REWARD_SEMANTICS
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -61,6 +68,24 @@ def test_formal_dsrl_configs_preserve_training_contract(monkeypatch, task_id):
     assert cfg.algorithm.gamma == 0.999
     assert cfg.algorithm.dsrl_reward_semantics == DSRL_REWARD_SEMANTICS
     assert cfg.algorithm.dsrl_observation_semantics == DSRL_OBSERVATION_SEMANTICS
+    assert cfg.algorithm.dsrl_replay_semantics == DSRL_REPLAY_SEMANTICS
+    assert cfg.algorithm.replay_buffer.backend == DSRL_REPLAY_BACKEND
+    assert (
+        cfg.algorithm.replay_buffer.capacity_transitions
+        == DSRL_REPLAY_CAPACITY_TRANSITIONS
+    )
+    assert (
+        cfg.algorithm.replay_buffer.checkpoint_shard_transitions
+        == DSRL_REPLAY_CHECKPOINT_SHARD_TRANSITIONS
+    )
+    assert cfg.algorithm.replay_buffer.max_resident_gib == DSRL_REPLAY_MAX_RESIDENT_GIB
+    for legacy_field in (
+        "enable_cache",
+        "cache_size",
+        "sample_window_size",
+        "auto_save",
+    ):
+        assert legacy_field not in cfg.algorithm.replay_buffer
     assert cfg.algorithm.tau == 0.005
     assert cfg.algorithm.entropy_tuning.target_entropy == -16
     assert cfg.actor.optim.lr == 1.0e-4

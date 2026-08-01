@@ -1223,7 +1223,8 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 observation,
                 noise=noise_actions,
                 mode="eval",
-                compute_values=compute_values,
+                compute_values=False,
+                collect_forward_metadata=False,
             )
 
             # Step 3: Extract actual actions for environment interaction
@@ -1234,8 +1235,16 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             # Return actual actions to environment, but forward_inputs stores noise.
             actions = real_actions
             prev_logprobs = noise_logprob  # SAC noise logprob
-            prev_values = outputs.get("prev_values")
-            forward_action = noise_actions  # Used for SAC training
+            # SAC only needs one 32D latent. GaussianPolicy repeats that latent
+            # over the 50-step Pi0 horizon for diffusion, but replay must not
+            # retain 50 identical copies or any frozen-Pi0 intermediates.
+            forward_inputs = {"action": noise_actions[:, 0, :].detach().contiguous()}
+            result = {
+                "prev_logprobs": prev_logprobs,
+                "prev_values": None,
+                "forward_inputs": forward_inputs,
+            }
+            return actions, result
 
         else:
             # Non-DSRL or eval mode
@@ -1247,7 +1256,6 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             )["actions"]
             prev_logprobs = outputs["prev_logprobs"]
             prev_values = outputs["prev_values"]
-            forward_action = None
 
         forward_inputs = {
             "chains": outputs["chains"],
@@ -1262,9 +1270,6 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             .reshape(outputs["actions"].shape[0], -1)
             .contiguous(),
         }
-        if forward_action is not None:
-            forward_inputs["action"] = forward_action
-
         if self.config.is_nft:
             nft_outputs = {
                 key: value for key, value in outputs.items() if key.startswith("nft_")
@@ -1291,6 +1296,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         noise=None,
         mode="train",
         compute_values=True,
+        collect_forward_metadata=True,
     ) -> torch.Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
         bsize = observation.state.shape[0]
@@ -1318,6 +1324,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             noise=noise,
             mode=mode,
             compute_values=compute_values,
+            collect_forward_metadata=collect_forward_metadata,
         )
 
     def _sample_actions_with_prefix_cache(
@@ -1329,6 +1336,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         noise=None,
         mode="train",
         compute_values=True,
+        collect_forward_metadata=True,
     ) -> torch.Tensor:
         bsize = state.shape[0]
         device = state.device
@@ -1345,12 +1353,13 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         chains = []
         log_probs = []
         values = []
-        chains.append(x_t)
+        if collect_forward_metadata:
+            chains.append(x_t)
 
         # add value based on the vlm for pi05, expert for pi0
-        if self.use_vlm_value:
+        if collect_forward_metadata and self.use_vlm_value:
             values_vlm = self.get_value_from_vlm(prefix_output)
-        if self.config.joint_logprob:
+        if collect_forward_metadata and self.config.joint_logprob:
             initial_log_prob = self.get_logprob_norm(
                 x_t, torch.zeros_like(noise), torch.ones_like(noise)
             )
@@ -1400,12 +1409,14 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             # Euler step - use new tensor assignment instead of in-place operation
             x_t = x_t_mean + self.sample_noise(x_t.shape, device) * x_t_std
             self._update_nft_state(nft_state, idx, x_t_prev, v_t, x_t, sample_method)
-            log_prob = self.get_logprob_norm(x_t, x_t_mean, x_t_std)
-            # store
-            values.append(value_t)
-            chains.append(x_t)
-            log_probs.append(log_prob)
+            if collect_forward_metadata:
+                log_prob = self.get_logprob_norm(x_t, x_t_mean, x_t_std)
+                values.append(value_t)
+                chains.append(x_t)
+                log_probs.append(log_prob)
         x_0 = x_t
+        if not collect_forward_metadata:
+            return {"actions": x_0}
         chains = torch.stack(chains, dim=1)
         # post process for logprob
         log_probs = torch.stack(log_probs, dim=1)[
@@ -1834,7 +1845,43 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             raise ValueError(
                 f"OpenPI DSRL dsrl_num_images must be 1 or 2; got {num_images}."
             )
-        if "images" in obs:
+        if "dsrl_images" in obs:
+            if "images" in obs or "main_images" in obs or "wrist_images" in obs:
+                raise ValueError(
+                    "OpenPI DSRL compact replay observation cannot mix "
+                    "'dsrl_images' with raw image fields."
+                )
+            compact_images = obs["dsrl_images"]
+            expected_shape = (
+                int(obs["states"].shape[0]),
+                num_images,
+                3,
+                64,
+                64,
+            )
+            if (
+                not torch.is_tensor(compact_images)
+                or tuple(compact_images.shape) != expected_shape
+            ):
+                actual = (
+                    tuple(compact_images.shape)
+                    if hasattr(compact_images, "shape")
+                    else None
+                )
+                raise ValueError(
+                    "OpenPI DSRL compact replay images expected shape "
+                    f"{expected_shape}; got {actual}."
+                )
+            if compact_images.dtype != torch.bfloat16:
+                raise ValueError(
+                    "OpenPI DSRL compact replay images must use bfloat16; "
+                    f"got {compact_images.dtype}."
+                )
+            normalized = {
+                "dsrl_images": compact_images,
+                "states": obs["states"],
+            }
+        elif "images" in obs:
             normalized = dict(obs)
         else:
             if "main_images" not in obs:
@@ -1856,8 +1903,18 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             }
         if "tactile_marker_motion" in obs:
             normalized["tactile_marker_motion"] = obs["tactile_marker_motion"]
-        self._validate_dsrl_image_views(normalized["images"], normalized.get("states"))
+        if "dsrl_images" not in normalized:
+            self._validate_dsrl_image_views(
+                normalized["images"], normalized.get("states")
+            )
         return normalized
+
+    def _prepare_dsrl_images(self, obs, *, train=False):
+        """Return raw or replay-preprocessed image views in model input format."""
+
+        if "dsrl_images" in obs:
+            return obs["dsrl_images"]
+        return self._preprocess_dsrl_images(obs["images"], train=train)
 
     def _validate_dsrl_image_views(self, images, states=None):
         num_images = int(getattr(self.config, "dsrl_num_images", 1))
@@ -1972,7 +2029,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
 
         # Preprocess ordered image views independently.
         # Returns [B, N, C, 64, 64] in [-1, 1] range (float32).
-        images = self._preprocess_dsrl_images(obs["images"], train=train)
+        images = self._prepare_dsrl_images(obs, train=train)
         states = self._preprocess_states(obs["states"])
 
         # Move to the same device as actor encoders, convert to bfloat16
@@ -2048,7 +2105,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
 
         # Preprocess ordered image views independently.
         # Returns [B, N, C, 64, 64] in [-1, 1] range (float32).
-        images = self._preprocess_dsrl_images(obs["images"], train=train)
+        images = self._prepare_dsrl_images(obs, train=train)
         states = self._preprocess_states(obs["states"])
 
         # Move to the same device as critic encoders, convert to bfloat16

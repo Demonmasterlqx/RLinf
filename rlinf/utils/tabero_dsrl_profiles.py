@@ -12,6 +12,13 @@ from rlinf.utils.dsrl_observation import (
     DSRL_NUM_IMAGES,
     DSRL_OBSERVATION_SEMANTICS,
 )
+from rlinf.utils.dsrl_replay import (
+    DSRL_REPLAY_BACKEND,
+    DSRL_REPLAY_CAPACITY_TRANSITIONS,
+    DSRL_REPLAY_CHECKPOINT_SHARD_TRANSITIONS,
+    DSRL_REPLAY_MAX_RESIDENT_GIB,
+    DSRL_REPLAY_SEMANTICS,
+)
 from rlinf.utils.dsrl_reward import DSRL_REWARD_SEMANTICS
 
 FORMAL_8GPU_50STEP_PROFILE = "formal_8gpu_50step"
@@ -20,6 +27,23 @@ TASK0_SELECTED_STEP10_PROFILE = "task0_selected_step10"
 TASK0_8GPU_60STEP_PROFILE = "task0_8gpu_60step"
 TASK0_8GPU_60STEP_SELECTED_PROFILE_TEMPLATE = "task0_8gpu_60step_selected_step{step}"
 TASK0_8GPU_60STEP_SELECTED_STEPS = (10, 20, 30, 40, 50)
+
+_COMPACT_REPLAY_REQUIREMENTS = (
+    ("algorithm.dsrl_replay_semantics", DSRL_REPLAY_SEMANTICS),
+    ("algorithm.replay_buffer.backend", DSRL_REPLAY_BACKEND),
+    (
+        "algorithm.replay_buffer.capacity_transitions",
+        DSRL_REPLAY_CAPACITY_TRANSITIONS,
+    ),
+    (
+        "algorithm.replay_buffer.checkpoint_shard_transitions",
+        DSRL_REPLAY_CHECKPOINT_SHARD_TRANSITIONS,
+    ),
+    (
+        "algorithm.replay_buffer.max_resident_gib",
+        DSRL_REPLAY_MAX_RESIDENT_GIB,
+    ),
+)
 
 
 @dataclass(frozen=True)
@@ -65,7 +89,8 @@ _PROFILES = {
             ),
             ("actor.model.openpi.dsrl_num_images", DSRL_NUM_IMAGES),
             ("algorithm.tau", 0.005),
-        ),
+        )
+        + _COMPACT_REPLAY_REQUIREMENTS,
     ),
     FORMAL_8GPU_50STEP_PROFILE: TaberoDSRLTrainingProfile(
         name=FORMAL_8GPU_50STEP_PROFILE,
@@ -91,7 +116,8 @@ _PROFILES = {
             ),
             ("actor.model.openpi.dsrl_num_images", DSRL_NUM_IMAGES),
             ("algorithm.tau", 0.005),
-        ),
+        )
+        + _COMPACT_REPLAY_REQUIREMENTS,
     ),
     TASK5_4GPU_40STEP_SMALL_PROFILE: TaberoDSRLTrainingProfile(
         name=TASK5_4GPU_40STEP_SMALL_PROFILE,
@@ -135,7 +161,8 @@ _PROFILES = {
             ("algorithm.train_actor_steps", 10),
             ("actor.global_batch_size", 20),
             ("actor.micro_batch_size", 2),
-        ),
+        )
+        + _COMPACT_REPLAY_REQUIREMENTS,
     ),
     TASK0_SELECTED_STEP10_PROFILE: TaberoDSRLTrainingProfile(
         name=TASK0_SELECTED_STEP10_PROFILE,
@@ -161,7 +188,8 @@ _PROFILES = {
             ),
             ("actor.model.openpi.dsrl_num_images", DSRL_NUM_IMAGES),
             ("algorithm.tau", 0.005),
-        ),
+        )
+        + _COMPACT_REPLAY_REQUIREMENTS,
     ),
 }
 _task0_60step_profile = _PROFILES[TASK0_8GPU_60STEP_PROFILE]

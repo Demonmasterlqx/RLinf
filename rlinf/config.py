@@ -30,6 +30,13 @@ from rlinf.utils.dsrl_observation import (
     DSRL_NUM_IMAGES,
     DSRL_OBSERVATION_SEMANTICS,
 )
+from rlinf.utils.dsrl_replay import (
+    DSRL_REPLAY_BACKEND,
+    DSRL_REPLAY_CAPACITY_TRANSITIONS,
+    DSRL_REPLAY_CHECKPOINT_SHARD_TRANSITIONS,
+    DSRL_REPLAY_MAX_RESIDENT_GIB,
+    DSRL_REPLAY_SEMANTICS,
+)
 from rlinf.utils.dsrl_reward import DSRL_REWARD_SEMANTICS
 from rlinf.utils.dsrl_rollout_sync import validate_dsrl_rollout_sync_config
 from rlinf.utils.placement import (
@@ -862,6 +869,51 @@ def validate_embodied_cfg(cfg):
                     "algorithm.dsrl_observation_semantics="
                     f"{DSRL_OBSERVATION_SEMANTICS!r}; got "
                     f"{observation_semantics!r}."
+                )
+            replay_semantics = algorithm_cfg.get("dsrl_replay_semantics")
+            if replay_semantics != DSRL_REPLAY_SEMANTICS:
+                raise ValueError(
+                    "Tabero tactile OpenPI DSRL requires "
+                    "algorithm.dsrl_replay_semantics="
+                    f"{DSRL_REPLAY_SEMANTICS!r}; got {replay_semantics!r}."
+                )
+            replay_cfg = algorithm_cfg.get("replay_buffer", {})
+            required_replay_values = {
+                "backend": DSRL_REPLAY_BACKEND,
+                "capacity_transitions": DSRL_REPLAY_CAPACITY_TRANSITIONS,
+                "checkpoint_shard_transitions": (
+                    DSRL_REPLAY_CHECKPOINT_SHARD_TRANSITIONS
+                ),
+                "max_resident_gib": DSRL_REPLAY_MAX_RESIDENT_GIB,
+            }
+            for key, expected in required_replay_values.items():
+                actual = replay_cfg.get(key)
+                if actual != expected:
+                    raise ValueError(
+                        "Tabero tactile OpenPI DSRL compact replay requires "
+                        f"algorithm.replay_buffer.{key}={expected!r}; got "
+                        f"{actual!r}."
+                    )
+            legacy_replay_fields = {
+                "enable_cache",
+                "cache_size",
+                "sample_window_size",
+                "auto_save",
+                "auto_save_path",
+                "trajectory_format",
+            }
+            configured_legacy_fields = sorted(
+                legacy_replay_fields.intersection(replay_cfg)
+            )
+            if configured_legacy_fields:
+                raise ValueError(
+                    "Tabero tactile OpenPI DSRL compact replay forbids legacy "
+                    f"trajectory-buffer fields: {configured_legacy_fields}."
+                )
+            if algorithm_cfg.get("demo_buffer") is not None:
+                raise ValueError(
+                    "Tabero tactile OpenPI DSRL compact replay does not support "
+                    "demo_buffer/intervention trajectories."
                 )
             dsrl_num_images = openpi_cfg.get("dsrl_num_images")
             if dsrl_num_images != DSRL_NUM_IMAGES:

@@ -19,6 +19,7 @@ GPU_SAMPLER_PID=""
 start_gpu_sampler() {
   GPU_SAMPLES_FILE="${OUTPUT_DIR}/gpu_samples.csv"
   GPU_PROCESS_SAMPLES_FILE="${OUTPUT_DIR}/gpu_process_samples.csv"
+  HOST_MEMORY_SAMPLES_FILE="${OUTPUT_DIR}/host_memory_samples.csv"
   if [[ ! -s "${GPU_SAMPLES_FILE}" ]]; then
     printf '%s\n' \
       'timestamp_utc,index,name,memory_used_mib,memory_total_mib,utilization_gpu_percent,power_draw_w,pstate' \
@@ -28,6 +29,11 @@ start_gpu_sampler() {
     printf '%s\n' \
       'timestamp_utc,gpu_uuid,pid,process_name,used_gpu_memory_mib' \
       >"${GPU_PROCESS_SAMPLES_FILE}"
+  fi
+  if [[ ! -s "${HOST_MEMORY_SAMPLES_FILE}" ]]; then
+    printf '%s\n' \
+      'timestamp_utc,mem_total_kib,mem_available_kib,swap_free_kib,user_rss_kib,user_processes,ray_rss_kib,ray_processes,sac_actor_rss_kib,sac_actor_processes' \
+      >"${HOST_MEMORY_SAMPLES_FILE}"
   fi
 
   (
@@ -48,6 +54,26 @@ start_gpu_sampler() {
           --query-compute-apps=gpu_uuid,pid,process_name,used_gpu_memory \
           --format=csv,noheader,nounits 2>/dev/null || true
       ) >>"${GPU_PROCESS_SAMPLES_FILE}"
+      mem_total_kib="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)"
+      mem_available_kib="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)"
+      swap_free_kib="$(awk '/^SwapFree:/ {print $2}' /proc/meminfo)"
+      read -r user_rss_kib user_processes < <(
+        ps -u "$(id -un)" -o rss= | \
+          awk '{rss += $1; count += 1} END {print rss + 0, count + 0}'
+      )
+      read -r ray_rss_kib ray_processes < <(
+        ps -u "$(id -un)" -o rss=,args= | \
+          awk 'index($0, "ray::") || index($0, "raylet") || index($0, "gcs_server") {rss += $1; count += 1} END {print rss + 0, count + 0}'
+      )
+      read -r sac_actor_rss_kib sac_actor_processes < <(
+        ps -u "$(id -un)" -o rss=,args= | \
+          awk 'index($0, "EmbodiedSACFSDPPolicy") {rss += $1; count += 1} END {print rss + 0, count + 0}'
+      )
+      printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+        "${sample_time}" "${mem_total_kib}" "${mem_available_kib}" \
+        "${swap_free_kib}" "${user_rss_kib}" "${user_processes}" \
+        "${ray_rss_kib}" "${ray_processes}" "${sac_actor_rss_kib}" \
+        "${sac_actor_processes}" >>"${HOST_MEMORY_SAMPLES_FILE}"
       sleep 5
     done
   ) &
@@ -165,6 +191,14 @@ else
   GPU_COUNT="${#installed_gpus[@]}"
 fi
 [[ "${GPU_COUNT}" -eq 8 ]] || die "exactly 8 visible GPUs are required; found ${GPU_COUNT}"
+
+mapfile -t existing_compute_processes < <(
+  nvidia-smi \
+    --query-compute-apps=gpu_uuid,pid,process_name,used_gpu_memory \
+    --format=csv,noheader,nounits 2>/dev/null | sed '/^[[:space:]]*$/d'
+)
+[[ "${#existing_compute_processes[@]}" -eq 0 ]] || \
+  die "all 8 GPUs must be compute-idle before smoke; found: ${existing_compute_processes[*]}"
 
 START_TIME_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 START_TIME_LOCAL="$(date +%Y-%m-%dT%H:%M:%S%z)"

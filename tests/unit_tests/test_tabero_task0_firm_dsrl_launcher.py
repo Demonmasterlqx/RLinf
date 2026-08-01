@@ -305,8 +305,20 @@ def test_dsrl_launcher_samples_gpu_and_process_metrics_every_five_seconds():
     assert (
         'GPU_PROCESS_SAMPLES_FILE="${OUTPUT_DIR}/gpu_process_samples.csv"' in launcher
     )
+    assert (
+        'HOST_MEMORY_SAMPLES_FILE="${OUTPUT_DIR}/host_memory_samples.csv"' in launcher
+    )
     assert "memory.used,memory.total,utilization.gpu,power.draw,pstate" in launcher
     assert "--query-compute-apps=gpu_uuid,pid,process_name,used_gpu_memory" in launcher
+    assert "mem_available_kib" in launcher
+    assert "sac_actor_rss_kib" in launcher
     assert "sleep 5" in launcher
+
+
+def test_dsrl_launcher_requires_compute_idle_gpus():
+    launcher = LAUNCHER.read_text()
+
+    assert "existing_compute_processes" in launcher
+    assert "all 8 GPUs must be compute-idle before smoke" in launcher
     assert "start_gpu_sampler" in launcher
     assert "stop_gpu_sampler" in launcher

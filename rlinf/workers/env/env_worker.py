@@ -39,6 +39,10 @@ from rlinf.envs.wrappers import RecordVideo
 from rlinf.scheduler import Channel, Cluster, CommMapper, Worker
 from rlinf.utils.data_iter_utils import split_list
 from rlinf.utils.distributed import masked_stats, normalize_from_stats
+from rlinf.utils.dsrl_replay import (
+    DSRL_REPLAY_SEMANTICS,
+    compact_tabero_dsrl_observation,
+)
 from rlinf.utils.metric_utils import compute_split_num
 from rlinf.utils.nested_dict_process import (
     clone_nested_to_cpu,
@@ -53,6 +57,60 @@ from rlinf.utils.utils import (
     preprocess_embodied_batch,
 )
 from rlinf.workers.env.history_manager import HistoryManager
+
+
+def project_compact_dsrl_rollout_inputs(
+    forward_inputs: dict[str, torch.Tensor],
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Extract the sole replay action and discard rollout-only metadata."""
+
+    actual_fields = set(forward_inputs)
+    if actual_fields != {"action"}:
+        raise ValueError(
+            "Tabero compact DSRL rollout must provide only the 32D latent "
+            f"action; got forward_inputs fields {sorted(actual_fields)}."
+        )
+    action = forward_inputs["action"]
+    if not torch.is_tensor(action) or action.ndim != 2 or action.shape[-1] != 32:
+        actual_shape = tuple(action.shape) if hasattr(action, "shape") else None
+        raise ValueError(
+            "Tabero compact DSRL rollout latent action expected [B,32]; "
+            f"got {actual_shape}."
+        )
+    if not action.is_floating_point():
+        raise ValueError(
+            "Tabero compact DSRL rollout latent action must be floating point; "
+            f"got {action.dtype}."
+        )
+    return action.to(device="cpu", dtype=torch.bfloat16).contiguous(), {}
+
+
+def project_compact_dsrl_step_result(
+    result: ChunkStepResult,
+) -> ChunkStepResult:
+    """Drop the leading bootstrap done row from compact SAC trajectories.
+
+    Each rollout epoch begins with an environment reset/bootstrap output.  It
+    has done metadata but no reward because no action has executed yet.  The
+    legacy replay buffer removes that leading row while flattening its
+    ``T + rollout_epoch`` done tensors.  Compact replay stores already-aligned
+    transitions, so discard only that unrewarded metadata at the producer.
+
+    The action predicted from the bootstrap observation is retained.  Its
+    reward and done metadata arrive with the next environment output (or the
+    final bootstrap-only policy call at the end of the epoch), preserving the
+    terminal metadata of the last executed action.
+    """
+
+    if result.rewards is not None:
+        return result
+    return ChunkStepResult(
+        actions=result.actions,
+        prev_logprobs=result.prev_logprobs,
+        prev_values=result.prev_values,
+        forward_inputs=result.forward_inputs,
+        versions=result.versions,
+    )
 
 
 class EnvWorker(Worker):
@@ -77,6 +135,14 @@ class EnvWorker(Worker):
         self.stage_num = self.cfg.rollout.pipeline_stage_num
         self.enable_rlt = (
             OmegaConf.select(self.cfg, "algorithm.loss_type", default="") == "rlt_ac"
+        )
+        self.compact_dsrl_replay = (
+            OmegaConf.select(
+                self.cfg,
+                "algorithm.dsrl_replay_semantics",
+                default=None,
+            )
+            == DSRL_REPLAY_SEMANTICS
         )
 
         self.reward_mode = self.cfg.get("reward", {}).get("reward_mode", "per_step")
@@ -1069,8 +1135,20 @@ class EnvWorker(Worker):
                     rewards = self.compute_bootstrap_rewards(
                         env_output, rollout_result.bootstrap_values, reward_model_output
                     )
+                    transition_actions = rollout_result.forward_inputs.get(
+                        "action", None
+                    )
+                    transition_forward_inputs = rollout_result.forward_inputs
+                    if self.compact_dsrl_replay:
+                        (
+                            transition_actions,
+                            transition_forward_inputs,
+                        ) = project_compact_dsrl_rollout_inputs(
+                            rollout_result.forward_inputs
+                        )
+
                     chunk_step_result = ChunkStepResult(
-                        actions=rollout_result.forward_inputs.get("action", None),
+                        actions=transition_actions,
                         prev_logprobs=(
                             rollout_result.prev_logprobs
                             if self.collect_prev_infos
@@ -1081,13 +1159,17 @@ class EnvWorker(Worker):
                             if self.collect_prev_infos
                             else None
                         ),
-                        forward_inputs=rollout_result.forward_inputs,
+                        forward_inputs=transition_forward_inputs,
                         versions=rollout_result.versions,
                         dones=env_output.dones,
                         truncations=env_output.truncations,
                         terminations=env_output.terminations,
                         rewards=rewards,
                     )
+                    if self.compact_dsrl_replay:
+                        chunk_step_result = project_compact_dsrl_step_result(
+                            chunk_step_result
+                        )
 
                     self.rollout_results[stage_id].append_step_result(chunk_step_result)
                     if (
@@ -1136,6 +1218,9 @@ class EnvWorker(Worker):
                             if env_output.dones.any() and self.cfg.env.train.auto_reset
                             else env_output.obs
                         )
+                        if self.compact_dsrl_replay:
+                            curr_obs = compact_tabero_dsrl_observation(curr_obs)
+                            next_obs = compact_tabero_dsrl_observation(next_obs)
                         self.rollout_results[stage_id].append_transitions(
                             curr_obs, next_obs
                         )
@@ -1193,6 +1278,10 @@ class EnvWorker(Worker):
                     terminations=env_output.terminations,
                     rewards=rewards,
                 )
+                if self.compact_dsrl_replay:
+                    chunk_step_result = project_compact_dsrl_step_result(
+                        chunk_step_result
+                    )
                 self.rollout_results[stage_id].append_step_result(chunk_step_result)
                 if (
                     self.reward_mode == "history_buffer"
