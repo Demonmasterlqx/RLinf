@@ -24,10 +24,10 @@ DSRL_ROLLOUT_SYNC_PREFIXES = (
     "actor_state_encoder.",
     "actor_tactile_encoder.",
 )
-DSRL_ROLLOUT_SYNC_MANIFEST_VERSION = 1
-DSRL_ROLLOUT_SYNC_MANIFEST_V1: Mapping[str, tuple[int, ...]] = MappingProxyType(
+DSRL_ROLLOUT_SYNC_MANIFEST_VERSION = 2
+DSRL_ROLLOUT_SYNC_MANIFEST_V2: Mapping[str, tuple[int, ...]] = MappingProxyType(
     {
-        "dsrl_action_noise_net.shared_net.0.weight": (128, 192),
+        "dsrl_action_noise_net.shared_net.0.weight": (128, 256),
         "dsrl_action_noise_net.shared_net.0.bias": (128,),
         "dsrl_action_noise_net.shared_net.1.weight": (128,),
         "dsrl_action_noise_net.shared_net.1.bias": (128,),
@@ -77,12 +77,12 @@ DSRL_ROLLOUT_SYNC_MANIFEST_V1: Mapping[str, tuple[int, ...]] = MappingProxyType(
         "actor_tactile_encoder.out_proj.bias": (64,),
     }
 )
-DSRL_ROLLOUT_SYNC_TENSOR_COUNT = len(DSRL_ROLLOUT_SYNC_MANIFEST_V1)
-DSRL_ROLLOUT_SYNC_PARAMETER_COUNT = 2_311_648
+DSRL_ROLLOUT_SYNC_TENSOR_COUNT = len(DSRL_ROLLOUT_SYNC_MANIFEST_V2)
+DSRL_ROLLOUT_SYNC_PARAMETER_COUNT = 2_319_840
 
 assert DSRL_ROLLOUT_SYNC_TENSOR_COUNT == 48
 assert (
-    sum(prod(shape) for shape in DSRL_ROLLOUT_SYNC_MANIFEST_V1.values())
+    sum(prod(shape) for shape in DSRL_ROLLOUT_SYNC_MANIFEST_V2.values())
     == DSRL_ROLLOUT_SYNC_PARAMETER_COUNT
 )
 
@@ -181,7 +181,7 @@ def validate_dsrl_rollout_state_dict(
 ) -> None:
     """Require the versioned Tabero DSRL rollout synchronization manifest."""
     actual_key_set = set(state_dict)
-    expected_key_set = set(DSRL_ROLLOUT_SYNC_MANIFEST_V1)
+    expected_key_set = set(DSRL_ROLLOUT_SYNC_MANIFEST_V2)
     missing_keys = sorted(expected_key_set - actual_key_set)
     unexpected_keys = sorted(actual_key_set - expected_key_set)
     shape_mismatches = {
@@ -189,7 +189,7 @@ def validate_dsrl_rollout_state_dict(
             "expected": expected_shape,
             "actual": tuple(state_dict[key].shape),
         }
-        for key, expected_shape in DSRL_ROLLOUT_SYNC_MANIFEST_V1.items()
+        for key, expected_shape in DSRL_ROLLOUT_SYNC_MANIFEST_V2.items()
         if key in state_dict and tuple(state_dict[key].shape) != expected_shape
     }
     if missing_keys or unexpected_keys or shape_mismatches:
@@ -208,6 +208,6 @@ def validate_dsrl_rollout_state_dict(
     ):
         raise ValueError(
             "OpenPI DSRL rollout sync requires exactly 48 tensors and "
-            "2,311,648 parameters selected by actor.rollout_sync_prefixes; "
+            "2,319,840 parameters selected by actor.rollout_sync_prefixes; "
             f"got {tensor_count} tensors and {parameter_count:,} parameters."
         )

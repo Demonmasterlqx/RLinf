@@ -54,7 +54,7 @@ class _RLinfActor(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.dsrl_action_noise_net = GaussianPolicy(
-            input_dim=192,
+            input_dim=256,
             output_dim=32,
             hidden_dims=(128, 128, 128),
             low=None,
@@ -94,12 +94,14 @@ def _git_sha(repository: Path, revision: str = "HEAD") -> str:
 def _fixed_raw_observation() -> dict[str, torch.Tensor]:
     image = torch.arange(256 * 256 * 3, dtype=torch.int64)
     image = image.remainder(256).to(torch.uint8).reshape(256, 256, 3)
+    wrist_image = torch.flip(image, dims=(0, 1)).contiguous()
     state = torch.linspace(-0.75, 0.75, 7, dtype=torch.float32)
     tactile = torch.linspace(-0.5, 0.5, 9 * 198 * 2, dtype=torch.float32).reshape(
         9, 198, 2
     )
     return {
         "dsrl_raw_image": image,
+        "dsrl_raw_wrist_image": wrist_image,
         "state": state,
         "tactile_marker_motion": tactile,
     }
@@ -171,7 +173,10 @@ def _run_actor_parity(
     t2_image, t2_state, t2_tactile = t2_actor.preprocess(raw)
     preprocessor = _RLinfPreprocessor()
     batched = {
-        "images": [raw["dsrl_raw_image"].unsqueeze(0).to(device)],
+        "images": [
+            raw["dsrl_raw_image"].unsqueeze(0).to(device),
+            raw["dsrl_raw_wrist_image"].unsqueeze(0).to(device),
+        ],
         "states": raw["state"].unsqueeze(0).to(device),
         "tactile_marker_motion": raw["tactile_marker_motion"].unsqueeze(0).to(device),
     }
@@ -189,7 +194,9 @@ def _run_actor_parity(
     )
 
     rlinf_state_features = rlinf_actor.actor_state_encoder(rlinf_state)
-    rlinf_image_features = rlinf_actor.actor_image_encoder(rlinf_image)
+    rlinf_image_features = OpenPi0ForRLActionPrediction._encode_dsrl_image_views(
+        rlinf_image, rlinf_actor.actor_image_encoder
+    )
     rlinf_tactile_features = rlinf_actor.actor_tactile_encoder(rlinf_tactile)
     rlinf_features = torch.cat(
         [rlinf_state_features, rlinf_image_features, rlinf_tactile_features], dim=-1
@@ -207,10 +214,20 @@ def _run_actor_parity(
 
     pairs = {
         "image_input": (rlinf_image, t2_image),
+        "main_image_input": (rlinf_image[:, 0], t2_image[:, 0]),
+        "wrist_image_input": (rlinf_image[:, 1], t2_image[:, 1]),
         "state_input": (rlinf_state, t2_state),
         "tactile_input": (rlinf_tactile, t2_tactile),
         "state_features": (rlinf_state_features, t2_state_features),
         "image_features": (rlinf_image_features, t2_image_features),
+        "main_image_features": (
+            rlinf_image_features[:, :64],
+            t2_image_features[:, :64],
+        ),
+        "wrist_image_features": (
+            rlinf_image_features[:, 64:],
+            t2_image_features[:, 64:],
+        ),
         "tactile_features": (rlinf_tactile_features, t2_tactile_features),
         "gaussian_mean": (rlinf_mean, t2_mean),
         "deterministic_noise": (rlinf_deterministic, t2_deterministic),
@@ -222,6 +239,7 @@ def _run_actor_parity(
     }
     fixture = {
         "raw_image_shape": list(raw["dsrl_raw_image"].shape),
+        "raw_wrist_image_shape": list(raw["dsrl_raw_wrist_image"].shape),
         "raw_state_shape": list(raw["state"].shape),
         "raw_tactile_shape": list(raw["tactile_marker_motion"].shape),
         "weight_key_count": len(weights),
@@ -259,6 +277,7 @@ def _load_pi0_model(checkpoint: Path, device: torch.device):
             "num_steps": 10,
             "use_dsrl": True,
             "dsrl_use_tactile": True,
+            "dsrl_num_images": 2,
             "dsrl_state_dim": 7,
             "dsrl_action_noise_dim": 32,
             "dsrl_num_q_heads": 10,
@@ -303,7 +322,9 @@ def _transformed_observation(model, raw: dict, device: torch.device):
     image = raw["dsrl_raw_image"][:224, :224]
     image = image.permute(2, 0, 1).to(device=device, dtype=torch.float32)
     image = (image / 255.0 * 2.0 - 1.0).unsqueeze(0)
-    wrist_image = torch.flip(image, dims=(3,))
+    wrist_image = raw["dsrl_raw_wrist_image"][:224, :224]
+    wrist_image = wrist_image.permute(2, 0, 1).to(device=device, dtype=torch.float32)
+    wrist_image = (wrist_image / 255.0 * 2.0 - 1.0).unsqueeze(0)
     state = torch.zeros(1, 32, dtype=torch.float32, device=device)
     state[:, :7] = raw["state"].to(device)
     tactile_prefix = raw["tactile_marker_motion"].reshape(1, 9, 396).to(device)

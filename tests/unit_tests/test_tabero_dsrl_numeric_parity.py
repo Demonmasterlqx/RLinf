@@ -22,11 +22,15 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 T2_REPO = REPO_ROOT.parent / "T2-VLA"
 RUNNER = REPO_ROOT / "examples" / "embodiment" / "run_tabero_dsrl_parity.py"
 ACTOR_STAGES = {
-    "image_input": [1, 1, 3, 64, 64],
+    "image_input": [1, 2, 3, 64, 64],
+    "main_image_input": [1, 3, 64, 64],
+    "wrist_image_input": [1, 3, 64, 64],
     "state_input": [1, 7],
     "tactile_input": [1, 9, 396],
     "state_features": [1, 64],
-    "image_features": [1, 64],
+    "image_features": [1, 128],
+    "main_image_features": [1, 64],
+    "wrist_image_features": [1, 64],
     "tactile_features": [1, 64],
     "gaussian_mean": [1, 32],
     "deterministic_noise": [1, 32],
@@ -63,6 +67,8 @@ def test_actor_parity_runner_emits_complete_passing_contract(tmp_path):
     assert report["passed"] is True
     assert report["fixture"]["weight_key_count"] == 48
     assert report["fixture"]["weight_dtype"] == "bfloat16"
+    assert report["fixture"]["raw_image_shape"] == [256, 256, 3]
+    assert report["fixture"]["raw_wrist_image_shape"] == [256, 256, 3]
     assert set(report["revisions"]) == {"base", "t2", "rlinf"}
     assert all(len(item["git_sha"]) == 40 for item in report["revisions"].values())
     for name, shape in ACTOR_STAGES.items():

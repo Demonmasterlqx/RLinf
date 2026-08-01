@@ -37,6 +37,7 @@ from rlinf.scheduler import Channel, Worker
 from rlinf.utils import drq
 from rlinf.utils.distributed import all_reduce_dict
 from rlinf.utils.dsrl_checkpoint import (
+    DSRL_TRAINABLE_MANIFEST_VERSION,
     DSRL_TRAINABLE_PARAMETER_COUNT,
     build_compact_target_payload,
     restore_target_payload,
@@ -44,6 +45,7 @@ from rlinf.utils.dsrl_checkpoint import (
     select_dsrl_trainable_state,
     validate_target_payload_contract,
 )
+from rlinf.utils.dsrl_observation import DSRL_OBSERVATION_SEMANTICS
 from rlinf.utils.dsrl_reward import (
     DSRL_REWARD_SEMANTICS,
     chunk_bootstrap_discount,
@@ -388,6 +390,8 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                     "world_size": world_size,
                     "format": "trainable_weights",
                     "reward_semantics": DSRL_REWARD_SEMANTICS,
+                    "observation_semantics": DSRL_OBSERVATION_SEMANTICS,
+                    "manifest_version": DSRL_TRAINABLE_MANIFEST_VERSION,
                     "parameter_count": len(state_dict),
                     "tensor_count": len(state_dict),
                     "total_parameter_count": DSRL_TRAINABLE_PARAMETER_COUNT,
@@ -456,8 +460,8 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         self._logger.info(f"[FSDP] Restored OpenPI DSRL target: {receipt}")
         return receipt
 
-    def _validate_dsrl_resume_reward_semantics(self, load_path: str) -> None:
-        """Reject pre-fix Tabero DSRL checkpoints before restoring any state."""
+    def _validate_dsrl_resume_contract(self, load_path: str) -> None:
+        """Reject legacy Tabero DSRL checkpoints before restoring any state."""
         if not self._compact_dsrl_checkpointing_enabled():
             return
         sidecar_path = os.path.join(
@@ -466,7 +470,8 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         if not os.path.isfile(sidecar_path):
             raise ValueError(
                 "OpenPI DSRL resume requires a trainable sidecar carrying reward "
-                f"semantics metadata: {sidecar_path}"
+                "and observation semantics metadata: "
+                f"{sidecar_path}"
             )
         payload = torch.load(sidecar_path, map_location="cpu", weights_only=True)
         if not isinstance(payload, Mapping) or not isinstance(
@@ -481,6 +486,20 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                 "OpenPI DSRL checkpoint reward semantics mismatch: "
                 f"expected {DSRL_REWARD_SEMANTICS!r}, got {actual_semantics!r}. "
                 "Legacy checkpoints cannot be resumed."
+            )
+        observation_semantics = payload["metadata"].get("observation_semantics")
+        if observation_semantics != DSRL_OBSERVATION_SEMANTICS:
+            raise ValueError(
+                "OpenPI DSRL checkpoint observation semantics mismatch: "
+                f"expected {DSRL_OBSERVATION_SEMANTICS!r}, got "
+                f"{observation_semantics!r}. Legacy checkpoints cannot be resumed."
+            )
+        manifest_version = payload["metadata"].get("manifest_version")
+        if manifest_version != DSRL_TRAINABLE_MANIFEST_VERSION:
+            raise ValueError(
+                "OpenPI DSRL checkpoint trainable manifest version mismatch: "
+                f"expected {DSRL_TRAINABLE_MANIFEST_VERSION}, got "
+                f"{manifest_version!r}. Legacy checkpoints cannot be resumed."
             )
         target_path = os.path.join(
             load_path,
@@ -1064,7 +1083,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         self.replay_buffer.save_checkpoint(buffer_save_path)
 
     def load_checkpoint(self, load_base_path):
-        self._validate_dsrl_resume_reward_semantics(load_base_path)
+        self._validate_dsrl_resume_contract(load_base_path)
 
         # load model
         self._strategy.load_checkpoint(

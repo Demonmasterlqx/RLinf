@@ -55,6 +55,7 @@ def _representative_dsrl_model() -> OpenPi0ForRLActionPrediction:
     config = SimpleNamespace(
         use_dsrl=True,
         dsrl_use_tactile=True,
+        dsrl_num_images=2,
         dsrl_tactile_latent_dim=64,
         dsrl_state_dim=7,
         dsrl_action_noise_dim=32,
@@ -101,7 +102,7 @@ def test_dsrl_sender_selects_exact_actor_keyspace_and_normalizes_fsdp_names():
     EmbodiedSACFSDPPolicy._validate_dsrl_rollout_state_dict(selected)
 
     assert len(selected) == 48
-    assert sum(parameter.numel() for parameter in selected.values()) == 2_311_648
+    assert sum(parameter.numel() for parameter in selected.values()) == 2_319_840
     assert all(key.startswith(tuple(ROLLOUT_SYNC_PREFIXES)) for key in selected)
     assert not any("_fsdp_wrapped_module" in key for key in selected)
 
@@ -355,7 +356,7 @@ def test_dsrl_sender_rejects_runtime_compensating_parameter_rename():
         model, ROLLOUT_SYNC_PREFIXES
     )
     assert len(selected) == 48
-    assert sum(value.numel() for value in selected.values()) == 2_311_648
+    assert sum(value.numel() for value in selected.values()) == 2_319_840
 
     worker = EmbodiedSACFSDPPolicy.__new__(EmbodiedSACFSDPPolicy)
     worker.use_dsrl = True

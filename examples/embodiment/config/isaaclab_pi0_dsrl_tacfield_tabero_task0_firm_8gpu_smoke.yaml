@@ -61,6 +61,7 @@ algorithm:
   bootstrap_type: standard
   gamma: 0.999
   dsrl_reward_semantics: discounted_alive_masked_v1
+  dsrl_observation_semantics: main_wrist_shared_encoder_concat_v1
   tau: 0.005
   entropy_tuning:
     alpha_type: softplus
@@ -256,6 +257,7 @@ actor:
       tactile_loss_weight: 0.0
       use_dsrl: True
       dsrl_use_tactile: True
+      dsrl_num_images: 2
       dsrl_state_dim: 7
       dsrl_action_noise_dim: 32
       dsrl_num_q_heads: 10

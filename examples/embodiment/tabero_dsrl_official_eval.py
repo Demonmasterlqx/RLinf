@@ -26,9 +26,10 @@ from typing import Any
 import torch
 from safetensors import safe_open
 
+from rlinf.utils.dsrl_observation import DSRL_OBSERVATION_SEMANTICS
 from rlinf.utils.dsrl_reward import DSRL_REWARD_SEMANTICS
 from rlinf.utils.dsrl_rollout_sync import (
-    DSRL_ROLLOUT_SYNC_MANIFEST_V1,
+    DSRL_ROLLOUT_SYNC_MANIFEST_V2,
     DSRL_ROLLOUT_SYNC_MANIFEST_VERSION,
     DSRL_ROLLOUT_SYNC_PARAMETER_COUNT,
     DSRL_ROLLOUT_SYNC_TENSOR_COUNT,
@@ -41,14 +42,13 @@ from rlinf.utils.tabero_dsrl_profiles import (
 )
 
 FORMAT = "tabero_dsrl_t2vla"
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 BASE_WEIGHTS_NAME = "model.safetensors"
 ACTOR_NAME = "dsrl_actor.safetensors"
 MANIFEST_NAME = "manifest.json"
 AUDIT_NAME = "artifact_audit.json"
 EXPECTED_AUDIT_CHECKS = {
-    # Kept as the v1 artifact-audit key for compatibility; the check means the
-    # source path matches the checkpoint selected by the explicit profile.
+    # The source path must match the checkpoint selected by the explicit profile.
     "final_checkpoint_path",
     "source_metadata",
     "source_trainable_manifest",
@@ -58,6 +58,7 @@ EXPECTED_AUDIT_CHECKS = {
     "base_model_sha256",
     "formal_provenance",
     "reward_semantics",
+    "observation_semantics",
     "output_hashes",
 }
 EXPECTED_AUDIT_KEYS = {
@@ -67,6 +68,7 @@ EXPECTED_AUDIT_KEYS = {
     "task_id",
     "global_step",
     "reward_semantics",
+    "observation_semantics",
     "source_checkpoint_sha256",
     "base_model_sha256",
     "actor_weights_sha256",
@@ -78,6 +80,7 @@ EXPECTED_MANIFEST_KEYS = {
     "format_version",
     "algorithm",
     "reward_semantics",
+    "observation_semantics",
     "task_id",
     "global_step",
     "is_final",
@@ -106,8 +109,22 @@ EXPECTED_MANIFEST_KEYS = {
     "artifact_audit",
 }
 EXPECTED_OBSERVATION_CONTRACT = {
-    "image": {
+    "main_image": {
         "key": "dsrl_raw_image",
+        "shape": [256, 256, 3],
+        "layout": "HWC",
+        "dtype": "uint8",
+        "value_range": [0, 255],
+        "preprocessing": {
+            "resize": [64, 64],
+            "mode": "bilinear",
+            "align_corners": False,
+            "output_layout": "NCHW",
+            "normalization": "uint8_to_minus_one_one",
+        },
+    },
+    "wrist_image": {
+        "key": "dsrl_raw_wrist_image",
         "shape": [256, 256, 3],
         "layout": "HWC",
         "dtype": "uint8",
@@ -129,9 +146,9 @@ EXPECTED_OBSERVATION_CONTRACT = {
     },
 }
 EXPECTED_FEATURE_CONTRACT = {
-    "order": ["state", "image", "tactile"],
-    "dims": [64, 64, 64],
-    "total_dim": 192,
+    "order": ["state", "main_image", "wrist_image", "tactile"],
+    "dims": [64, 64, 64, 64],
+    "total_dim": 256,
 }
 EXPECTED_NOISE_CONTRACT = {
     "dim": 32,
@@ -142,10 +159,14 @@ EXPECTED_NOISE_CONTRACT = {
 }
 EXPECTED_ARCHITECTURE = {
     "image_size": 64,
+    "image_views": ["main", "wrist"],
+    "shared_image_encoder": True,
+    "per_view_image_dim": 64,
+    "image_feature_dim": 128,
     "state_dim": 7,
     "tactile_shape": [9, 198, 2],
     "hidden_dims": [128, 128, 128],
-    "feature_dim": 192,
+    "feature_dim": 256,
     "noise_dim": 32,
 }
 PROVENANCE_KEYS = {
@@ -275,6 +296,7 @@ def _validate_actor(
                 "global_step": str(profile.global_step),
                 "dtype": "bfloat16",
                 "reward_semantics": DSRL_REWARD_SEMANTICS,
+                "observation_semantics": DSRL_OBSERVATION_SEMANTICS,
             }
             if metadata != expected_metadata:
                 raise ValueError(
@@ -282,14 +304,14 @@ def _validate_actor(
                     f"expected={expected_metadata}, actual={metadata}"
                 )
             actual_keys = set(actor.keys())
-            expected_keys = set(DSRL_ROLLOUT_SYNC_MANIFEST_V1)
+            expected_keys = set(DSRL_ROLLOUT_SYNC_MANIFEST_V2)
             if actual_keys != expected_keys:
                 raise ValueError(
                     "actor tensor manifest keyspace mismatch; "
                     f"missing={sorted(expected_keys - actual_keys)}, "
                     f"unexpected={sorted(actual_keys - expected_keys)}"
                 )
-            for key, expected_shape in DSRL_ROLLOUT_SYNC_MANIFEST_V1.items():
+            for key, expected_shape in DSRL_ROLLOUT_SYNC_MANIFEST_V2.items():
                 tensor = actor.get_slice(key)
                 if tuple(tensor.get_shape()) != expected_shape:
                     raise ValueError(
@@ -412,6 +434,11 @@ def validate_bundle(
         DSRL_REWARD_SEMANTICS,
         "manifest reward_semantics",
     )
+    _require_exact(
+        manifest.get("observation_semantics"),
+        DSRL_OBSERVATION_SEMANTICS,
+        "manifest observation_semantics",
+    )
     _require_exact(manifest.get("task_id"), task_id, "manifest task_id")
     _require_exact(
         manifest.get("global_step"), profile.global_step, "manifest global_step"
@@ -515,7 +542,7 @@ def validate_bundle(
     if set(audit) != EXPECTED_AUDIT_KEYS:
         raise ValueError("audit keyspace mismatch")
     _require_exact(audit.get("format"), "tabero_dsrl_artifact_audit", "audit format")
-    _require_exact(audit.get("format_version"), 1, "audit format_version")
+    _require_exact(audit.get("format_version"), 2, "audit format_version")
     _require_exact(audit.get("status"), "passed", "audit status")
     _require_exact(audit.get("task_id"), task_id, "audit task_id")
     _require_exact(audit.get("global_step"), profile.global_step, "audit global_step")
@@ -523,6 +550,11 @@ def validate_bundle(
         audit.get("reward_semantics"),
         DSRL_REWARD_SEMANTICS,
         "audit reward_semantics",
+    )
+    _require_exact(
+        audit.get("observation_semantics"),
+        DSRL_OBSERVATION_SEMANTICS,
+        "audit observation_semantics",
     )
     checks = audit.get("checks")
     if (

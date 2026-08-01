@@ -91,6 +91,7 @@ def apply_drq(obs, pad=4):
 
     Expected keys:
       - "main_images": main camera images
+      - "wrist_images": optional wrist camera images
       - "extra_view_images": optional multi-view images
 
     Args:
@@ -102,6 +103,10 @@ def apply_drq(obs, pad=4):
     """
     if obs.get("main_images", None) is not None:
         obs["main_images"] = drq_crop_main(obs["main_images"], pad=pad)
+
+    # The two viewpoints are not pixel-aligned, so draw independent crop offsets.
+    if obs.get("wrist_images", None) is not None:
+        obs["wrist_images"] = drq_crop_main(obs["wrist_images"], pad=pad)
 
     if obs.get("extra_view_images", None) is not None:
         obs["extra_view_images"] = drq_crop_extra(obs["extra_view_images"], pad=pad)

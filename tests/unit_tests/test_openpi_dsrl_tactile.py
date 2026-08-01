@@ -21,12 +21,15 @@ import torch.nn as nn
 from omegaconf import OmegaConf
 
 import rlinf.models as model_registry
+from rlinf.data.embodied_io_struct import Trajectory
+from rlinf.data.replay_buffer import TrajectoryReplayBuffer
 from rlinf.models.embodiment.openpi.openpi_action_model import (
     OpenPi0Config,
     OpenPi0ForRLActionPrediction,
 )
 from rlinf.models.embodiment.openpi.tactile_encoder import TactileTCNEncoder
 from rlinf.runners.embodied_runner import EmbodiedRunner
+from rlinf.utils.drq import apply_drq
 from rlinf.workers.actor.fsdp_sac_policy_worker import EmbodiedSACFSDPPolicy
 
 
@@ -47,7 +50,9 @@ def _bare_model(config) -> OpenPi0ForRLActionPrediction:
     return model
 
 
-def _runtime_model(*, use_tactile: bool) -> OpenPi0ForRLActionPrediction:
+def _runtime_model(
+    *, use_tactile: bool, num_images: int = 1
+) -> OpenPi0ForRLActionPrediction:
     config = SimpleNamespace(
         use_dsrl=True,
         dsrl_use_tactile=use_tactile,
@@ -56,6 +61,7 @@ def _runtime_model(*, use_tactile: bool) -> OpenPi0ForRLActionPrediction:
         dsrl_action_noise_dim=32,
         dsrl_num_q_heads=10,
         dsrl_image_latent_dim=64,
+        dsrl_num_images=num_images,
         dsrl_state_latent_dim=64,
         dsrl_hidden_dims=(32, 32),
         action_horizon=2,
@@ -67,11 +73,18 @@ def _runtime_model(*, use_tactile: bool) -> OpenPi0ForRLActionPrediction:
     return model.float()
 
 
-def _obs(*, include_tactile: bool = True, tactile_shape=(2, 9, 198, 2)):
+def _obs(
+    *,
+    include_tactile: bool = True,
+    include_wrist: bool = False,
+    tactile_shape=(2, 9, 198, 2),
+):
     obs = {
         "main_images": torch.randint(0, 256, (2, 32, 32, 3), dtype=torch.uint8),
         "states": torch.randn(2, 7),
     }
+    if include_wrist:
+        obs["wrist_images"] = torch.randint(0, 256, (2, 32, 32, 3), dtype=torch.uint8)
     if include_tactile:
         obs["tactile_marker_motion"] = torch.randn(*tactile_shape)
     return obs
@@ -89,6 +102,7 @@ def test_dsrl_tactile_config_defaults_are_opt_in():
 
     assert config.dsrl_use_tactile is False
     assert config.dsrl_tactile_latent_dim == 64
+    assert config.dsrl_num_images == 1
 
 
 def test_dsrl_tactile_components_use_independent_tcn_encoders():
@@ -105,6 +119,186 @@ def test_dsrl_tactile_components_use_independent_tcn_encoders():
         assert encoder.out_proj.out_features == 64
     assert model.dsrl_action_noise_net.input_dim == 64 + 64 + 64
     assert model.q_head.q_heads[0].net[0].in_features == 64 + 64 + 64 + 32
+
+
+def test_dsrl_dual_camera_components_share_each_side_encoder_and_expand_features():
+    model = _runtime_model(use_tactile=True, num_images=2)
+
+    assert model.actor_image_encoder is not model.critic_image_encoder
+    assert model.dsrl_action_noise_net.input_dim == 64 + 64 + 64 + 64
+    assert model.q_head.q_heads[0].net[0].in_features == 64 + 64 + 64 + 64 + 32
+
+
+def test_dsrl_dual_camera_preprocessing_preserves_main_wrist_order_and_range():
+    model = _runtime_model(use_tactile=False, num_images=2)
+    main = torch.zeros(2, 48, 32, 3, dtype=torch.uint8)
+    wrist = torch.full((2, 24, 40, 3), 255, dtype=torch.uint8)
+
+    normalized = model._normalize_dsrl_obs(
+        {"main_images": main, "wrist_images": wrist, "states": torch.zeros(2, 7)}
+    )
+    images = model._preprocess_dsrl_images(normalized["images"])
+
+    assert normalized["images"][0] is main
+    assert normalized["images"][1] is wrist
+    assert images.shape == (2, 2, 3, 64, 64)
+    assert images.dtype == torch.float32
+    assert torch.equal(images[:, 0], torch.full_like(images[:, 0], -1.0))
+    assert torch.equal(images[:, 1], torch.full_like(images[:, 1], 1.0))
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (lambda obs: obs.pop("wrist_images"), "requires 'wrist_images'"),
+        (
+            lambda obs: obs.__setitem__("wrist_images", obs["wrist_images"].float()),
+            "wrist image must use uint8",
+        ),
+        (
+            lambda obs: obs.__setitem__(
+                "wrist_images", torch.zeros(2, 255, 256, 3, dtype=torch.uint8)
+            ),
+            "wrist image expected shape",
+        ),
+        (
+            lambda obs: obs.__setitem__(
+                "main_images", torch.zeros(2, 256, 256, dtype=torch.uint8)
+            ),
+            "main image must be a rank-4 tensor",
+        ),
+        (
+            lambda obs: obs.__setitem__(
+                "wrist_images", torch.zeros(1, 256, 256, 3, dtype=torch.uint8)
+            ),
+            "wrist image batch mismatch",
+        ),
+    ],
+)
+def test_tabero_dsrl_dual_camera_rejects_invalid_raw_view_contract(
+    mutation,
+    message,
+):
+    model = _bare_model(
+        SimpleNamespace(
+            dsrl_num_images=2,
+            config_name="pi0_lora_tacfield_tabero",
+        )
+    )
+    obs = {
+        "main_images": torch.zeros(2, 256, 256, 3, dtype=torch.uint8),
+        "wrist_images": torch.ones(2, 256, 256, 3, dtype=torch.uint8),
+        "states": torch.zeros(2, 7),
+    }
+    mutation(obs)
+
+    with pytest.raises(ValueError, match=message):
+        model._normalize_dsrl_obs(obs)
+
+
+def test_dsrl_dual_camera_actor_and_critic_depend_on_wrist_and_share_view_gradients():
+    torch.manual_seed(7)
+    model = _runtime_model(use_tactile=True, num_images=2)
+    main = torch.rand(2, 32, 32, 3, requires_grad=True)
+    wrist = torch.rand(2, 32, 32, 3, requires_grad=True)
+    obs = _obs(include_wrist=True)
+    obs["main_images"] = main
+    obs["wrist_images"] = wrist
+
+    actions, _, _ = model.sac_forward(obs, mode="eval")
+    actions.sum().backward()
+
+    assert main.grad is not None and torch.count_nonzero(main.grad) > 0
+    assert wrist.grad is not None and torch.count_nonzero(wrist.grad) > 0
+    assert _has_grad(model.actor_image_encoder)
+    assert not _has_grad(model.critic_image_encoder)
+
+    model.zero_grad(set_to_none=True)
+    main.grad = None
+    wrist.grad = None
+    q_values = model.sac_q_forward(obs, actions=actions.detach())
+    q_values.sum().backward()
+
+    assert main.grad is not None and torch.count_nonzero(main.grad) > 0
+    assert wrist.grad is not None and torch.count_nonzero(wrist.grad) > 0
+    assert _has_grad(model.critic_image_encoder)
+    assert not _has_grad(model.actor_image_encoder)
+
+    changed_obs = dict(obs)
+    changed_obs["wrist_images"] = torch.ones_like(wrist)
+    with torch.no_grad():
+        changed_actions, _, _ = model.sac_forward(changed_obs, mode="eval")
+        changed_q = model.sac_q_forward(changed_obs, actions=actions.detach())
+    assert not torch.allclose(actions, changed_actions)
+    assert not torch.allclose(q_values, changed_q)
+
+
+def test_dsrl_drq_uses_independent_crop_offsets_for_main_and_wrist(monkeypatch):
+    offsets = iter((0, 0, 8, 8))
+
+    def fake_randint(_low, _high, size, *, device):
+        return torch.full(size, next(offsets), dtype=torch.long, device=device)
+
+    monkeypatch.setattr(torch, "randint", fake_randint)
+    pixels = torch.arange(8 * 8, dtype=torch.float32).reshape(1, 8, 8, 1)
+    pixels = pixels.expand(-1, -1, -1, 3).contiguous()
+
+    augmented = apply_drq(
+        {"main_images": pixels.clone(), "wrist_images": pixels.clone()},
+        pad=4,
+    )
+
+    assert augmented["main_images"].shape == pixels.shape
+    assert augmented["wrist_images"].shape == pixels.shape
+    assert not torch.equal(augmented["main_images"], augmented["wrist_images"])
+
+
+def test_dsrl_replay_round_trip_preserves_wrist_and_feeds_actor_and_critic():
+    values = torch.tensor([[10, 20], [30, 40]], dtype=torch.uint8)
+
+    def images(offset):
+        return (values + offset)[..., None, None, None].expand(2, 2, 32, 32, 3)
+
+    trajectory = Trajectory(
+        max_episode_length=20,
+        model_weights_id="dual-camera-test",
+        rewards=torch.zeros(2, 2, 10),
+        curr_obs={
+            "main_images": images(0),
+            "wrist_images": images(100),
+            "states": torch.randn(2, 2, 7),
+            "tactile_marker_motion": torch.randn(2, 2, 9, 198, 2),
+        },
+        next_obs={
+            "main_images": images(1),
+            "wrist_images": images(101),
+            "states": torch.randn(2, 2, 7),
+            "tactile_marker_motion": torch.randn(2, 2, 9, 198, 2),
+        },
+    )
+    replay = TrajectoryReplayBuffer(seed=3, auto_save=False, sample_window_size=4)
+    try:
+        replay.add_trajectories([trajectory])
+        batch = replay.sample_chunks(4)
+    finally:
+        replay.close()
+
+    for obs_key in ("curr_obs", "next_obs"):
+        sampled_obs = batch[obs_key]
+        assert "wrist_images" in sampled_obs
+        assert sampled_obs["wrist_images"].shape == (4, 32, 32, 3)
+        delta = sampled_obs["wrist_images"][:, 0, 0, 0].to(torch.int16)
+        delta -= sampled_obs["main_images"][:, 0, 0, 0].to(torch.int16)
+        assert torch.equal(delta, torch.full_like(delta, 100))
+
+    model = _runtime_model(use_tactile=True, num_images=2)
+    actions, _, _ = model.sac_forward(batch["curr_obs"], mode="eval")
+    q_values = model.sac_q_forward(
+        batch["next_obs"],
+        actions=actions.detach(),
+    )
+    assert actions.shape == (4, 2, 32)
+    assert q_values.shape == (4, 10)
 
 
 @pytest.mark.parametrize("method_name", ["sac_forward", "sac_q_forward"])
@@ -173,11 +367,17 @@ def test_standard_dsrl_does_not_require_or_initialize_tactile():
 
 def test_predict_action_batch_sends_tacfield_to_prefix_and_dsrl_paths():
     model = _bare_model(
-        SimpleNamespace(use_dsrl=True, dsrl_use_tactile=True, is_nft=False)
+        SimpleNamespace(
+            use_dsrl=True,
+            dsrl_use_tactile=True,
+            dsrl_num_images=2,
+            is_nft=False,
+        )
     )
     tactile = torch.randn(2, 9, 198, 2)
     env_obs = {
         "main_images": torch.zeros(2, 16, 16, 3, dtype=torch.uint8),
+        "wrist_images": torch.ones(2, 16, 16, 3, dtype=torch.uint8),
         "states": torch.zeros(2, 7),
         "tactile_marker_motion": tactile,
     }
@@ -218,6 +418,8 @@ def test_predict_action_batch_sends_tacfield_to_prefix_and_dsrl_paths():
 
     assert captured["prefix_obs"]["tactile_marker_motion"] is tactile
     assert captured["dsrl_obs"]["tactile_marker_motion"] is tactile
+    assert captured["dsrl_obs"]["images"][0] is env_obs["main_images"]
+    assert captured["dsrl_obs"]["images"][1] is env_obs["wrist_images"]
 
 
 @pytest.mark.parametrize(

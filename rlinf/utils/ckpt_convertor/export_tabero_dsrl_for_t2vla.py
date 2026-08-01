@@ -25,13 +25,15 @@ from omegaconf import OmegaConf
 from safetensors.torch import load_file, save_file
 
 from rlinf.utils.dsrl_checkpoint import (
-    DSRL_TRAINABLE_MANIFEST_V1,
+    DSRL_TRAINABLE_MANIFEST_V2,
+    DSRL_TRAINABLE_MANIFEST_VERSION,
     DSRL_TRAINABLE_PARAMETER_COUNT,
     DSRL_TRAINABLE_TENSOR_COUNT,
 )
+from rlinf.utils.dsrl_observation import DSRL_OBSERVATION_SEMANTICS
 from rlinf.utils.dsrl_reward import DSRL_REWARD_SEMANTICS
 from rlinf.utils.dsrl_rollout_sync import (
-    DSRL_ROLLOUT_SYNC_MANIFEST_V1,
+    DSRL_ROLLOUT_SYNC_MANIFEST_V2,
     DSRL_ROLLOUT_SYNC_MANIFEST_VERSION,
     DSRL_ROLLOUT_SYNC_PARAMETER_COUNT,
     DSRL_ROLLOUT_SYNC_PREFIXES,
@@ -46,7 +48,7 @@ from rlinf.utils.tabero_dsrl_profiles import (
 )
 
 FORMAT = "tabero_dsrl_t2vla"
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 ACTOR_WEIGHTS_NAME = "dsrl_actor.safetensors"
 MANIFEST_NAME = "manifest.json"
 AUDIT_NAME = "artifact_audit.json"
@@ -216,6 +218,16 @@ def _validate_metadata(
             "selected DSRL checkpoint reward_semantics must be "
             f"{DSRL_REWARD_SEMANTICS!r}"
         )
+    if metadata.get("observation_semantics") != DSRL_OBSERVATION_SEMANTICS:
+        raise ValueError(
+            "selected DSRL checkpoint observation_semantics must be "
+            f"{DSRL_OBSERVATION_SEMANTICS!r}"
+        )
+    _require_strict_int(
+        metadata.get("manifest_version"),
+        DSRL_TRAINABLE_MANIFEST_VERSION,
+        "manifest_version",
+    )
     _require_strict_int(metadata.get("task_id"), task_id, "task_id")
     if metadata.get("training_config") != expected_config:
         raise ValueError(
@@ -258,7 +270,7 @@ def _validate_metadata(
 def _validate_trainable_state(state: Any) -> dict[str, torch.Tensor]:
     if not isinstance(state, Mapping):
         raise ValueError("selected DSRL checkpoint model must be a tensor mapping")
-    expected_keys = set(DSRL_TRAINABLE_MANIFEST_V1)
+    expected_keys = set(DSRL_TRAINABLE_MANIFEST_V2)
     actual_keys = set(state)
     missing = sorted(expected_keys - actual_keys)
     unexpected = sorted(actual_keys - expected_keys)
@@ -269,12 +281,12 @@ def _validate_trainable_state(state: Any) -> dict[str, torch.Tensor]:
     )
     shape_mismatches = {
         key: {
-            "expected": DSRL_TRAINABLE_MANIFEST_V1[key],
+            "expected": DSRL_TRAINABLE_MANIFEST_V2[key],
             "actual": tuple(state[key].shape),
         }
         for key in expected_keys & actual_keys
         if isinstance(state[key], torch.Tensor)
-        and tuple(state[key].shape) != DSRL_TRAINABLE_MANIFEST_V1[key]
+        and tuple(state[key].shape) != DSRL_TRAINABLE_MANIFEST_V2[key]
     }
     dtype_mismatches = {
         key: str(state[key].dtype)
@@ -303,7 +315,7 @@ def _validate_trainable_state(state: Any) -> dict[str, torch.Tensor]:
         raise ValueError(
             f"selected DSRL trainable tensors must be finite; keys={nonfinite}"
         )
-    return {key: state[key] for key in DSRL_TRAINABLE_MANIFEST_V1}
+    return {key: state[key] for key in DSRL_TRAINABLE_MANIFEST_V2}
 
 
 def _validate_config_snapshot(
@@ -347,6 +359,8 @@ def _validate_config_snapshot(
     require_value("actor.model.openpi.dsrl_state_dim", 7)
     require_value("actor.model.openpi.dsrl_action_noise_dim", 32)
     require_value("algorithm.dsrl_reward_semantics", DSRL_REWARD_SEMANTICS)
+    require_value("algorithm.dsrl_observation_semantics", DSRL_OBSERVATION_SEMANTICS)
+    require_value("actor.model.openpi.dsrl_num_images", 2)
 
     logger_backends = OmegaConf.select(
         config,
@@ -600,7 +614,7 @@ def export_tabero_dsrl_bundle(
     trainable_state = _validate_trainable_state(payload["model"])
     actor_state = {
         key: trainable_state[key].detach().cpu().contiguous()
-        for key in DSRL_ROLLOUT_SYNC_MANIFEST_V1
+        for key in DSRL_ROLLOUT_SYNC_MANIFEST_V2
     }
     validate_dsrl_rollout_state_dict(actor_state)
     provenance = _validate_provenance(
@@ -627,6 +641,7 @@ def export_tabero_dsrl_bundle(
                 "global_step": str(profile.global_step),
                 "dtype": "bfloat16",
                 "reward_semantics": DSRL_REWARD_SEMANTICS,
+                "observation_semantics": DSRL_OBSERVATION_SEMANTICS,
             },
         )
         saved_actor = load_file(actor_path, device="cpu")
@@ -644,6 +659,7 @@ def export_tabero_dsrl_bundle(
             "format_version": FORMAT_VERSION,
             "algorithm": "dsrl-sac",
             "reward_semantics": DSRL_REWARD_SEMANTICS,
+            "observation_semantics": DSRL_OBSERVATION_SEMANTICS,
             "task_id": task_id,
             "global_step": profile.global_step,
             "is_final": metadata["is_final"],
@@ -670,8 +686,22 @@ def export_tabero_dsrl_bundle(
             "actor_parameter_count": DSRL_ROLLOUT_SYNC_PARAMETER_COUNT,
             "actor_dtype": "bfloat16",
             "observation_contract": {
-                "image": {
+                "main_image": {
                     "key": "dsrl_raw_image",
+                    "shape": [256, 256, 3],
+                    "layout": "HWC",
+                    "dtype": "uint8",
+                    "value_range": [0, 255],
+                    "preprocessing": {
+                        "resize": [64, 64],
+                        "mode": "bilinear",
+                        "align_corners": False,
+                        "output_layout": "NCHW",
+                        "normalization": "uint8_to_minus_one_one",
+                    },
+                },
+                "wrist_image": {
+                    "key": "dsrl_raw_wrist_image",
                     "shape": [256, 256, 3],
                     "layout": "HWC",
                     "dtype": "uint8",
@@ -693,9 +723,9 @@ def export_tabero_dsrl_bundle(
                 },
             },
             "feature_contract": {
-                "order": ["state", "image", "tactile"],
-                "dims": [64, 64, 64],
-                "total_dim": 192,
+                "order": ["state", "main_image", "wrist_image", "tactile"],
+                "dims": [64, 64, 64, 64],
+                "total_dim": 256,
             },
             "noise_contract": {
                 "dim": 32,
@@ -706,10 +736,14 @@ def export_tabero_dsrl_bundle(
             },
             "architecture": {
                 "image_size": 64,
+                "image_views": ["main", "wrist"],
+                "shared_image_encoder": True,
+                "per_view_image_dim": 64,
+                "image_feature_dim": 128,
                 "state_dim": 7,
                 "tactile_shape": [9, 198, 2],
                 "hidden_dims": [128, 128, 128],
-                "feature_dim": 192,
+                "feature_dim": 256,
                 "noise_dim": 32,
             },
             "artifact_audit": AUDIT_NAME,
@@ -718,11 +752,12 @@ def export_tabero_dsrl_bundle(
         _write_json(manifest_path, manifest)
         audit = {
             "format": "tabero_dsrl_artifact_audit",
-            "format_version": 1,
+            "format_version": 2,
             "status": "passed",
             "task_id": task_id,
             "global_step": profile.global_step,
             "reward_semantics": DSRL_REWARD_SEMANTICS,
+            "observation_semantics": DSRL_OBSERVATION_SEMANTICS,
             "source_checkpoint_sha256": checkpoint_hash,
             "base_model_sha256": actual_base_hash,
             "actor_weights_sha256": actor_hash,
@@ -737,6 +772,7 @@ def export_tabero_dsrl_bundle(
                 "base_model_sha256": True,
                 "formal_provenance": True,
                 "reward_semantics": True,
+                "observation_semantics": True,
                 "output_hashes": True,
             },
         }

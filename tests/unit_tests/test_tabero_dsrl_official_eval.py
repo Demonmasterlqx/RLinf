@@ -19,9 +19,10 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
+from rlinf.utils.dsrl_observation import DSRL_OBSERVATION_SEMANTICS
 from rlinf.utils.dsrl_reward import DSRL_REWARD_SEMANTICS
 from rlinf.utils.dsrl_rollout_sync import (
-    DSRL_ROLLOUT_SYNC_MANIFEST_V1,
+    DSRL_ROLLOUT_SYNC_MANIFEST_V2,
     DSRL_ROLLOUT_SYNC_PARAMETER_COUNT,
     DSRL_ROLLOUT_SYNC_TENSOR_COUNT,
 )
@@ -84,23 +85,25 @@ def bundle_fixture(tmp_path):
     save_file(
         {
             key: torch.zeros(shape, dtype=torch.bfloat16)
-            for key, shape in DSRL_ROLLOUT_SYNC_MANIFEST_V1.items()
+            for key, shape in DSRL_ROLLOUT_SYNC_MANIFEST_V2.items()
         },
         actor_path,
         metadata={
             "format": "tabero_dsrl_t2vla",
-            "format_version": "1",
+            "format_version": "2",
             "task_id": "0",
             "global_step": "50",
             "dtype": "bfloat16",
             "reward_semantics": DSRL_REWARD_SEMANTICS,
+            "observation_semantics": DSRL_OBSERVATION_SEMANTICS,
         },
     )
     manifest = {
         "format": "tabero_dsrl_t2vla",
-        "format_version": 1,
+        "format_version": 2,
         "algorithm": "dsrl-sac",
         "reward_semantics": DSRL_REWARD_SEMANTICS,
+        "observation_semantics": DSRL_OBSERVATION_SEMANTICS,
         "task_id": 0,
         "global_step": 50,
         "is_final": True,
@@ -118,13 +121,27 @@ def bundle_fixture(tmp_path):
         "source_git_commit": "4" * 40,
         "actor_weights": "dsrl_actor.safetensors",
         "actor_weights_sha256": _sha256(actor_path),
-        "actor_manifest_version": 1,
+        "actor_manifest_version": 2,
         "actor_tensor_count": DSRL_ROLLOUT_SYNC_TENSOR_COUNT,
         "actor_parameter_count": DSRL_ROLLOUT_SYNC_PARAMETER_COUNT,
         "actor_dtype": "bfloat16",
         "observation_contract": {
-            "image": {
+            "main_image": {
                 "key": "dsrl_raw_image",
+                "shape": [256, 256, 3],
+                "layout": "HWC",
+                "dtype": "uint8",
+                "value_range": [0, 255],
+                "preprocessing": {
+                    "resize": [64, 64],
+                    "mode": "bilinear",
+                    "align_corners": False,
+                    "output_layout": "NCHW",
+                    "normalization": "uint8_to_minus_one_one",
+                },
+            },
+            "wrist_image": {
+                "key": "dsrl_raw_wrist_image",
                 "shape": [256, 256, 3],
                 "layout": "HWC",
                 "dtype": "uint8",
@@ -146,9 +163,9 @@ def bundle_fixture(tmp_path):
             },
         },
         "feature_contract": {
-            "order": ["state", "image", "tactile"],
-            "dims": [64, 64, 64],
-            "total_dim": 192,
+            "order": ["state", "main_image", "wrist_image", "tactile"],
+            "dims": [64, 64, 64, 64],
+            "total_dim": 256,
         },
         "noise_contract": {
             "dim": 32,
@@ -159,10 +176,14 @@ def bundle_fixture(tmp_path):
         },
         "architecture": {
             "image_size": 64,
+            "image_views": ["main", "wrist"],
+            "shared_image_encoder": True,
+            "per_view_image_dim": 64,
+            "image_feature_dim": 128,
             "state_dim": 7,
             "tactile_shape": [9, 198, 2],
             "hidden_dims": [128, 128, 128],
-            "feature_dim": 192,
+            "feature_dim": 256,
             "noise_dim": 32,
         },
         "artifact_audit": "artifact_audit.json",
@@ -171,11 +192,12 @@ def bundle_fixture(tmp_path):
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     audit = {
         "format": "tabero_dsrl_artifact_audit",
-        "format_version": 1,
+        "format_version": 2,
         "status": "passed",
         "task_id": 0,
         "global_step": 50,
         "reward_semantics": DSRL_REWARD_SEMANTICS,
+        "observation_semantics": DSRL_OBSERVATION_SEMANTICS,
         "source_checkpoint_sha256": manifest["source_checkpoint_sha256"],
         "base_model_sha256": manifest["base_model_sha256"],
         "actor_weights_sha256": manifest["actor_weights_sha256"],
@@ -190,6 +212,7 @@ def bundle_fixture(tmp_path):
             "base_model_sha256": True,
             "formal_provenance": True,
             "reward_semantics": True,
+            "observation_semantics": True,
             "output_hashes": True,
         },
     }
@@ -212,16 +235,17 @@ def _retask_bundle_to_small4gpu40(bundle, manifest, audit):
     save_file(
         {
             key: torch.zeros(shape, dtype=torch.bfloat16)
-            for key, shape in DSRL_ROLLOUT_SYNC_MANIFEST_V1.items()
+            for key, shape in DSRL_ROLLOUT_SYNC_MANIFEST_V2.items()
         },
         actor_path,
         metadata={
             "format": "tabero_dsrl_t2vla",
-            "format_version": "1",
+            "format_version": "2",
             "task_id": "5",
             "global_step": "40",
             "dtype": "bfloat16",
             "reward_semantics": DSRL_REWARD_SEMANTICS,
+            "observation_semantics": DSRL_OBSERVATION_SEMANTICS,
         },
     )
     manifest.update(
@@ -252,16 +276,17 @@ def _retask_bundle_to_selected_step10(bundle, manifest, audit):
     save_file(
         {
             key: torch.zeros(shape, dtype=torch.bfloat16)
-            for key, shape in DSRL_ROLLOUT_SYNC_MANIFEST_V1.items()
+            for key, shape in DSRL_ROLLOUT_SYNC_MANIFEST_V2.items()
         },
         actor_path,
         metadata={
             "format": "tabero_dsrl_t2vla",
-            "format_version": "1",
+            "format_version": "2",
             "task_id": "0",
             "global_step": "10",
             "dtype": "bfloat16",
             "reward_semantics": DSRL_REWARD_SEMANTICS,
+            "observation_semantics": DSRL_OBSERVATION_SEMANTICS,
         },
     )
     manifest.update(
@@ -419,11 +444,12 @@ def test_validate_bundle_rejects_actor_keyspace(bundle_fixture):
         actor_path,
         metadata={
             "format": "tabero_dsrl_t2vla",
-            "format_version": "1",
+            "format_version": "2",
             "task_id": "0",
             "global_step": "50",
             "dtype": "bfloat16",
             "reward_semantics": DSRL_REWARD_SEMANTICS,
+            "observation_semantics": DSRL_OBSERVATION_SEMANTICS,
         },
     )
     manifest["actor_weights_sha256"] = _sha256(actor_path)
@@ -443,7 +469,7 @@ def test_validate_bundle_rejects_coherently_rehashed_nonfinite_actor(
     bundle, base_model, manifest, audit = bundle_fixture
     tensors = {
         key: torch.zeros(shape, dtype=torch.bfloat16)
-        for key, shape in DSRL_ROLLOUT_SYNC_MANIFEST_V1.items()
+        for key, shape in DSRL_ROLLOUT_SYNC_MANIFEST_V2.items()
     }
     first_key = next(iter(tensors))
     tensors[first_key].flatten()[0] = float("nan")
@@ -453,11 +479,12 @@ def test_validate_bundle_rejects_coherently_rehashed_nonfinite_actor(
         actor_path,
         metadata={
             "format": "tabero_dsrl_t2vla",
-            "format_version": "1",
+            "format_version": "2",
             "task_id": "0",
             "global_step": "50",
             "dtype": "bfloat16",
             "reward_semantics": DSRL_REWARD_SEMANTICS,
+            "observation_semantics": DSRL_OBSERVATION_SEMANTICS,
         },
     )
     manifest["actor_weights_sha256"] = _sha256(actor_path)
@@ -500,13 +527,13 @@ def test_validate_bundle_binds_source_git_commit_to_provenance(bundle_fixture):
     ("mutation", "message"),
     [
         (
-            lambda manifest: manifest["observation_contract"]["image"].update(
+            lambda manifest: manifest["observation_contract"]["main_image"].update(
                 key="wrong"
             ),
             "observation",
         ),
         (
-            lambda manifest: manifest["feature_contract"].update(total_dim=191),
+            lambda manifest: manifest["feature_contract"].update(total_dim=255),
             "feature",
         ),
         (
@@ -520,6 +547,10 @@ def test_validate_bundle_binds_source_git_commit_to_provenance(bundle_fixture):
         (
             lambda manifest: manifest.update(reward_semantics="legacy"),
             "reward_semantics",
+        ),
+        (
+            lambda manifest: manifest.update(observation_semantics="single_camera_v1"),
+            "observation_semantics",
         ),
         (
             lambda manifest: manifest.update(source_checkpoint_sha256="bad"),
@@ -1221,16 +1252,17 @@ def _retask_bundle(bundle, task_id):
     save_file(
         {
             key: torch.zeros(shape, dtype=torch.bfloat16)
-            for key, shape in DSRL_ROLLOUT_SYNC_MANIFEST_V1.items()
+            for key, shape in DSRL_ROLLOUT_SYNC_MANIFEST_V2.items()
         },
         actor_path,
         metadata={
             "format": "tabero_dsrl_t2vla",
-            "format_version": "1",
+            "format_version": "2",
             "task_id": str(task_id),
             "global_step": "50",
             "dtype": "bfloat16",
             "reward_semantics": DSRL_REWARD_SEMANTICS,
+            "observation_semantics": DSRL_OBSERVATION_SEMANTICS,
         },
     )
     manifest_path = bundle / "manifest.json"

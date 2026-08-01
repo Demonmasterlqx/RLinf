@@ -158,8 +158,10 @@ class _CriticModel:
         self.data_q = data_q
         self.next_q = next_q
         self.crossq = crossq
+        self.calls = []
 
     def __call__(self, *, forward_type, obs, actions=None, **_kwargs):
+        self.calls.append((forward_type, obs, _kwargs.get("next_obs")))
         batch_size = obs["state"].shape[0]
         if forward_type == ForwardType.SAC:
             return (
@@ -207,9 +209,19 @@ def _critic_worker(*, use_dsrl, crossq=False, next_q=0.0):
 
 
 def _critic_batch(*, reward_width=CHUNK_LENGTH):
+    current_wrist = torch.full((1, 2, 2, 3), 7, dtype=torch.uint8)
+    next_wrist = torch.full((1, 2, 2, 3), 11, dtype=torch.uint8)
     return {
-        "curr_obs": {"kind": "current", "state": torch.zeros(1, 7)},
-        "next_obs": {"kind": "next", "state": torch.zeros(1, 7)},
+        "curr_obs": {
+            "kind": "current",
+            "state": torch.zeros(1, 7),
+            "wrist_images": current_wrist,
+        },
+        "next_obs": {
+            "kind": "next",
+            "state": torch.zeros(1, 7),
+            "wrist_images": next_wrist,
+        },
         "actions": torch.zeros(1, 50, 32),
         "rewards": torch.zeros(1, reward_width),
         "terminations": torch.zeros(1, reward_width, dtype=torch.bool),
@@ -238,6 +250,21 @@ def test_forward_critic_uses_position_seven_terminal_reward_without_bootstrap(
 
     assert captured["target"].shape == (1, 10)
     assert captured["target"].float().unique().item() == pytest.approx(GAMMA**7)
+    observed = [
+        obs
+        for model in (worker.model, worker.target_model)
+        for _, obs, _ in model.calls
+    ]
+    observed.extend(
+        next_obs
+        for model in (worker.model, worker.target_model)
+        for _, _, next_obs in model.calls
+        if next_obs is not None
+    )
+    assert observed
+    assert all("wrist_images" in obs for obs in observed)
+    assert any(obs is batch["curr_obs"] for obs in observed)
+    assert any(obs is batch["next_obs"] for obs in observed)
 
 
 def test_forward_critic_non_dsrl_reward_sum_and_bootstrap_are_unchanged(monkeypatch):

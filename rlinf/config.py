@@ -26,6 +26,10 @@ from omegaconf.dictconfig import DictConfig
 
 from rlinf.envs import SupportedEnvType
 from rlinf.scheduler.cluster import Cluster
+from rlinf.utils.dsrl_observation import (
+    DSRL_NUM_IMAGES,
+    DSRL_OBSERVATION_SEMANTICS,
+)
 from rlinf.utils.dsrl_reward import DSRL_REWARD_SEMANTICS
 from rlinf.utils.dsrl_rollout_sync import validate_dsrl_rollout_sync_config
 from rlinf.utils.placement import (
@@ -850,6 +854,21 @@ def validate_embodied_cfg(cfg):
                     "Tabero tactile OpenPI DSRL requires "
                     "algorithm.dsrl_reward_semantics="
                     f"{DSRL_REWARD_SEMANTICS!r}; got {reward_semantics!r}."
+                )
+            observation_semantics = algorithm_cfg.get("dsrl_observation_semantics")
+            if observation_semantics != DSRL_OBSERVATION_SEMANTICS:
+                raise ValueError(
+                    "Tabero tactile OpenPI DSRL requires "
+                    "algorithm.dsrl_observation_semantics="
+                    f"{DSRL_OBSERVATION_SEMANTICS!r}; got "
+                    f"{observation_semantics!r}."
+                )
+            dsrl_num_images = openpi_cfg.get("dsrl_num_images")
+            if dsrl_num_images != DSRL_NUM_IMAGES:
+                raise ValueError(
+                    "Tabero tactile OpenPI DSRL requires "
+                    f"actor.model.openpi.dsrl_num_images={DSRL_NUM_IMAGES}; "
+                    f"got {dsrl_num_images!r}."
                 )
     with open_dict(cfg):
         cfg.runner.val_check_interval = cfg.runner.get("val_check_interval", -1)

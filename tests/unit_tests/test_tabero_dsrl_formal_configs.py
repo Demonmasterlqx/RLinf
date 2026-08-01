@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 from omegaconf import OmegaConf
 
+from rlinf.utils.dsrl_observation import DSRL_OBSERVATION_SEMANTICS
 from rlinf.utils.dsrl_reward import DSRL_REWARD_SEMANTICS
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -59,6 +60,7 @@ def test_formal_dsrl_configs_preserve_training_contract(monkeypatch, task_id):
     assert cfg.algorithm.train_actor_steps == 10
     assert cfg.algorithm.gamma == 0.999
     assert cfg.algorithm.dsrl_reward_semantics == DSRL_REWARD_SEMANTICS
+    assert cfg.algorithm.dsrl_observation_semantics == DSRL_OBSERVATION_SEMANTICS
     assert cfg.algorithm.tau == 0.005
     assert cfg.algorithm.entropy_tuning.target_entropy == -16
     assert cfg.actor.optim.lr == 1.0e-4
@@ -74,6 +76,7 @@ def test_formal_dsrl_configs_preserve_training_contract(monkeypatch, task_id):
     assert cfg.rollout.model.model_path == MODEL_PATH
     assert cfg.actor.model.openpi.use_dsrl is True
     assert cfg.actor.model.openpi.dsrl_use_tactile is True
+    assert cfg.actor.model.openpi.dsrl_num_images == 2
     assert cfg.actor.model.openpi.dsrl_state_dim == 7
     assert cfg.actor.model.openpi.dsrl_action_noise_dim == 32
     assert cfg.actor.model.openpi.dsrl_num_q_heads == 10

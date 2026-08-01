@@ -19,6 +19,7 @@ from omegaconf import OmegaConf
 from omegaconf.errors import InterpolationResolutionError
 
 from rlinf.config import validate_embodied_cfg
+from rlinf.utils.dsrl_observation import DSRL_OBSERVATION_SEMANTICS
 from rlinf.utils.dsrl_reward import DSRL_REWARD_SEMANTICS
 
 CONFIG_PATH = (
@@ -106,6 +107,7 @@ def test_dsrl_smoke_runs_one_complete_sac_update(monkeypatch):
     assert cfg.algorithm.update_epoch == 1
     assert cfg.algorithm.gamma == 0.999
     assert cfg.algorithm.dsrl_reward_semantics == DSRL_REWARD_SEMANTICS
+    assert cfg.algorithm.dsrl_observation_semantics == DSRL_OBSERVATION_SEMANTICS
     assert cfg.algorithm.tau == 0.005
     assert cfg.algorithm.replay_buffer.min_buffer_size == 1
     assert cfg.algorithm.train_actor_steps == 1
@@ -130,6 +132,33 @@ def test_dsrl_smoke_config_validation_rejects_missing_or_wrong_reward_semantics(
         validate_embodied_cfg(cfg)
 
 
+@pytest.mark.parametrize("semantics", [None, "single_camera_v1"])
+def test_dsrl_smoke_config_validation_rejects_wrong_observation_semantics(
+    monkeypatch,
+    semantics,
+):
+    cfg = _load(monkeypatch)
+    if semantics is None:
+        del cfg.algorithm.dsrl_observation_semantics
+    else:
+        cfg.algorithm.dsrl_observation_semantics = semantics
+
+    with pytest.raises(ValueError, match="dsrl_observation_semantics"):
+        validate_embodied_cfg(cfg)
+
+
+@pytest.mark.parametrize("num_images", [None, 1, 3])
+def test_dsrl_smoke_config_validation_requires_two_images(monkeypatch, num_images):
+    cfg = _load(monkeypatch)
+    if num_images is None:
+        del cfg.actor.model.openpi.dsrl_num_images
+    else:
+        cfg.actor.model.openpi.dsrl_num_images = num_images
+
+    with pytest.raises(ValueError, match="dsrl_num_images=2"):
+        validate_embodied_cfg(cfg)
+
+
 def test_dsrl_smoke_model_and_optimizers_are_tactile_only_steering(monkeypatch):
     cfg = _load(monkeypatch)
     model = cfg.actor.model
@@ -144,6 +173,7 @@ def test_dsrl_smoke_model_and_optimizers_are_tactile_only_steering(monkeypatch):
     assert openpi.add_value_head is False
     assert openpi.use_dsrl is True
     assert openpi.dsrl_use_tactile is True
+    assert openpi.dsrl_num_images == 2
     assert openpi.dsrl_state_dim == 7
     assert openpi.dsrl_action_noise_dim == 32
     assert openpi.dsrl_num_q_heads == 10

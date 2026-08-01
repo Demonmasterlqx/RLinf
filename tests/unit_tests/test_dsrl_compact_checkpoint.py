@@ -26,13 +26,14 @@ from rlinf.models.embodiment.openpi.openpi_action_model import (
     OpenPi0ForRLActionPrediction,
 )
 from rlinf.utils.dsrl_checkpoint import (
-    DSRL_TRAINABLE_MANIFEST_V1,
+    DSRL_TRAINABLE_MANIFEST_V2,
     restore_target_payload,
     select_dsrl_trainable_state,
 )
+from rlinf.utils.dsrl_observation import DSRL_OBSERVATION_SEMANTICS
 from rlinf.utils.dsrl_reward import DSRL_REWARD_SEMANTICS
 from rlinf.utils.dsrl_rollout_sync import (
-    DSRL_ROLLOUT_SYNC_MANIFEST_V1,
+    DSRL_ROLLOUT_SYNC_MANIFEST_V2,
     DSRL_ROLLOUT_SYNC_PREFIXES,
 )
 from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
@@ -173,10 +174,26 @@ def _target_path(base_path):
     return base_path / "sac_components" / "target_model" / "checkpoint_rank_0.pt"
 
 
-def _write_reward_semantics_sidecar(base_path, *, semantics=DSRL_REWARD_SEMANTICS):
+def _write_reward_semantics_sidecar(
+    base_path,
+    *,
+    semantics=DSRL_REWARD_SEMANTICS,
+    observation_semantics=DSRL_OBSERVATION_SEMANTICS,
+    manifest_version=2,
+):
     sidecar = base_path / "model_state_dict" / "trainable_weights.pt"
     sidecar.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"model": {}, "metadata": {"reward_semantics": semantics}}, sidecar)
+    torch.save(
+        {
+            "model": {},
+            "metadata": {
+                "reward_semantics": semantics,
+                "observation_semantics": observation_semantics,
+                "manifest_version": manifest_version,
+            },
+        },
+        sidecar,
+    )
     return sidecar
 
 
@@ -210,12 +227,14 @@ def test_compact_target_save_contains_only_critic_and_exact_shadow(
     runtime = _critic_named_parameters(worker.target_model)
 
     assert payload["format"] == "tabero_dsrl_target"
-    assert payload["version"] == 2
+    assert payload["version"] == 3
     assert payload["metadata"] == {
         "step": 17,
         "rank": 0,
         "world_size": 4,
         "reward_semantics": DSRL_REWARD_SEMANTICS,
+        "observation_semantics": DSRL_OBSERVATION_SEMANTICS,
+        "manifest_version": 2,
         "tensor_count": len(runtime),
         "parameter_count": sum(param.numel() for param in runtime.values()),
         "shadow_tensor_count": len(runtime),
@@ -255,8 +274,9 @@ def test_compact_target_round_trip_restores_parameters_and_shadow_exactly(
     assert worker.target_model.backbone.weight.eq(-9).all()
     assert worker.target_model.actor_image_encoder.weight.eq(-9).all()
     assert receipt["target_model"] == {
-        "format": "compact_v2",
+        "format": "compact_v3",
         "reward_semantics": DSRL_REWARD_SEMANTICS,
+        "observation_semantics": DSRL_OBSERVATION_SEMANTICS,
         "tensor_count": len(expected_model),
         "parameter_count": sum(tensor.numel() for tensor in expected_model.values()),
         "shadow_tensor_count": len(expected_shadow),
@@ -277,12 +297,14 @@ def _valid_compact_payload(worker):
     parameter_count = sum(tensor.numel() for tensor in model.values())
     return {
         "format": "tabero_dsrl_target",
-        "version": 2,
+        "version": 3,
         "metadata": {
             "step": 1,
             "rank": 0,
             "world_size": 4,
             "reward_semantics": DSRL_REWARD_SEMANTICS,
+            "observation_semantics": DSRL_OBSERVATION_SEMANTICS,
+            "manifest_version": 2,
             "tensor_count": len(model),
             "parameter_count": parameter_count,
             "shadow_tensor_count": len(shadow),
@@ -325,6 +347,20 @@ def _valid_compact_payload(worker):
         (
             lambda p: p["metadata"].__setitem__("reward_semantics", "legacy"),
             "reward semantics mismatch",
+        ),
+        (
+            lambda p: p["metadata"].pop("observation_semantics"),
+            "observation semantics mismatch",
+        ),
+        (
+            lambda p: p["metadata"].__setitem__(
+                "observation_semantics", "single_camera_v1"
+            ),
+            "observation semantics mismatch",
+        ),
+        (
+            lambda p: p["metadata"].__setitem__("manifest_version", 1),
+            "manifest version mismatch",
         ),
         (lambda p: p["metadata"].__setitem__("rank", 3), "rank"),
         (lambda p: p["metadata"].__setitem__("rank", False), "rank.*integer"),
@@ -390,16 +426,16 @@ def test_legacy_full_target_is_rejected(tmp_path, distributed):
 
 
 def _canonical_trainable_shapes():
-    shapes = dict(DSRL_ROLLOUT_SYNC_MANIFEST_V1)
+    shapes = dict(DSRL_ROLLOUT_SYNC_MANIFEST_V2)
     shapes.update(
         {
             name.replace("actor_", "critic_", 1): shape
-            for name, shape in DSRL_ROLLOUT_SYNC_MANIFEST_V1.items()
+            for name, shape in DSRL_ROLLOUT_SYNC_MANIFEST_V2.items()
             if name.startswith("actor_")
         }
     )
     q_layer_shapes = {
-        "net.0.weight": (128, 224),
+        "net.0.weight": (128, 288),
         "net.0.bias": (128,),
         "net.1.weight": (128,),
         "net.1.bias": (128,),
@@ -422,7 +458,7 @@ def _canonical_trainable_shapes():
             }
         )
     assert len(shapes) == 220
-    assert sum(prod(shape) for shape in shapes.values()) == 5_183_754
+    assert sum(prod(shape) for shape in shapes.values()) == 5_273_866
     return shapes
 
 
@@ -486,13 +522,13 @@ def test_dsrl_sidecar_saves_exact_direct_trainable_manifest(tmp_path, distribute
         weights_only=True,
     )
     assert len(payload["model"]) == 220
-    assert sum(tensor.numel() for tensor in payload["model"].values()) == 5_183_754
+    assert sum(tensor.numel() for tensor in payload["model"].values()) == 5_273_866
     assert all(name.startswith(TRAINABLE_PREFIXES) for name in payload["model"])
     assert all(tensor.device.type == "cpu" for tensor in payload["model"].values())
     assert all(tensor.is_contiguous() for tensor in payload["model"].values())
     assert payload["metadata"]["parameter_count"] == 220
     assert payload["metadata"]["tensor_count"] == 220
-    assert payload["metadata"]["total_parameter_count"] == 5_183_754
+    assert payload["metadata"]["total_parameter_count"] == 5_273_866
     assert payload["metadata"]["reward_semantics"] == DSRL_REWARD_SEMANTICS
     assert payload["metadata"]["global_step"] == 50
     assert payload["metadata"]["is_final"] is True
@@ -624,6 +660,7 @@ def _representative_runtime_components():
     model.config = SimpleNamespace(
         use_dsrl=True,
         dsrl_use_tactile=True,
+        dsrl_num_images=2,
         dsrl_tactile_latent_dim=64,
         dsrl_state_dim=7,
         dsrl_action_noise_dim=32,
@@ -642,9 +679,9 @@ def test_dsrl_trainable_manifest_matches_representative_runtime_components():
 
     state = select_dsrl_trainable_state(model)
 
-    assert set(state) == set(DSRL_TRAINABLE_MANIFEST_V1)
+    assert set(state) == set(DSRL_TRAINABLE_MANIFEST_V2)
     assert {name: tuple(tensor.shape) for name, tensor in state.items()} == dict(
-        DSRL_TRAINABLE_MANIFEST_V1
+        DSRL_TRAINABLE_MANIFEST_V2
     )
 
 
@@ -655,7 +692,7 @@ def test_opted_in_dsrl_shadow_uses_complete_canonical_target_selection():
     worker._init_target_shadow()
 
     expected = {
-        name for name in DSRL_TRAINABLE_MANIFEST_V1 if name.startswith(CRITIC_PREFIXES)
+        name for name in DSRL_TRAINABLE_MANIFEST_V2 if name.startswith(CRITIC_PREFIXES)
     }
     assert set(worker._target_shadow_f32) == expected
     assert all(
@@ -720,7 +757,7 @@ def test_dsrl_sidecar_rejects_bad_key_count_or_finite(
 
 def test_dsrl_sidecar_rejects_same_numel_wrong_shape():
     model = _ManyParameters()
-    model.replace_shape("q_head.q_heads.0.net.0.weight", (224, 128))
+    model.replace_shape("q_head.q_heads.0.net.0.weight", (288, 128))
 
     with pytest.raises(ValueError, match="shape mismatches"):
         select_dsrl_trainable_state(model)
@@ -816,6 +853,42 @@ def test_compact_dsrl_resume_rejects_wrong_semantics_before_any_restore(tmp_path
     _write_reward_semantics_sidecar(tmp_path, semantics="legacy")
 
     with pytest.raises(ValueError, match="Legacy checkpoints cannot be resumed"):
+        worker.load_checkpoint(str(tmp_path))
+
+    assert worker._strategy.load_calls == []
+    assert worker.replay_buffer.total_samples == 0
+
+
+@pytest.mark.parametrize("observation_semantics", [None, "single_camera_v1"])
+def test_compact_dsrl_resume_rejects_wrong_observation_semantics_before_any_restore(
+    tmp_path,
+    observation_semantics,
+):
+    worker = _worker()
+    _write_reward_semantics_sidecar(
+        tmp_path,
+        observation_semantics=observation_semantics,
+    )
+
+    with pytest.raises(ValueError, match="observation semantics mismatch"):
+        worker.load_checkpoint(str(tmp_path))
+
+    assert worker._strategy.load_calls == []
+    assert worker.replay_buffer.total_samples == 0
+
+
+@pytest.mark.parametrize("manifest_version", [None, 1])
+def test_compact_dsrl_resume_rejects_wrong_manifest_version_before_any_restore(
+    tmp_path,
+    manifest_version,
+):
+    worker = _worker()
+    _write_reward_semantics_sidecar(
+        tmp_path,
+        manifest_version=manifest_version,
+    )
+
+    with pytest.raises(ValueError, match="manifest version mismatch"):
         worker.load_checkpoint(str(tmp_path))
 
     assert worker._strategy.load_calls == []

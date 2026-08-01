@@ -8,6 +8,10 @@
 from dataclasses import dataclass
 from typing import Any
 
+from rlinf.utils.dsrl_observation import (
+    DSRL_NUM_IMAGES,
+    DSRL_OBSERVATION_SEMANTICS,
+)
 from rlinf.utils.dsrl_reward import DSRL_REWARD_SEMANTICS
 
 FORMAL_8GPU_50STEP_PROFILE = "formal_8gpu_50step"
@@ -55,6 +59,11 @@ _PROFILES = {
             ("algorithm.update_epoch", 200),
             ("algorithm.gamma", 0.999),
             ("algorithm.dsrl_reward_semantics", DSRL_REWARD_SEMANTICS),
+            (
+                "algorithm.dsrl_observation_semantics",
+                DSRL_OBSERVATION_SEMANTICS,
+            ),
+            ("actor.model.openpi.dsrl_num_images", DSRL_NUM_IMAGES),
             ("algorithm.tau", 0.005),
         ),
     ),
@@ -76,6 +85,11 @@ _PROFILES = {
             ("algorithm.update_epoch", 200),
             ("algorithm.gamma", 0.999),
             ("algorithm.dsrl_reward_semantics", DSRL_REWARD_SEMANTICS),
+            (
+                "algorithm.dsrl_observation_semantics",
+                DSRL_OBSERVATION_SEMANTICS,
+            ),
+            ("actor.model.openpi.dsrl_num_images", DSRL_NUM_IMAGES),
             ("algorithm.tau", 0.005),
         ),
     ),
@@ -111,6 +125,11 @@ _PROFILES = {
             ("algorithm.update_epoch", 20),
             ("algorithm.gamma", 0.999),
             ("algorithm.dsrl_reward_semantics", DSRL_REWARD_SEMANTICS),
+            (
+                "algorithm.dsrl_observation_semantics",
+                DSRL_OBSERVATION_SEMANTICS,
+            ),
+            ("actor.model.openpi.dsrl_num_images", DSRL_NUM_IMAGES),
             ("algorithm.tau", 0.005),
             ("algorithm.replay_buffer.min_buffer_size", 5),
             ("algorithm.train_actor_steps", 10),
@@ -136,6 +155,11 @@ _PROFILES = {
             ("algorithm.update_epoch", 200),
             ("algorithm.gamma", 0.999),
             ("algorithm.dsrl_reward_semantics", DSRL_REWARD_SEMANTICS),
+            (
+                "algorithm.dsrl_observation_semantics",
+                DSRL_OBSERVATION_SEMANTICS,
+            ),
+            ("actor.model.openpi.dsrl_num_images", DSRL_NUM_IMAGES),
             ("algorithm.tau", 0.005),
         ),
     ),

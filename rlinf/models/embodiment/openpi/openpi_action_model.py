@@ -105,6 +105,7 @@ class OpenPi0Config(Pi0Config):
     dsrl_num_q_heads: int = 10  # Number of Q-networks
     dsrl_agg_q: str = "mean"  # Q aggregation method: 'mean' | 'min'
     dsrl_image_latent_dim: int = 64  # Latent dim for lightweight image encoder
+    dsrl_num_images: int = 1  # Number of ordered DSRL image views
     dsrl_state_latent_dim: int = 64  # Hidden dim for state encoder
     dsrl_use_tactile: bool = False  # Include TacField history in DSRL steering
     dsrl_tactile_latent_dim: int = 64  # Latent dim for each tactile encoder
@@ -307,8 +308,14 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         tactile_latent_dim = (
             self.config.dsrl_tactile_latent_dim if self.config.dsrl_use_tactile else 0
         )
+        dsrl_num_images = int(getattr(self.config, "dsrl_num_images", 1))
+        if dsrl_num_images not in {1, 2}:
+            raise ValueError(
+                f"OpenPI DSRL dsrl_num_images must be 1 or 2; got {dsrl_num_images}."
+            )
         state_side_dim = self.config.dsrl_state_latent_dim + tactile_latent_dim
-        dsrl_input_dim = state_side_dim + self.config.dsrl_image_latent_dim
+        image_side_dim = self.config.dsrl_image_latent_dim * dsrl_num_images
+        dsrl_input_dim = state_side_dim + image_side_dim
 
         self.dsrl_action_noise_net = GaussianPolicy(
             input_dim=dsrl_input_dim,
@@ -353,7 +360,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             ).to(dtype=dsrl_dtype)
         self.q_head = CompactMultiQHead(
             state_dim=state_side_dim,
-            image_dim=self.config.dsrl_image_latent_dim,
+            image_dim=image_side_dim,
             action_dim=self.config.dsrl_action_noise_dim,
             hidden_dims=self.config.dsrl_hidden_dims,
             num_q_heads=self.config.dsrl_num_q_heads,
@@ -1180,6 +1187,9 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         compute_values=True,
         **kwargs,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
+        dsrl_obs = None
+        if self.config.use_dsrl:
+            dsrl_obs = self._normalize_dsrl_obs(env_obs)
         if self.config.use_dsrl and self.config.dsrl_use_tactile:
             main_images = env_obs.get("main_images")
             batch_size = (
@@ -1203,12 +1213,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             # DSRL mode (both train and eval)
 
             # Step 1: SAC agent outputs noise
-            dsrl_obs = {
-                "images": [env_obs["main_images"]],
-                "states": env_obs["states"],
-            }
-            if "tactile_marker_motion" in env_obs:
-                dsrl_obs["tactile_marker_motion"] = env_obs["tactile_marker_motion"]
+            assert dsrl_obs is not None
             noise_actions, noise_logprob, _ = self.sac_forward(
                 dsrl_obs, train=False, mode=mode
             )
@@ -1823,21 +1828,92 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
     # ===== DSRL-specific methods =====
 
     def _normalize_dsrl_obs(self, obs):
-        """Convert environment observations without dropping optional TacField data."""
-        if "images" in obs:
-            return obs
-        if "main_images" not in obs:
+        """Normalize and validate the ordered DSRL image-view contract."""
+        num_images = int(getattr(self.config, "dsrl_num_images", 1))
+        if num_images not in {1, 2}:
             raise ValueError(
-                f"Invalid obs format: {obs.keys()}. Expected 'images' or "
-                "'main_images' key."
+                f"OpenPI DSRL dsrl_num_images must be 1 or 2; got {num_images}."
             )
-        normalized = {
-            "images": [obs["main_images"]],
-            "states": obs["states"],
-        }
+        if "images" in obs:
+            normalized = dict(obs)
+        else:
+            if "main_images" not in obs:
+                raise ValueError(
+                    f"Invalid obs format: {obs.keys()}. Expected 'images' or "
+                    "'main_images' key."
+                )
+            images = [obs["main_images"]]
+            if num_images == 2:
+                if "wrist_images" not in obs or obs["wrist_images"] is None:
+                    raise ValueError(
+                        "OpenPI DSRL dual-camera mode requires 'wrist_images'; "
+                        f"available keys={list(obs.keys())}."
+                    )
+                images.append(obs["wrist_images"])
+            normalized = {
+                "images": images,
+                "states": obs["states"],
+            }
         if "tactile_marker_motion" in obs:
             normalized["tactile_marker_motion"] = obs["tactile_marker_motion"]
+        self._validate_dsrl_image_views(normalized["images"], normalized.get("states"))
         return normalized
+
+    def _validate_dsrl_image_views(self, images, states=None):
+        num_images = int(getattr(self.config, "dsrl_num_images", 1))
+        if not isinstance(images, (list, tuple)):
+            raise ValueError(
+                "OpenPI DSRL 'images' must be an ordered list/tuple in "
+                "main-to-wrist order."
+            )
+        if len(images) != num_images:
+            raise ValueError(
+                f"OpenPI DSRL expected {num_images} image views in main-to-wrist "
+                f"order; got {len(images)}."
+            )
+
+        expected_batch = (
+            int(states.shape[0])
+            if torch.is_tensor(states) and states.ndim > 0
+            else None
+        )
+        is_tabero_dual_camera = (
+            getattr(self.config, "config_name", None) == "pi0_lora_tacfield_tabero"
+            and num_images == 2
+        )
+        view_names = ("main", "wrist") if num_images == 2 else ("main",)
+        for view_name, image in zip(view_names, images, strict=True):
+            if not torch.is_tensor(image) or image.ndim != 4:
+                actual = tuple(image.shape) if hasattr(image, "shape") else None
+                raise ValueError(
+                    f"OpenPI DSRL {view_name} image must be a rank-4 tensor; "
+                    f"got {actual}."
+                )
+            if expected_batch is not None and image.shape[0] != expected_batch:
+                raise ValueError(
+                    f"OpenPI DSRL {view_name} image batch mismatch: expected "
+                    f"{expected_batch}, got {image.shape[0]}."
+                )
+            is_nhwc = image.shape[-1] == 3
+            is_nchw = image.shape[1] == 3
+            if not is_nhwc and not is_nchw:
+                raise ValueError(
+                    f"OpenPI DSRL {view_name} image expected RGB in NHWC or NCHW; "
+                    f"got {tuple(image.shape)}."
+                )
+            if is_tabero_dual_camera:
+                expected_shape = (expected_batch, 256, 256, 3)
+                if tuple(image.shape) != expected_shape:
+                    raise ValueError(
+                        f"Tabero DSRL {view_name} image expected shape "
+                        f"{expected_shape}; got {tuple(image.shape)}."
+                    )
+                if image.dtype != torch.uint8:
+                    raise ValueError(
+                        f"Tabero DSRL {view_name} image must use uint8; "
+                        f"got {image.dtype}."
+                    )
+        return images
 
     def _validate_dsrl_tactile(self, obs, *, batch_size):
         key = "tactile_marker_motion"
@@ -1894,8 +1970,8 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
 
         obs = self._normalize_dsrl_obs(obs)
 
-        # Preprocess images: resize to 64x64, use only agentview camera
-        # Returns [B, 1, C, 64, 64] in [-1, 1] range (float32)
+        # Preprocess ordered image views independently.
+        # Returns [B, N, C, 64, 64] in [-1, 1] range (float32).
         images = self._preprocess_dsrl_images(obs["images"], train=train)
         states = self._preprocess_states(obs["states"])
 
@@ -1912,7 +1988,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             )
 
         # Extract features (using actor's independent encoder)
-        image_features = self.actor_image_encoder(images)  # [B, 64]
+        image_features = self._encode_dsrl_image_views(images, self.actor_image_encoder)
         state_features = self.actor_state_encoder(states)  # [B, 64]
         features = [state_features, image_features]
         if tactile is not None:
@@ -1970,8 +2046,8 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
 
         obs = self._normalize_dsrl_obs(obs)
 
-        # Preprocess images: resize to 64x64, use only agentview camera
-        # Returns [B, 1, C, 64, 64] in [-1, 1] range (float32)
+        # Preprocess ordered image views independently.
+        # Returns [B, N, C, 64, 64] in [-1, 1] range (float32).
         images = self._preprocess_dsrl_images(obs["images"], train=train)
         states = self._preprocess_states(obs["states"])
 
@@ -1989,7 +2065,9 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             )
 
         # Extract features (using critic's independent encoder)
-        image_features = self.critic_image_encoder(images)
+        image_features = self._encode_dsrl_image_views(
+            images, self.critic_image_encoder
+        )
         state_features = self.critic_state_encoder(states)
         tactile_features = None
         if tactile is not None:
@@ -2089,7 +2167,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         return torch.full((), noise_level, device=device, dtype=dtype)
 
     def _preprocess_dsrl_images(self, images, train=False):
-        """Preprocess images for DSRL: resize to 64x64, use only agentview camera.
+        """Preprocess ordered DSRL views independently at 64x64.
 
         Args:
             images: List of tensors.
@@ -2099,57 +2177,48 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             train: Whether to use data augmentation (placeholder for now).
 
         Returns:
-            Tensor of shape [B, 1, C, 64, 64] - only agentview, resized, in [-1, 1].
+            Tensor of shape [B, N, C, 64, 64], resized, in [-1, 1].
         """
+        if not isinstance(images, (list, tuple)):
+            images = [images]
+        resized_views = []
+        for image in images:
+            if image.shape[-1] == 3:
+                image = image.permute(0, 3, 1, 2)
+            elif image.shape[1] != 3:
+                raise ValueError(
+                    "OpenPI DSRL image expected RGB in NHWC or NCHW; "
+                    f"got {tuple(image.shape)}."
+                )
+            if image.dtype == torch.uint8:
+                image = image.float() / 255.0
+            else:
+                image = image.float()
+                if image.min() < 0:
+                    image = (image + 1.0) / 2.0
+            image = image.clamp(0.0, 1.0)
+            image = F.interpolate(
+                image,
+                size=(64, 64),
+                mode="bilinear",
+                align_corners=False,
+            )
+            resized_views.append(image * 2.0 - 1.0)
+        return torch.stack(resized_views, dim=1)
 
-        # Extract only agentview camera (first image in the list)
-        if isinstance(images, list):
-            agentview_img = images[0]
-        else:
-            # Assume it's already a tensor
-            agentview_img = images
-
-        # Detect and convert NHWC -> NCHW (environment outputs NHWC)
-        if agentview_img.shape[-1] == 3:
-            # NHWC format: [B, H, W, C] -> [B, C, H, W]
-            agentview_img = agentview_img.permute(0, 3, 1, 2)
-
-        B, C, H, W = agentview_img.shape
-        target_size = 64
-
-        # ===== UNIFIED VALUE RANGE HANDLING =====
-        # Convert to float32 and normalize to [0, 1] for PyTorch resize
-        if agentview_img.dtype == torch.uint8:
-            # [0, 255] -> [0, 1]
-            agentview_img = agentview_img.float() / 255.0
-        else:
-            # Check if in [-1, 1] range
-            if agentview_img.min() < 0:
-                # [-1, 1] -> [0, 1]
-                agentview_img = (agentview_img + 1.0) / 2.0
-            # else: already in [0, 1] range, assume correctly normalized
-        # ===========================================
-
-        # Clamp to ensure valid range
-        agentview_img = agentview_img.clamp(0.0, 1.0)
-
-        # ===== GPU-ACCELERATED RESIZE (aligned with PIL behavior) =====
-        # PyTorch bilinear with align_corners=False approximates PIL's behavior
-        resized_img = F.interpolate(
-            agentview_img,
-            size=(target_size, target_size),
-            mode="bilinear",
-            align_corners=False,
+    @staticmethod
+    def _encode_dsrl_image_views(images, encoder):
+        """Share one image encoder across views, then concatenate by view order."""
+        if images.ndim != 5:
+            raise ValueError(
+                f"OpenPI DSRL encoded images expected [B,N,C,H,W]; got {tuple(images.shape)}."
+            )
+        batch_size, num_images, channels, height, width = images.shape
+        view_batch = images.reshape(batch_size * num_images, 1, channels, height, width)
+        per_view_features = encoder(view_batch)
+        return per_view_features.reshape(batch_size, num_images, -1).reshape(
+            batch_size, -1
         )
-        # =============================================================
-
-        # Convert back to [-1, 1] range (to match PIL-based pipeline)
-        resized_img = resized_img * 2.0 - 1.0  # [0, 1] -> [-1, 1]
-
-        # Add num_images dimension: [B, C, 64, 64] -> [B, 1, C, 64, 64]
-        resized_img = resized_img.unsqueeze(1)
-
-        return resized_img
 
     def _preprocess_states(self, states):
         """
