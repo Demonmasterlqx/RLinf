@@ -12,6 +12,8 @@ from pathlib import Path
 import pytest
 from omegaconf import OmegaConf
 
+from rlinf.utils.dsrl_reward import DSRL_REWARD_SEMANTICS
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_DIR = REPO_ROOT / "examples" / "embodiment" / "config"
 LAUNCHER = REPO_ROOT / "examples" / "embodiment" / "run_tabero_firm_matrix_train.sh"
@@ -56,6 +58,7 @@ def test_formal_dsrl_configs_preserve_training_contract(monkeypatch, task_id):
     assert cfg.algorithm.replay_buffer.min_buffer_size == 10
     assert cfg.algorithm.train_actor_steps == 10
     assert cfg.algorithm.gamma == 0.999
+    assert cfg.algorithm.dsrl_reward_semantics == DSRL_REWARD_SEMANTICS
     assert cfg.algorithm.tau == 0.005
     assert cfg.algorithm.entropy_tuning.target_entropy == -16
     assert cfg.actor.optim.lr == 1.0e-4

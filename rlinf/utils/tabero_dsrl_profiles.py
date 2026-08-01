@@ -8,6 +8,8 @@
 from dataclasses import dataclass
 from typing import Any
 
+from rlinf.utils.dsrl_reward import DSRL_REWARD_SEMANTICS
+
 FORMAL_8GPU_50STEP_PROFILE = "formal_8gpu_50step"
 TASK5_4GPU_40STEP_SMALL_PROFILE = "task5_4gpu_40step_small"
 TASK0_SELECTED_STEP10_PROFILE = "task0_selected_step10"
@@ -52,6 +54,7 @@ _PROFILES = {
             ("env.train.rollout_epoch", 2),
             ("algorithm.update_epoch", 200),
             ("algorithm.gamma", 0.999),
+            ("algorithm.dsrl_reward_semantics", DSRL_REWARD_SEMANTICS),
             ("algorithm.tau", 0.005),
         ),
     ),
@@ -72,6 +75,7 @@ _PROFILES = {
             ("env.train.rollout_epoch", 2),
             ("algorithm.update_epoch", 200),
             ("algorithm.gamma", 0.999),
+            ("algorithm.dsrl_reward_semantics", DSRL_REWARD_SEMANTICS),
             ("algorithm.tau", 0.005),
         ),
     ),
@@ -106,6 +110,7 @@ _PROFILES = {
             ),
             ("algorithm.update_epoch", 20),
             ("algorithm.gamma", 0.999),
+            ("algorithm.dsrl_reward_semantics", DSRL_REWARD_SEMANTICS),
             ("algorithm.tau", 0.005),
             ("algorithm.replay_buffer.min_buffer_size", 5),
             ("algorithm.train_actor_steps", 10),
@@ -130,6 +135,7 @@ _PROFILES = {
             ("env.train.rollout_epoch", 2),
             ("algorithm.update_epoch", 200),
             ("algorithm.gamma", 0.999),
+            ("algorithm.dsrl_reward_semantics", DSRL_REWARD_SEMANTICS),
             ("algorithm.tau", 0.005),
         ),
     ),

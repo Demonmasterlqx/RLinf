@@ -19,6 +19,7 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
+from rlinf.utils.dsrl_reward import DSRL_REWARD_SEMANTICS
 from rlinf.utils.dsrl_rollout_sync import (
     DSRL_ROLLOUT_SYNC_MANIFEST_V1,
     DSRL_ROLLOUT_SYNC_PARAMETER_COUNT,
@@ -92,12 +93,14 @@ def bundle_fixture(tmp_path):
             "task_id": "0",
             "global_step": "50",
             "dtype": "bfloat16",
+            "reward_semantics": DSRL_REWARD_SEMANTICS,
         },
     )
     manifest = {
         "format": "tabero_dsrl_t2vla",
         "format_version": 1,
         "algorithm": "dsrl-sac",
+        "reward_semantics": DSRL_REWARD_SEMANTICS,
         "task_id": 0,
         "global_step": 50,
         "is_final": True,
@@ -172,6 +175,7 @@ def bundle_fixture(tmp_path):
         "status": "passed",
         "task_id": 0,
         "global_step": 50,
+        "reward_semantics": DSRL_REWARD_SEMANTICS,
         "source_checkpoint_sha256": manifest["source_checkpoint_sha256"],
         "base_model_sha256": manifest["base_model_sha256"],
         "actor_weights_sha256": manifest["actor_weights_sha256"],
@@ -185,6 +189,7 @@ def bundle_fixture(tmp_path):
             "actor_finite": True,
             "base_model_sha256": True,
             "formal_provenance": True,
+            "reward_semantics": True,
             "output_hashes": True,
         },
     }
@@ -216,6 +221,7 @@ def _retask_bundle_to_small4gpu40(bundle, manifest, audit):
             "task_id": "5",
             "global_step": "40",
             "dtype": "bfloat16",
+            "reward_semantics": DSRL_REWARD_SEMANTICS,
         },
     )
     manifest.update(
@@ -255,6 +261,7 @@ def _retask_bundle_to_selected_step10(bundle, manifest, audit):
             "task_id": "0",
             "global_step": "10",
             "dtype": "bfloat16",
+            "reward_semantics": DSRL_REWARD_SEMANTICS,
         },
     )
     manifest.update(
@@ -416,6 +423,7 @@ def test_validate_bundle_rejects_actor_keyspace(bundle_fixture):
             "task_id": "0",
             "global_step": "50",
             "dtype": "bfloat16",
+            "reward_semantics": DSRL_REWARD_SEMANTICS,
         },
     )
     manifest["actor_weights_sha256"] = _sha256(actor_path)
@@ -449,6 +457,7 @@ def test_validate_bundle_rejects_coherently_rehashed_nonfinite_actor(
             "task_id": "0",
             "global_step": "50",
             "dtype": "bfloat16",
+            "reward_semantics": DSRL_REWARD_SEMANTICS,
         },
     )
     manifest["actor_weights_sha256"] = _sha256(actor_path)
@@ -507,6 +516,10 @@ def test_validate_bundle_binds_source_git_commit_to_provenance(bundle_fixture):
         (
             lambda manifest: manifest["architecture"].update(state_dim=8),
             "architecture",
+        ),
+        (
+            lambda manifest: manifest.update(reward_semantics="legacy"),
+            "reward_semantics",
         ),
         (
             lambda manifest: manifest.update(source_checkpoint_sha256="bad"),
@@ -1217,6 +1230,7 @@ def _retask_bundle(bundle, task_id):
             "task_id": str(task_id),
             "global_step": "50",
             "dtype": "bfloat16",
+            "reward_semantics": DSRL_REWARD_SEMANTICS,
         },
     )
     manifest_path = bundle / "manifest.json"
@@ -1367,9 +1381,7 @@ def test_launcher_recognizes_task0_60step_profiles_before_preflight(
     )
 
     assert result.returncode != 0
-    assert (
-        f"{training_profile} training profile supports only Task 0" in result.stderr
-    )
+    assert f"{training_profile} training profile supports only Task 0" in result.stderr
     assert "unsupported --training-profile" not in result.stderr
 
 

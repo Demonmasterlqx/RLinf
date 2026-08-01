@@ -30,6 +30,7 @@ from rlinf.utils.dsrl_checkpoint import (
     restore_target_payload,
     select_dsrl_trainable_state,
 )
+from rlinf.utils.dsrl_reward import DSRL_REWARD_SEMANTICS
 from rlinf.utils.dsrl_rollout_sync import (
     DSRL_ROLLOUT_SYNC_MANIFEST_V1,
     DSRL_ROLLOUT_SYNC_PREFIXES,
@@ -172,6 +173,13 @@ def _target_path(base_path):
     return base_path / "sac_components" / "target_model" / "checkpoint_rank_0.pt"
 
 
+def _write_reward_semantics_sidecar(base_path, *, semantics=DSRL_REWARD_SEMANTICS):
+    sidecar = base_path / "model_state_dict" / "trainable_weights.pt"
+    sidecar.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({"model": {}, "metadata": {"reward_semantics": semantics}}, sidecar)
+    return sidecar
+
+
 def _critic_named_parameters(model):
     return {
         name: parameter
@@ -190,6 +198,7 @@ def _save_compact_target(tmp_path, distributed):
         shadow.add_(index / 1000)
 
     worker.save_checkpoint(str(tmp_path), step=17)
+    _write_reward_semantics_sidecar(tmp_path)
     payload = torch.load(_target_path(tmp_path), map_location="cpu", weights_only=True)
     return worker, payload
 
@@ -201,11 +210,12 @@ def test_compact_target_save_contains_only_critic_and_exact_shadow(
     runtime = _critic_named_parameters(worker.target_model)
 
     assert payload["format"] == "tabero_dsrl_target"
-    assert payload["version"] == 1
+    assert payload["version"] == 2
     assert payload["metadata"] == {
         "step": 17,
         "rank": 0,
         "world_size": 4,
+        "reward_semantics": DSRL_REWARD_SEMANTICS,
         "tensor_count": len(runtime),
         "parameter_count": sum(param.numel() for param in runtime.values()),
         "shadow_tensor_count": len(runtime),
@@ -245,7 +255,8 @@ def test_compact_target_round_trip_restores_parameters_and_shadow_exactly(
     assert worker.target_model.backbone.weight.eq(-9).all()
     assert worker.target_model.actor_image_encoder.weight.eq(-9).all()
     assert receipt["target_model"] == {
-        "format": "compact_v1",
+        "format": "compact_v2",
+        "reward_semantics": DSRL_REWARD_SEMANTICS,
         "tensor_count": len(expected_model),
         "parameter_count": sum(tensor.numel() for tensor in expected_model.values()),
         "shadow_tensor_count": len(expected_shadow),
@@ -266,11 +277,12 @@ def _valid_compact_payload(worker):
     parameter_count = sum(tensor.numel() for tensor in model.values())
     return {
         "format": "tabero_dsrl_target",
-        "version": 1,
+        "version": 2,
         "metadata": {
             "step": 1,
             "rank": 0,
             "world_size": 4,
+            "reward_semantics": DSRL_REWARD_SEMANTICS,
             "tensor_count": len(model),
             "parameter_count": parameter_count,
             "shadow_tensor_count": len(shadow),
@@ -304,8 +316,16 @@ def _valid_compact_payload(worker):
             "dtype mismatches",
         ),
         (lambda p: p.__setitem__("format", "wrong_format"), "wrong format"),
-        (lambda p: p.__setitem__("version", 2), "version"),
+        (lambda p: p.__setitem__("version", 1), "version"),
         (lambda p: p.__setitem__("version", True), "version.*integer"),
+        (
+            lambda p: p["metadata"].pop("reward_semantics"),
+            "reward semantics mismatch",
+        ),
+        (
+            lambda p: p["metadata"].__setitem__("reward_semantics", "legacy"),
+            "reward semantics mismatch",
+        ),
         (lambda p: p["metadata"].__setitem__("rank", 3), "rank"),
         (lambda p: p["metadata"].__setitem__("rank", False), "rank.*integer"),
         (
@@ -358,70 +378,11 @@ def _legacy_state(worker):
     return state
 
 
-def test_legacy_full_target_filters_critic_and_rebuilds_shadow(tmp_path, distributed):
+def test_legacy_full_target_is_rejected(tmp_path, distributed):
     worker = _worker()
-    with torch.no_grad():
-        for parameter in worker.target_model.parameters():
-            parameter.fill_(-3)
-    shadow, receipt = restore_target_payload(
-        _legacy_state(worker),
-        worker.target_model,
-        rank=0,
-        world_size=4,
-    )
-    worker._target_shadow_f32 = shadow
-
-    for name, parameter in worker.target_model.named_parameters():
-        expected = 7 if name.startswith(CRITIC_PREFIXES) else -3
-        assert parameter.eq(expected).all(), name
-    assert set(worker._target_shadow_f32) == set(
-        _critic_named_parameters(worker.target_model)
-    )
-    assert all(
-        shadow.dtype == torch.float32 for shadow in worker._target_shadow_f32.values()
-    )
-    assert all(shadow.eq(7).all() for shadow in worker._target_shadow_f32.values())
-    assert receipt["format"] == "legacy_full"
-    assert receipt["tensor_count"] == 8
-    assert worker._strategy.full_load_calls == 0
-
-
-@pytest.mark.parametrize(
-    ("mutation", "message"),
-    [
-        (
-            lambda state: state.pop("module._fsdp_wrapped_module.q_head.bias"),
-            "missing keys",
-        ),
-        (
-            lambda state: state.__setitem__(
-                "module._fsdp_wrapped_module.q_head.extra", torch.ones(1)
-            ),
-            "unexpected keys",
-        ),
-        (
-            lambda state: state.__setitem__(
-                "module._fsdp_wrapped_module.q_head.weight", torch.ones(1)
-            ),
-            "shape mismatches",
-        ),
-        (
-            lambda state: state["module._fsdp_wrapped_module.q_head.weight"].fill_(
-                torch.inf
-            ),
-            "non-finite",
-        ),
-    ],
-)
-def test_legacy_target_load_rejects_invalid_critic_state(
-    tmp_path, distributed, mutation, message
-):
-    worker = _worker()
-    state = _legacy_state(worker)
-    mutation(state)
-    with pytest.raises(ValueError, match=message):
+    with pytest.raises(ValueError, match="wrong format"):
         restore_target_payload(
-            state,
+            _legacy_state(worker),
             worker.target_model,
             rank=0,
             world_size=4,
@@ -532,6 +493,7 @@ def test_dsrl_sidecar_saves_exact_direct_trainable_manifest(tmp_path, distribute
     assert payload["metadata"]["parameter_count"] == 220
     assert payload["metadata"]["tensor_count"] == 220
     assert payload["metadata"]["total_parameter_count"] == 5_183_754
+    assert payload["metadata"]["reward_semantics"] == DSRL_REWARD_SEMANTICS
     assert payload["metadata"]["global_step"] == 50
     assert payload["metadata"]["is_final"] is True
     assert distributed.gathers == [None]
@@ -839,6 +801,48 @@ def test_nonselected_dsrl_target_uses_prior_full_state_apis(tmp_path):
     )
 
 
+def test_compact_dsrl_resume_rejects_missing_semantics_before_any_restore(tmp_path):
+    worker = _worker()
+
+    with pytest.raises(ValueError, match="requires a trainable sidecar"):
+        worker.load_checkpoint(str(tmp_path))
+
+    assert worker._strategy.load_calls == []
+    assert worker.replay_buffer.total_samples == 0
+
+
+def test_compact_dsrl_resume_rejects_wrong_semantics_before_any_restore(tmp_path):
+    worker = _worker()
+    _write_reward_semantics_sidecar(tmp_path, semantics="legacy")
+
+    with pytest.raises(ValueError, match="Legacy checkpoints cannot be resumed"):
+        worker.load_checkpoint(str(tmp_path))
+
+    assert worker._strategy.load_calls == []
+    assert worker.replay_buffer.total_samples == 0
+
+
+def test_compact_dsrl_resume_rejects_old_target_version_before_any_restore(tmp_path):
+    worker = _worker()
+    _write_reward_semantics_sidecar(tmp_path)
+    target_path = _target_path(tmp_path)
+    target_path.parent.mkdir(parents=True)
+    torch.save(
+        {
+            "format": "tabero_dsrl_target",
+            "version": 1,
+            "metadata": {"reward_semantics": DSRL_REWARD_SEMANTICS},
+        },
+        target_path,
+    )
+
+    with pytest.raises(ValueError, match="unsupported version"):
+        worker.load_checkpoint(str(tmp_path))
+
+    assert worker._strategy.load_calls == []
+    assert worker.replay_buffer.total_samples == 0
+
+
 @pytest.mark.parametrize("rank", range(4))
 def test_high_level_checkpoint_preserves_component_calls(tmp_path, distributed, rank):
     worker = _worker()
@@ -857,6 +861,7 @@ def test_high_level_checkpoint_preserves_component_calls(tmp_path, distributed, 
     _init_small_target_shadow(worker)
 
     worker.save_checkpoint(str(tmp_path), step=3)
+    _write_reward_semantics_sidecar(tmp_path)
     receipt = worker.load_checkpoint(str(tmp_path))
 
     assert len(worker._strategy.save_calls) == 2

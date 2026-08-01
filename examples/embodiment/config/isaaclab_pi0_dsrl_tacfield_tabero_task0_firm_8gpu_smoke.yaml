@@ -60,6 +60,7 @@ algorithm:
   critic_actor_ratio: 1
   bootstrap_type: standard
   gamma: 0.999
+  dsrl_reward_semantics: discounted_alive_masked_v1
   tau: 0.005
   entropy_tuning:
     alpha_type: softplus

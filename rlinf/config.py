@@ -26,6 +26,7 @@ from omegaconf.dictconfig import DictConfig
 
 from rlinf.envs import SupportedEnvType
 from rlinf.scheduler.cluster import Cluster
+from rlinf.utils.dsrl_reward import DSRL_REWARD_SEMANTICS
 from rlinf.utils.dsrl_rollout_sync import validate_dsrl_rollout_sync_config
 from rlinf.utils.placement import (
     HybridComponentPlacement,
@@ -838,6 +839,18 @@ def validate_embodied_cfg(cfg):
         raise ValueError("OpenPI DSRL requires actor.model.is_lora=false.")
     if use_dsrl and not only_eval:
         validate_dsrl_rollout_sync_config(cfg.actor)
+        openpi_cfg = model_cfg.get("openpi", {})
+        is_tabero_tactile_dsrl = openpi_cfg.get(
+            "config_name"
+        ) == "pi0_lora_tacfield_tabero" and openpi_cfg.get("dsrl_use_tactile", False)
+        if is_tabero_tactile_dsrl:
+            reward_semantics = algorithm_cfg.get("dsrl_reward_semantics")
+            if reward_semantics != DSRL_REWARD_SEMANTICS:
+                raise ValueError(
+                    "Tabero tactile OpenPI DSRL requires "
+                    "algorithm.dsrl_reward_semantics="
+                    f"{DSRL_REWARD_SEMANTICS!r}; got {reward_semantics!r}."
+                )
     with open_dict(cfg):
         cfg.runner.val_check_interval = cfg.runner.get("val_check_interval", -1)
     enable_eval = cfg.runner.val_check_interval > 0 or only_eval

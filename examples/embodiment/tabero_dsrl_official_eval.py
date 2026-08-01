@@ -26,6 +26,7 @@ from typing import Any
 import torch
 from safetensors import safe_open
 
+from rlinf.utils.dsrl_reward import DSRL_REWARD_SEMANTICS
 from rlinf.utils.dsrl_rollout_sync import (
     DSRL_ROLLOUT_SYNC_MANIFEST_V1,
     DSRL_ROLLOUT_SYNC_MANIFEST_VERSION,
@@ -56,6 +57,7 @@ EXPECTED_AUDIT_CHECKS = {
     "actor_finite",
     "base_model_sha256",
     "formal_provenance",
+    "reward_semantics",
     "output_hashes",
 }
 EXPECTED_AUDIT_KEYS = {
@@ -64,6 +66,7 @@ EXPECTED_AUDIT_KEYS = {
     "status",
     "task_id",
     "global_step",
+    "reward_semantics",
     "source_checkpoint_sha256",
     "base_model_sha256",
     "actor_weights_sha256",
@@ -74,6 +77,7 @@ EXPECTED_MANIFEST_KEYS = {
     "format",
     "format_version",
     "algorithm",
+    "reward_semantics",
     "task_id",
     "global_step",
     "is_final",
@@ -270,6 +274,7 @@ def _validate_actor(
                 "task_id": str(task_id),
                 "global_step": str(profile.global_step),
                 "dtype": "bfloat16",
+                "reward_semantics": DSRL_REWARD_SEMANTICS,
             }
             if metadata != expected_metadata:
                 raise ValueError(
@@ -402,6 +407,11 @@ def validate_bundle(
         manifest.get("format_version"), FORMAT_VERSION, "manifest format_version"
     )
     _require_exact(manifest.get("algorithm"), "dsrl-sac", "manifest algorithm")
+    _require_exact(
+        manifest.get("reward_semantics"),
+        DSRL_REWARD_SEMANTICS,
+        "manifest reward_semantics",
+    )
     _require_exact(manifest.get("task_id"), task_id, "manifest task_id")
     _require_exact(
         manifest.get("global_step"), profile.global_step, "manifest global_step"
@@ -509,6 +519,11 @@ def validate_bundle(
     _require_exact(audit.get("status"), "passed", "audit status")
     _require_exact(audit.get("task_id"), task_id, "audit task_id")
     _require_exact(audit.get("global_step"), profile.global_step, "audit global_step")
+    _require_exact(
+        audit.get("reward_semantics"),
+        DSRL_REWARD_SEMANTICS,
+        "audit reward_semantics",
+    )
     checks = audit.get("checks")
     if (
         not isinstance(checks, dict)

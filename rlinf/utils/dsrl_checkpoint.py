@@ -22,13 +22,14 @@ from typing import Any
 import torch
 from torch import nn
 
+from rlinf.utils.dsrl_reward import DSRL_REWARD_SEMANTICS
 from rlinf.utils.dsrl_rollout_sync import (
     DSRL_ROLLOUT_SYNC_MANIFEST_V1,
     normalize_fsdp_parameter_name,
 )
 
 DSRL_TARGET_FORMAT = "tabero_dsrl_target"
-DSRL_TARGET_VERSION = 1
+DSRL_TARGET_VERSION = 2
 DSRL_TARGET_PREFIXES = (
     "critic_image_encoder.",
     "critic_state_encoder.",
@@ -307,6 +308,7 @@ def build_compact_target_payload(
             "step": step,
             "rank": rank,
             "world_size": world_size,
+            "reward_semantics": DSRL_REWARD_SEMANTICS,
             "tensor_count": len(model_state),
             "parameter_count": parameter_count,
             "shadow_tensor_count": len(shadow_state),
@@ -332,6 +334,12 @@ def _validate_compact_metadata(
         metadata.get("world_size"), label="world_size", minimum=1
     )
     _require_strict_int(metadata.get("step"), label="step", minimum=0)
+    reward_semantics = metadata.get("reward_semantics")
+    if reward_semantics != DSRL_REWARD_SEMANTICS:
+        raise ValueError(
+            "OpenPI DSRL compact target reward semantics mismatch: "
+            f"expected {DSRL_REWARD_SEMANTICS!r}, got {reward_semantics!r}."
+        )
     if checkpoint_rank != rank:
         raise ValueError(
             "OpenPI DSRL compact target rank mismatch: "
@@ -364,16 +372,11 @@ def _validate_compact_metadata(
 def _copy_target_and_build_shadow(
     runtime: Mapping[str, nn.Parameter],
     model_state: Mapping[str, torch.Tensor],
-    shadow_state: Mapping[str, torch.Tensor] | None,
+    shadow_state: Mapping[str, torch.Tensor],
 ) -> dict[str, torch.Tensor]:
     with torch.no_grad():
         for name, parameter in runtime.items():
             parameter.copy_(model_state[name].to(device=parameter.device))
-    if shadow_state is None:
-        return {
-            name: parameter.detach().float().clone()
-            for name, parameter in runtime.items()
-        }
     return {
         name: shadow_state[name]
         .to(device=runtime[name].device, dtype=torch.float32)
@@ -383,6 +386,31 @@ def _copy_target_and_build_shadow(
     }
 
 
+def validate_target_payload_contract(payload: Any) -> None:
+    """Validate the non-tensor contract needed before any checkpoint restore."""
+    if not isinstance(payload, Mapping):
+        raise ValueError("OpenPI DSRL target checkpoint must be a mapping.")
+    if payload.get("format") != DSRL_TARGET_FORMAT:
+        raise ValueError(
+            "OpenPI DSRL target checkpoint has wrong format: "
+            f"{payload.get('format')!r}."
+        )
+    version = _require_strict_int(payload.get("version"), label="version", minimum=1)
+    if version != DSRL_TARGET_VERSION:
+        raise ValueError(
+            f"OpenPI DSRL target checkpoint has unsupported version: {version!r}."
+        )
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, Mapping):
+        raise ValueError("OpenPI DSRL compact target metadata must be a mapping.")
+    reward_semantics = metadata.get("reward_semantics")
+    if reward_semantics != DSRL_REWARD_SEMANTICS:
+        raise ValueError(
+            "OpenPI DSRL compact target reward semantics mismatch: "
+            f"expected {DSRL_REWARD_SEMANTICS!r}, got {reward_semantics!r}."
+        )
+
+
 def restore_target_payload(
     payload: Any,
     target_model: nn.Module,
@@ -390,81 +418,45 @@ def restore_target_payload(
     rank: int,
     world_size: int,
 ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
-    """Validate/copy compact or legacy target tensors and return shadow/receipt."""
-    if not isinstance(payload, Mapping):
-        raise ValueError("OpenPI DSRL target checkpoint must be a mapping.")
+    """Validate/copy a current compact target and return shadow/receipt."""
+    validate_target_payload_contract(payload)
     _require_strict_int(rank, label="runtime rank", minimum=0)
     _require_strict_int(world_size, label="runtime world_size", minimum=1)
     runtime = select_target_parameters(target_model)
 
-    if "format" in payload:
-        if payload.get("format") != DSRL_TARGET_FORMAT:
-            raise ValueError(
-                "OpenPI DSRL target checkpoint has wrong format: "
-                f"{payload.get('format')!r}."
-            )
-        version = _require_strict_int(
-            payload.get("version"), label="version", minimum=1
+    model_state = payload.get("model")
+    shadow_state = payload.get("target_shadow_f32")
+    if not isinstance(model_state, Mapping) or not isinstance(shadow_state, Mapping):
+        raise ValueError(
+            "OpenPI DSRL compact target model and target_shadow_f32 must be mappings."
         )
-        if version != DSRL_TARGET_VERSION:
-            raise ValueError(
-                f"OpenPI DSRL target checkpoint has unsupported version: {version!r}."
-            )
-        model_state = payload.get("model")
-        shadow_state = payload.get("target_shadow_f32")
-        if not isinstance(model_state, Mapping) or not isinstance(
-            shadow_state, Mapping
-        ):
-            raise ValueError(
-                "OpenPI DSRL compact target model and target_shadow_f32 must be mappings."
-            )
-        _validate_tensor_mapping(
-            model_state,
-            runtime,
-            label="compact target parameters",
-            require_runtime_dtype=True,
-        )
-        _validate_tensor_mapping(
-            shadow_state,
-            runtime,
-            label="compact target shadow",
-            require_runtime_dtype=False,
-            require_float32=True,
-        )
-        _validate_compact_metadata(
-            payload.get("metadata"),
-            rank=rank,
-            world_size=world_size,
-            model_state=model_state,
-            shadow_state=shadow_state,
-        )
-        shadow = _copy_target_and_build_shadow(runtime, model_state, shadow_state)
-        receipt = {
-            "format": "compact_v1",
-            "tensor_count": len(model_state),
-            "parameter_count": sum(tensor.numel() for tensor in model_state.values()),
-            "shadow_tensor_count": len(shadow_state),
-        }
-        return shadow, receipt
-
-    legacy_state = _normalize_tensor_mapping(payload, label="legacy target")
-    selected_legacy = {
-        name: tensor
-        for name, tensor in legacy_state.items()
-        if name.startswith(DSRL_TARGET_PREFIXES)
-    }
     _validate_tensor_mapping(
-        selected_legacy,
+        model_state,
         runtime,
-        label="legacy target parameters",
-        require_runtime_dtype=False,
+        label="compact target parameters",
+        require_runtime_dtype=True,
     )
-    shadow = _copy_target_and_build_shadow(runtime, selected_legacy, None)
+    _validate_tensor_mapping(
+        shadow_state,
+        runtime,
+        label="compact target shadow",
+        require_runtime_dtype=False,
+        require_float32=True,
+    )
+    _validate_compact_metadata(
+        payload.get("metadata"),
+        rank=rank,
+        world_size=world_size,
+        model_state=model_state,
+        shadow_state=shadow_state,
+    )
+    shadow = _copy_target_and_build_shadow(runtime, model_state, shadow_state)
     receipt = {
-        "format": "legacy_full",
-        "tensor_count": len(selected_legacy),
-        "parameter_count": sum(tensor.numel() for tensor in selected_legacy.values()),
-        "shadow_tensor_count": len(shadow),
+        "format": "compact_v2",
+        "reward_semantics": DSRL_REWARD_SEMANTICS,
+        "tensor_count": len(model_state),
+        "parameter_count": sum(tensor.numel() for tensor in model_state.values()),
+        "shadow_tensor_count": len(shadow_state),
     }
     return shadow, receipt
 

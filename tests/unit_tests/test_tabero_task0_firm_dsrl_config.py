@@ -18,6 +18,9 @@ import pytest
 from omegaconf import OmegaConf
 from omegaconf.errors import InterpolationResolutionError
 
+from rlinf.config import validate_embodied_cfg
+from rlinf.utils.dsrl_reward import DSRL_REWARD_SEMANTICS
+
 CONFIG_PATH = (
     Path(__file__).resolve().parents[2]
     / "examples"
@@ -102,6 +105,7 @@ def test_dsrl_smoke_runs_one_complete_sac_update(monkeypatch):
     assert cfg.algorithm.loss_type == "embodied_sac"
     assert cfg.algorithm.update_epoch == 1
     assert cfg.algorithm.gamma == 0.999
+    assert cfg.algorithm.dsrl_reward_semantics == DSRL_REWARD_SEMANTICS
     assert cfg.algorithm.tau == 0.005
     assert cfg.algorithm.replay_buffer.min_buffer_size == 1
     assert cfg.algorithm.train_actor_steps == 1
@@ -110,6 +114,20 @@ def test_dsrl_smoke_runs_one_complete_sac_update(monkeypatch):
     assert cfg.algorithm.entropy_tuning.target_entropy == -16
     assert cfg.algorithm.entropy_tuning.optim.lr == 3.0e-4
     assert cfg.rollout.collect_transitions is True
+
+
+@pytest.mark.parametrize("semantics", [None, "legacy"])
+def test_dsrl_smoke_config_validation_rejects_missing_or_wrong_reward_semantics(
+    monkeypatch, semantics
+):
+    cfg = _load(monkeypatch)
+    if semantics is None:
+        del cfg.algorithm.dsrl_reward_semantics
+    else:
+        cfg.algorithm.dsrl_reward_semantics = semantics
+
+    with pytest.raises(ValueError, match="dsrl_reward_semantics"):
+        validate_embodied_cfg(cfg)
 
 
 def test_dsrl_smoke_model_and_optimizers_are_tactile_only_steering(monkeypatch):

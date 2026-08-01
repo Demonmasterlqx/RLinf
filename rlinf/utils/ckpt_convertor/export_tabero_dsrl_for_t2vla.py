@@ -29,6 +29,7 @@ from rlinf.utils.dsrl_checkpoint import (
     DSRL_TRAINABLE_PARAMETER_COUNT,
     DSRL_TRAINABLE_TENSOR_COUNT,
 )
+from rlinf.utils.dsrl_reward import DSRL_REWARD_SEMANTICS
 from rlinf.utils.dsrl_rollout_sync import (
     DSRL_ROLLOUT_SYNC_MANIFEST_V1,
     DSRL_ROLLOUT_SYNC_MANIFEST_VERSION,
@@ -210,6 +211,11 @@ def _validate_metadata(
         raise ValueError("selected DSRL checkpoint format must be trainable_weights")
     if metadata.get("method") != "dsrl":
         raise ValueError("selected DSRL checkpoint method must be dsrl")
+    if metadata.get("reward_semantics") != DSRL_REWARD_SEMANTICS:
+        raise ValueError(
+            "selected DSRL checkpoint reward_semantics must be "
+            f"{DSRL_REWARD_SEMANTICS!r}"
+        )
     _require_strict_int(metadata.get("task_id"), task_id, "task_id")
     if metadata.get("training_config") != expected_config:
         raise ValueError(
@@ -340,6 +346,7 @@ def _validate_config_snapshot(
     require_value("actor.model.openpi.dsrl_use_tactile", True)
     require_value("actor.model.openpi.dsrl_state_dim", 7)
     require_value("actor.model.openpi.dsrl_action_noise_dim", 32)
+    require_value("algorithm.dsrl_reward_semantics", DSRL_REWARD_SEMANTICS)
 
     logger_backends = OmegaConf.select(
         config,
@@ -586,7 +593,9 @@ def export_tabero_dsrl_bundle(
     )
     _require_artifact_unchanged(checkpoint, checkpoint_hash, "source checkpoint")
     if not isinstance(payload, Mapping) or set(payload) != {"model", "metadata"}:
-        raise ValueError("selected DSRL sidecar must contain exactly model and metadata")
+        raise ValueError(
+            "selected DSRL sidecar must contain exactly model and metadata"
+        )
     metadata = _validate_metadata(payload["metadata"], task_id, profile)
     trainable_state = _validate_trainable_state(payload["model"])
     actor_state = {
@@ -617,6 +626,7 @@ def export_tabero_dsrl_bundle(
                 "task_id": str(task_id),
                 "global_step": str(profile.global_step),
                 "dtype": "bfloat16",
+                "reward_semantics": DSRL_REWARD_SEMANTICS,
             },
         )
         saved_actor = load_file(actor_path, device="cpu")
@@ -633,6 +643,7 @@ def export_tabero_dsrl_bundle(
             "format": FORMAT,
             "format_version": FORMAT_VERSION,
             "algorithm": "dsrl-sac",
+            "reward_semantics": DSRL_REWARD_SEMANTICS,
             "task_id": task_id,
             "global_step": profile.global_step,
             "is_final": metadata["is_final"],
@@ -711,6 +722,7 @@ def export_tabero_dsrl_bundle(
             "status": "passed",
             "task_id": task_id,
             "global_step": profile.global_step,
+            "reward_semantics": DSRL_REWARD_SEMANTICS,
             "source_checkpoint_sha256": checkpoint_hash,
             "base_model_sha256": actual_base_hash,
             "actor_weights_sha256": actor_hash,
@@ -724,6 +736,7 @@ def export_tabero_dsrl_bundle(
                 "actor_finite": True,
                 "base_model_sha256": True,
                 "formal_provenance": True,
+                "reward_semantics": True,
                 "output_hashes": True,
             },
         }

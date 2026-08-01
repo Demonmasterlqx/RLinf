@@ -42,6 +42,12 @@ from rlinf.utils.dsrl_checkpoint import (
     restore_target_payload,
     select_compact_target_parameters,
     select_dsrl_trainable_state,
+    validate_target_payload_contract,
+)
+from rlinf.utils.dsrl_reward import (
+    DSRL_REWARD_SEMANTICS,
+    chunk_bootstrap_discount,
+    discounted_alive_masked_chunk_rewards,
 )
 from rlinf.utils.dsrl_rollout_sync import (
     normalize_fsdp_parameter_name,
@@ -381,6 +387,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                     "rank": rank,
                     "world_size": world_size,
                     "format": "trainable_weights",
+                    "reward_semantics": DSRL_REWARD_SEMANTICS,
                     "parameter_count": len(state_dict),
                     "tensor_count": len(state_dict),
                     "total_parameter_count": DSRL_TRAINABLE_PARAMETER_COUNT,
@@ -448,6 +455,46 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         )
         self._logger.info(f"[FSDP] Restored OpenPI DSRL target: {receipt}")
         return receipt
+
+    def _validate_dsrl_resume_reward_semantics(self, load_path: str) -> None:
+        """Reject pre-fix Tabero DSRL checkpoints before restoring any state."""
+        if not self._compact_dsrl_checkpointing_enabled():
+            return
+        sidecar_path = os.path.join(
+            load_path, "model_state_dict", "trainable_weights.pt"
+        )
+        if not os.path.isfile(sidecar_path):
+            raise ValueError(
+                "OpenPI DSRL resume requires a trainable sidecar carrying reward "
+                f"semantics metadata: {sidecar_path}"
+            )
+        payload = torch.load(sidecar_path, map_location="cpu", weights_only=True)
+        if not isinstance(payload, Mapping) or not isinstance(
+            payload.get("metadata"), Mapping
+        ):
+            raise ValueError(
+                "OpenPI DSRL trainable sidecar must contain metadata before resume."
+            )
+        actual_semantics = payload["metadata"].get("reward_semantics")
+        if actual_semantics != DSRL_REWARD_SEMANTICS:
+            raise ValueError(
+                "OpenPI DSRL checkpoint reward semantics mismatch: "
+                f"expected {DSRL_REWARD_SEMANTICS!r}, got {actual_semantics!r}. "
+                "Legacy checkpoints cannot be resumed."
+            )
+        target_path = os.path.join(
+            load_path,
+            "sac_components",
+            "target_model",
+            f"checkpoint_rank_{self._rank}.pt",
+        )
+        if not os.path.isfile(target_path):
+            raise ValueError(
+                "OpenPI DSRL resume requires a compact target checkpoint: "
+                f"{target_path}"
+            )
+        target_payload = torch.load(target_path, map_location="cpu", weights_only=True)
+        validate_target_payload_contract(target_payload)
 
     def soft_update_target_model(self, tau: Optional[float] = None):
         """Soft update target model parameters.
@@ -541,8 +588,18 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         use_dsrl = self.cfg.actor.model.get("openpi", {}).get("use_dsrl", False)
         if use_dsrl:
             num_action_chunks = self.cfg.actor.model.get("num_action_chunks", 1)
-            discount = self.cfg.algorithm.gamma**num_action_chunks
-            rewards_for_bootstrap = batch["rewards"][:, 0:1].to(self.torch_dtype)
+            rewards_for_bootstrap = discounted_alive_masked_chunk_rewards(
+                batch["rewards"],
+                batch["terminations"],
+                batch["truncations"],
+                gamma=self.cfg.algorithm.gamma,
+                num_action_chunks=num_action_chunks,
+            )
+            discount = chunk_bootstrap_discount(
+                self.cfg.algorithm.gamma,
+                num_action_chunks=num_action_chunks,
+                device=batch["rewards"].device,
+            )
         else:
             discount = self.cfg.algorithm.gamma
             rewards_for_bootstrap = (
@@ -1007,6 +1064,8 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         self.replay_buffer.save_checkpoint(buffer_save_path)
 
     def load_checkpoint(self, load_base_path):
+        self._validate_dsrl_resume_reward_semantics(load_base_path)
+
         # load model
         self._strategy.load_checkpoint(
             model=self.model,

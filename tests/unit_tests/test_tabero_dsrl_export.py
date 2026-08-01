@@ -20,6 +20,7 @@ from rlinf.utils.dsrl_checkpoint import (
     DSRL_TRAINABLE_PARAMETER_COUNT,
     DSRL_TRAINABLE_TENSOR_COUNT,
 )
+from rlinf.utils.dsrl_reward import DSRL_REWARD_SEMANTICS
 from rlinf.utils.dsrl_rollout_sync import (
     DSRL_ROLLOUT_SYNC_MANIFEST_V1,
     DSRL_ROLLOUT_SYNC_PARAMETER_COUNT,
@@ -89,6 +90,7 @@ def _checkpoint(
     metadata = {
         "format": "trainable_weights",
         "method": "dsrl",
+        "reward_semantics": DSRL_REWARD_SEMANTICS,
         "task_id": task_id,
         "training_config": profile_metadata["training_config"],
         "target_global_step": profile_metadata["target_global_step"],
@@ -135,6 +137,7 @@ def _formal_config(task_id, base_model, *, profile="formal"):
         "algorithm": {
             "update_epoch": 20 if is_custom else 200,
             "gamma": 0.999,
+            "dsrl_reward_semantics": DSRL_REWARD_SEMANTICS,
             "tau": 0.005,
         },
         "env": {
@@ -393,6 +396,7 @@ def test_export_writes_strict_actor_bundle_and_audit(tmp_path):
     assert manifest["format"] == "tabero_dsrl_t2vla"
     assert manifest["format_version"] == 1
     assert manifest["algorithm"] == "dsrl-sac"
+    assert manifest["reward_semantics"] == DSRL_REWARD_SEMANTICS
     assert manifest["task_id"] == 5
     assert manifest["global_step"] == 50
     assert manifest["is_final"] is True
@@ -447,6 +451,7 @@ def test_export_writes_strict_actor_bundle_and_audit(tmp_path):
 
     audit = json.loads((output_dir / "artifact_audit.json").read_text())
     assert audit["status"] == "passed"
+    assert audit["reward_semantics"] == DSRL_REWARD_SEMANTICS
     assert all(audit["checks"].values())
     assert audit["actor_weights_sha256"] == _sha256(actor_path)
     assert audit["manifest_sha256"] == _sha256(output_dir / "manifest.json")
@@ -493,6 +498,7 @@ def test_export_accepts_final_task5_small4gpu40_profile(tmp_path):
     ("metadata_overrides", "message"),
     [
         ({"method": "pirl"}, "method"),
+        ({"reward_semantics": None}, "reward_semantics"),
         ({"task_id": 0}, "task_id"),
         ({"step": 39}, "step"),
         ({"global_step": 39}, "global_step"),
@@ -557,6 +563,7 @@ def test_export_rejects_wrong_small4gpu40_metadata(
         ("env.train.init_params.wrist_image_key", "wrong"),
         ("env.train.init_params.marker_motion_key", "wrong"),
         ("algorithm.update_epoch", 200),
+        ("algorithm.dsrl_reward_semantics", "legacy"),
         ("algorithm.replay_buffer.min_buffer_size", 10),
         ("algorithm.train_actor_steps", 9),
         ("actor.global_batch_size", 40),
