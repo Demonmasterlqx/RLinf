@@ -278,11 +278,19 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
 
     @staticmethod
     def _assert_no_parameter_gradients(parameters: tuple, phase: str) -> None:
-        unexpected = sum(parameter.grad is not None for parameter in parameters)
+        # FSDP ``use_orig_params=True`` exposes every original parameter as a
+        # view into one flat gradient buffer. A backward pass can therefore
+        # materialize exact-zero grad views for parameters that were not in the
+        # graph. Treat only non-zero views as cross-phase gradient leakage.
+        unexpected = sum(
+            parameter.grad is not None
+            and bool(torch.count_nonzero(parameter.grad.detach()).item())
+            for parameter in parameters
+        )
         if unexpected:
             raise RuntimeError(
-                f"SAC {phase} phase populated {unexpected} gradients outside its "
-                "optimizer parameter set."
+                f"SAC {phase} phase populated {unexpected} non-zero gradients "
+                "outside its optimizer parameter set."
             )
 
     @staticmethod

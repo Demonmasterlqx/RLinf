@@ -74,6 +74,17 @@ def test_dsrl_critic_and_actor_backward_keep_parameter_gradients_isolated():
     assert torch.count_nonzero(worker.model.actor.weight.grad).item() > 0
 
 
+def test_dsrl_gradient_isolation_allows_fsdp_zero_gradient_views():
+    worker = _gradient_partition_worker()
+    worker.model.actor.weight.grad = torch.zeros_like(worker.model.actor.weight)
+
+    worker._assert_no_parameter_gradients(worker._actor_parameters, "critic")
+
+    worker.model.actor.weight.grad[0, 0] = torch.finfo(torch.float32).eps
+    with pytest.raises(RuntimeError, match="1 non-zero gradients"):
+        worker._assert_no_parameter_gradients(worker._actor_parameters, "critic")
+
+
 def test_dsrl_phase_start_clears_stale_model_gradients():
     worker = _gradient_partition_worker()
     worker.model.actor.weight.grad = torch.ones_like(worker.model.actor.weight)
