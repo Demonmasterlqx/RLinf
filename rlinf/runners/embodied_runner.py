@@ -25,9 +25,14 @@ from omegaconf.dictconfig import DictConfig
 from rlinf.scheduler import Channel
 from rlinf.scheduler import WorkerGroupFuncResult as Handle
 from rlinf.utils.distributed import ScopedTimer
+from rlinf.utils.dsrl_reward import compare_tabero_dsrl_reward_audits
 from rlinf.utils.logging import get_logger
 from rlinf.utils.metric_logger import MetricLogger
-from rlinf.utils.metric_utils import compute_evaluate_metrics, print_metrics_table
+from rlinf.utils.metric_utils import (
+    aggregate_tabero_dsrl_env_metrics,
+    compute_evaluate_metrics,
+    print_metrics_table,
+)
 from rlinf.utils.runner_utils import check_progress
 from rlinf.utils.timers import Timer
 
@@ -105,6 +110,7 @@ class EmbodiedRunner:
         self.consumed_samples = 0
         # the step here is GRPO step
         self.global_step = 0
+        self._dsrl_consecutive_zero_success_steps = 0
 
         # compute `max_steps`
         self.set_max_steps()
@@ -332,6 +338,73 @@ class EmbodiedRunner:
 
         return eval_metrics
 
+    def _validate_tabero_dsrl_reward_step(
+        self,
+        *,
+        step: int,
+        env_results: list[dict | None],
+        actor_training_metrics: list[dict],
+    ) -> dict[str, float]:
+        """Validate env-to-replay reward flow before advancing global step."""
+
+        env_results_list = [result for result in env_results if result is not None]
+        exact_env_metrics = aggregate_tabero_dsrl_env_metrics(env_results_list)
+        if not exact_env_metrics:
+            return {}
+
+        aggregated_training_metrics = self._aggregate_numeric_metrics(
+            actor_training_metrics
+        )
+        audit_metrics, mismatch_messages = compare_tabero_dsrl_reward_audits(
+            exact_env_metrics, aggregated_training_metrics
+        )
+        mismatches = list(mismatch_messages)
+
+        firm_success_count = float(exact_env_metrics["firm_success_count"])
+        warmup_steps = int(
+            self.cfg.algorithm.get("replay_buffer", {}).get("min_buffer_size", 0)
+        )
+        if step < warmup_steps:
+            self._dsrl_consecutive_zero_success_steps = 0
+            if firm_success_count <= 0:
+                mismatches.append(
+                    "formal Firm DSRL warm-up produced zero replay reward at "
+                    f"step {step}"
+                )
+        elif firm_success_count <= 0:
+            self._dsrl_consecutive_zero_success_steps += 1
+            if self._dsrl_consecutive_zero_success_steps >= 3:
+                mismatches.append(
+                    "formal Firm DSRL produced zero successes for "
+                    f"{self._dsrl_consecutive_zero_success_steps} consecutive "
+                    "post-warm-up steps"
+                )
+        else:
+            self._dsrl_consecutive_zero_success_steps = 0
+
+        audit_metrics = {
+            "audit/dsrl_reward_match": float(not mismatches),
+            "audit/dsrl_reward_mismatch_count": float(len(mismatches)),
+        }
+        if not mismatches:
+            return audit_metrics
+
+        prefixed_env_metrics = {
+            f"env/{key}": value for key, value in exact_env_metrics.items()
+        }
+        prefixed_training_metrics = {
+            f"train/{key}": value for key, value in aggregated_training_metrics.items()
+        }
+        self.metric_logger.log(prefixed_env_metrics, step)
+        self.metric_logger.log(prefixed_training_metrics, step)
+        self.metric_logger.log(audit_metrics, step)
+        for message in mismatches:
+            self.logger.error(f"Tabero DSRL reward audit mismatch: {message}")
+        raise RuntimeError(
+            "Tabero DSRL reward audit failed before advancing global step: "
+            + "; ".join(mismatches)
+        )
+
     def _log_step_metrics(
         self,
         step: int,
@@ -340,10 +413,12 @@ class EmbodiedRunner:
         env_handle: Handle,
         rollout_handle: Handle,
         actor_training_handle: Handle,
+        env_results: list[dict | None],
         reward_handle: Handle | None,
         actor_rollout_metrics: list[dict],
         actor_training_metrics: list[dict],
         eval_metrics: dict,
+        reward_audit_metrics: dict[str, float],
     ) -> None:
         time_metrics = self.timer.consume_durations()
         time_metrics = {f"time/{k}": v for k, v in time_metrics.items()}
@@ -372,9 +447,9 @@ class EmbodiedRunner:
                 {f"time/reward/{k}": v for k, v in reward_time_metrics.items()}
             )
 
-        env_results = env_handle.wait()
         env_results_list = [results for results in env_results if results is not None]
         env_metrics = compute_evaluate_metrics(env_results_list)
+        env_metrics.update(aggregate_tabero_dsrl_env_metrics(env_results_list))
         env_metrics = {f"env/{k}": v for k, v in env_metrics.items()}
         ranked_env_results = [
             {"rank": rank, "env": rank_metrics}
@@ -398,6 +473,7 @@ class EmbodiedRunner:
         self.metric_logger.log(rollout_metrics, step)
         self.metric_logger.log(time_metrics, step)
         self.metric_logger.log(training_metrics, step)
+        self.metric_logger.log(reward_audit_metrics, step)
         self._log_ranked_metrics(
             metrics_list=actor_rollout_metrics,
             step=step,
@@ -447,6 +523,7 @@ class EmbodiedRunner:
         logging_metrics.update(env_metrics)
         logging_metrics.update(rollout_metrics)
         logging_metrics.update(training_metrics)
+        logging_metrics.update(reward_audit_metrics)
 
         self.print_metrics_table_async(
             step, self.max_steps, start_time, logging_metrics, start_step
@@ -545,6 +622,12 @@ class EmbodiedRunner:
                     if env_bootstrap_handle is not None:
                         env_bootstrap_handle.wait()
 
+                env_results = env_handle.wait()
+                reward_audit_metrics = self._validate_tabero_dsrl_reward_step(
+                    step=_step,
+                    env_results=env_results,
+                    actor_training_metrics=actor_training_metrics,
+                )
                 self.global_step += 1
                 eval_metrics = self._maybe_eval_and_checkpoint(_step)
 
@@ -558,10 +641,12 @@ class EmbodiedRunner:
                 env_handle=env_handle,
                 rollout_handle=rollout_handle,
                 actor_training_handle=actor_training_handle,
+                env_results=env_results,
                 reward_handle=reward_handle,
                 actor_rollout_metrics=actor_rollout_metrics,
                 actor_training_metrics=actor_training_metrics,
                 eval_metrics=eval_metrics,
+                reward_audit_metrics=reward_audit_metrics,
             )
 
         self._finish_run()
@@ -624,6 +709,12 @@ class EmbodiedRunner:
                 if env_bootstrap_handle is not None:
                     env_bootstrap_handle.wait()
 
+                env_results = env_handle.wait()
+                reward_audit_metrics = self._validate_tabero_dsrl_reward_step(
+                    step=_step,
+                    env_results=env_results,
+                    actor_training_metrics=actor_training_metrics,
+                )
                 self.global_step += 1
                 eval_metrics = self._maybe_eval_and_checkpoint(_step)
 
@@ -637,10 +728,12 @@ class EmbodiedRunner:
                 env_handle=env_handle,
                 rollout_handle=rollout_handle,
                 actor_training_handle=actor_training_handle,
+                env_results=env_results,
                 reward_handle=reward_handle,
                 actor_rollout_metrics=actor_rollout_metrics,
                 actor_training_metrics=actor_training_metrics,
                 eval_metrics=eval_metrics,
+                reward_audit_metrics=reward_audit_metrics,
             )
 
         self._finish_run()

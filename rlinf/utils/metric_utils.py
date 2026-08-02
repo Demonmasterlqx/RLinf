@@ -22,6 +22,11 @@ import numpy as np
 import torch
 import torch.distributed
 
+from rlinf.utils.dsrl_reward import (
+    DSRL_REWARD_AUDIT_FIELDS,
+    combine_dsrl_reward_audits,
+)
+
 if TYPE_CHECKING:
     from rlinf.data.embodied_io_struct import Trajectory
 
@@ -360,6 +365,100 @@ def compute_evaluate_metrics(eval_metrics_list):
     all_eval_metrics["num_trajectories"] = sum(trajectory_counts)
 
     return all_eval_metrics
+
+
+def aggregate_tabero_dsrl_env_metrics(
+    env_metrics_list: Sequence[dict],
+) -> dict[str, float]:
+    """Aggregate exact terminal-safe episode rows and reward sufficient stats."""
+
+    has_reward_audit = any(
+        any(key.startswith("reward_audit/") for key in metrics)
+        for metrics in env_metrics_list
+    )
+    if not has_reward_audit:
+        return {}
+
+    audit_shards = []
+    for metrics in env_metrics_list:
+        audit = {}
+        for field in DSRL_REWARD_AUDIT_FIELDS:
+            key = f"reward_audit/{field}"
+            if key not in metrics:
+                raise ValueError(
+                    f"Tabero DSRL env metrics are missing reward audit field {key!r}."
+                )
+            values = _normalize_metric_shard(metrics[key])
+            audit[field] = (
+                float(values.max().item())
+                if field == "reward_max" and values.numel()
+                else float(values.sum().item())
+            )
+        audit_shards.append(audit)
+    combined_audit = combine_dsrl_reward_audits(audit_shards)
+
+    def concatenate(field: str) -> torch.Tensor:
+        shards = [
+            _normalize_metric_shard(metrics[field])
+            for metrics in env_metrics_list
+            if field in metrics
+        ]
+        return torch.cat(shards, dim=0) if shards else torch.empty(0)
+
+    success = concatenate("success_once")
+    returns = concatenate("return")
+    rewards = concatenate("reward")
+    reward_sums = concatenate("reward_sum")
+    terminal_step_rewards = concatenate("terminal_step_reward")
+    terminations = concatenate("termination")
+    truncations = concatenate("truncation")
+    condition_ids = concatenate("condition_id")
+    firm_success = concatenate("firm_success_once")
+    firm_returns = concatenate("firm_return")
+    firm_squeeze = concatenate("firm_squeeze_pred_mean")
+    gentle_success = concatenate("gentle_success_once")
+    gentle_returns = concatenate("gentle_return")
+    gentle_squeeze = concatenate("gentle_squeeze_pred_mean")
+
+    completed_episode_count = int(success.numel())
+    firm_episode_count = int(firm_success.numel())
+    gentle_episode_count = int(gentle_success.numel())
+    nonfirm_episode_count = int(condition_ids.ne(0).sum().item())
+
+    def mean_or_nan(values: torch.Tensor) -> float:
+        return float(values.mean().item()) if values.numel() else float("nan")
+
+    metrics = {
+        f"reward_audit/{field}": value for field, value in combined_audit.items()
+    }
+    metrics.update(
+        {
+            "num_trajectories": completed_episode_count,
+            "completed_episode_count": completed_episode_count,
+            "firm_episode_count": firm_episode_count,
+            "firm_success_count": float(firm_success.sum().item()),
+            "firm_success_rate": mean_or_nan(firm_success),
+            "firm_success_once": mean_or_nan(firm_success),
+            "firm_return": mean_or_nan(firm_returns),
+            "firm_return_sum": float(firm_returns.sum().item()),
+            "firm_squeeze_pred_mean": mean_or_nan(firm_squeeze),
+            "gentle_episode_count": gentle_episode_count,
+            "gentle_success_count": float(gentle_success.sum().item()),
+            "gentle_success_rate": mean_or_nan(gentle_success),
+            "gentle_success_once": mean_or_nan(gentle_success),
+            "gentle_return": mean_or_nan(gentle_returns),
+            "gentle_squeeze_pred_mean": mean_or_nan(gentle_squeeze),
+            "nonfirm_episode_count": nonfirm_episode_count,
+            "success_once": mean_or_nan(success),
+            "return": mean_or_nan(returns),
+            "reward": mean_or_nan(rewards),
+            "reward_sum": float(reward_sums.sum().item()),
+            "terminal_step_reward_sum": float(terminal_step_rewards.sum().item()),
+            "termination_count": float(terminations.sum().item()),
+            "truncation_count": float(truncations.sum().item()),
+        }
+    )
+    return metrics
 
 
 def compute_rollout_metrics(data_buffer: dict) -> dict:

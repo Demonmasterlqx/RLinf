@@ -972,6 +972,32 @@ def validate_embodied_cfg(cfg):
                     f"{TABERO_DSRL_CHUNK_BOUNDARY_MODE!r}; got "
                     f"{chunk_boundary_mode!r}."
                 )
+
+            def validate_firm_prompt_config(split_name: str, init_params) -> None:
+                prompt_cfg = init_params.get("prompt_conditions")
+                if prompt_cfg is None or prompt_cfg.get("enabled") is not True:
+                    raise ValueError(
+                        "Tabero tactile OpenPI DSRL requires Firm prompt "
+                        f"conditions for env.{split_name}."
+                    )
+                condition_cycle = list(prompt_cfg.get("condition_cycle", []))
+                if condition_cycle != ["firm"]:
+                    raise ValueError(
+                        "Tabero tactile OpenPI DSRL requires "
+                        f"env.{split_name}.init_params.prompt_conditions."
+                        "condition_cycle=['firm']; got "
+                        f"{condition_cycle!r}."
+                    )
+                firm_adverbs = list(prompt_cfg.get("firm_adverbs", []))
+                if firm_adverbs != ["firmly", "tightly"]:
+                    raise ValueError(
+                        "Tabero tactile OpenPI DSRL requires "
+                        f"env.{split_name}.init_params.prompt_conditions."
+                        "firm_adverbs=['firmly', 'tightly']; got "
+                        f"{firm_adverbs!r}."
+                    )
+
+            validate_firm_prompt_config("train", cfg.env.train.init_params)
             eval_cfg = cfg.env.get("eval")
             if eval_cfg is not None:
                 eval_boundary_mode = eval_cfg.init_params.get("chunk_boundary_mode")
@@ -982,6 +1008,7 @@ def validate_embodied_cfg(cfg):
                         f"{TABERO_DSRL_CHUNK_BOUNDARY_MODE!r}; got "
                         f"{eval_boundary_mode!r}."
                     )
+                validate_firm_prompt_config("eval", eval_cfg.init_params)
             replay_cfg = algorithm_cfg.get("replay_buffer", {})
             required_replay_values = {
                 "backend": DSRL_REPLAY_BACKEND,

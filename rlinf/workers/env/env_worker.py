@@ -43,6 +43,7 @@ from rlinf.utils.dsrl_replay import (
     DSRL_REPLAY_SEMANTICS,
     compact_tabero_dsrl_observation,
 )
+from rlinf.utils.dsrl_reward import summarize_dsrl_chunk_rewards
 from rlinf.utils.metric_utils import compute_split_num
 from rlinf.utils.nested_dict_process import (
     clone_nested_to_cpu,
@@ -57,6 +58,80 @@ from rlinf.utils.utils import (
     preprocess_embodied_batch,
 )
 from rlinf.workers.env.history_manager import HistoryManager
+
+_TABERO_CHUNK_EPISODE_RECORDS_KEY = "_tabero_chunk_episode_records"
+
+
+def tabero_chunk_episode_records_to_env_info(
+    records: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Project pre-reset Tabero episode records into exact logging samples."""
+
+    required_fields = {
+        "condition_id",
+        "termination",
+        "truncation",
+        "success_once",
+        "return",
+        "episode_len",
+        "reward",
+        "reward_sum",
+        "terminal_step_reward",
+        "squeeze_pred_mean",
+        "task_id",
+        "task_shard_id",
+    }
+    missing = sorted(required_fields - set(records))
+    if missing:
+        if not records:
+            return {}
+        raise ValueError(f"Tabero chunk episode records are missing fields {missing}.")
+
+    record_count = int(records["condition_id"].numel())
+    invalid_shapes = {
+        field: tuple(records[field].shape)
+        for field in required_fields
+        if not torch.is_tensor(records[field])
+        or records[field].ndim != 1
+        or int(records[field].numel()) != record_count
+    }
+    if invalid_shapes:
+        raise ValueError(
+            "Tabero chunk episode records must be aligned 1D tensors; "
+            f"got {invalid_shapes}."
+        )
+
+    env_info = {
+        field: records[field].detach().reshape(-1).cpu()
+        for field in (
+            "success_once",
+            "return",
+            "episode_len",
+            "reward",
+            "reward_sum",
+            "terminal_step_reward",
+            "termination",
+            "truncation",
+            "condition_id",
+            "task_id",
+            "task_shard_id",
+        )
+    }
+    condition_ids = records["condition_id"].detach().reshape(-1)
+    for condition_name, condition_id in (("firm", 0), ("gentle", 1)):
+        mask = condition_ids.eq(condition_id)
+        if not mask.any():
+            continue
+        env_info[f"{condition_name}_success_once"] = (
+            records["success_once"][mask].detach().reshape(-1).cpu()
+        )
+        env_info[f"{condition_name}_return"] = (
+            records["return"][mask].detach().reshape(-1).cpu()
+        )
+        env_info[f"{condition_name}_squeeze_pred_mean"] = (
+            records["squeeze_pred_mean"][mask].detach().reshape(-1).cpu()
+        )
+    return env_info
 
 
 def project_compact_dsrl_rollout_inputs(
@@ -531,7 +606,16 @@ class EnvWorker(Worker):
             infos = infos_list[-1] if infos_list else None
         chunk_dones = torch.logical_or(chunk_terminations, chunk_truncations)
         final_obs = self._build_chunk_final_obs(obs_list, infos_list)
-        if not self.cfg.env.train.auto_reset:
+        tabero_episode_records = (
+            infos.pop(_TABERO_CHUNK_EPISODE_RECORDS_KEY, None)
+            if isinstance(infos, dict)
+            else None
+        )
+        if tabero_episode_records is not None:
+            env_info.update(
+                tabero_chunk_episode_records_to_env_info(tabero_episode_records)
+            )
+        elif not self.cfg.env.train.auto_reset:
             if self.cfg.env.train.ignore_terminations:
                 if chunk_truncations[:, -1].any():
                     assert chunk_truncations[:, -1].all()
@@ -552,6 +636,15 @@ class EnvWorker(Worker):
             for key, value in infos["chunk_boundary_metrics"].items():
                 env_info[f"chunk_boundary/{key}"] = (
                     torch.as_tensor(value).reshape(-1).cpu()
+                )
+
+        if tabero_episode_records is not None:
+            reward_audit = summarize_dsrl_chunk_rewards(
+                chunk_rewards, chunk_terminations, chunk_truncations
+            )
+            for key, value in reward_audit.items():
+                env_info[f"reward_audit/{key}"] = torch.tensor(
+                    [value], dtype=torch.float64
                 )
 
         intervene_actions = (
@@ -1227,6 +1320,7 @@ class EnvWorker(Worker):
                         self.cfg.env.train.auto_reset
                         or self.cfg.env.train.ignore_terminations
                         or chunk_step_idx == self.n_train_chunk_steps - 1
+                        or any(key.startswith("reward_audit/") for key in env_info)
                     )
                     if should_record:
                         self.record_env_metrics(env_metrics, env_info)

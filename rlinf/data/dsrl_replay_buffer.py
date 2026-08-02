@@ -36,7 +36,13 @@ from rlinf.utils.dsrl_replay import (
     DSRL_REPLAY_VIEW_ORDER,
     dsrl_replay_bytes_per_transition,
 )
-from rlinf.utils.dsrl_reward import DSRL_REWARD_SEMANTICS
+from rlinf.utils.dsrl_reward import (
+    DSRL_REWARD_AUDIT_FIELDS,
+    DSRL_REWARD_SEMANTICS,
+    combine_dsrl_reward_audits,
+    empty_dsrl_reward_audit,
+    summarize_dsrl_chunk_rewards,
+)
 from rlinf.utils.dsrl_transition import DSRL_TRANSITION_BOUNDARY_SEMANTICS
 
 
@@ -107,6 +113,7 @@ class CompactDSRLReplayBuffer:
         self._write_pos = 0
         self._valid_samples = 0
         self._total_inserted_samples = 0
+        self._last_insert_reward_audit = empty_dsrl_reward_audit()
         self.size = 0
 
     def _ensure_storage(self) -> dict[str, torch.Tensor]:
@@ -226,11 +233,22 @@ class CompactDSRLReplayBuffer:
         self._total_inserted_samples += original_count
 
     def add_trajectories(self, trajectories: list[Trajectory]) -> None:
+        self._last_insert_reward_audit = empty_dsrl_reward_audit()
         if not trajectories:
             return
+        insertion_audits = []
         for trajectory in trajectories:
-            self._append_flat(self._flatten_trajectory(trajectory))
+            flat = self._flatten_trajectory(trajectory)
+            insertion_audits.append(
+                summarize_dsrl_chunk_rewards(
+                    flat["rewards"],
+                    flat["terminations"],
+                    flat["truncations"],
+                )
+            )
+            self._append_flat(flat)
             self.size += 1
+        self._last_insert_reward_audit = combine_dsrl_reward_audits(insertion_audits)
 
     @staticmethod
     def _nested_batch(flat: Mapping[str, torch.Tensor]) -> dict[str, object]:
@@ -286,7 +304,7 @@ class CompactDSRLReplayBuffer:
         return self._valid_samples
 
     def get_stats(self) -> dict[str, float]:
-        return {
+        stats = {
             "num_trajectories": float(self.size),
             "total_samples": float(self._valid_samples),
             "total_inserted_samples": float(self._total_inserted_samples),
@@ -295,11 +313,19 @@ class CompactDSRLReplayBuffer:
             ),
             "capacity_bytes": float(self.capacity_bytes),
         }
+        stats.update(
+            {
+                f"last_insert_{field}": self._last_insert_reward_audit[field]
+                for field in DSRL_REWARD_AUDIT_FIELDS
+            }
+        )
+        return stats
 
     def clear(self) -> None:
         self._write_pos = 0
         self._valid_samples = 0
         self._total_inserted_samples = 0
+        self._last_insert_reward_audit = empty_dsrl_reward_audit()
         self.size = 0
 
     def close(self, wait: bool = True) -> None:

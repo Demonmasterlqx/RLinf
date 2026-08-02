@@ -51,6 +51,7 @@ from rlinf.utils.dsrl_checkpoint import (
 from rlinf.utils.dsrl_observation import DSRL_OBSERVATION_SEMANTICS
 from rlinf.utils.dsrl_replay import DSRL_REPLAY_BACKEND, DSRL_REPLAY_SEMANTICS
 from rlinf.utils.dsrl_reward import (
+    DSRL_REWARD_AUDIT_FIELDS,
     DSRL_REWARD_SEMANTICS,
     chunk_bootstrap_discount,
     discounted_alive_masked_chunk_rewards,
@@ -1112,9 +1113,46 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                 else:
                     mean_metric_dict[key] = value
 
+        replay_audit_keys = {
+            field: f"replay_buffer/last_insert_{field}"
+            for field in DSRL_REWARD_AUDIT_FIELDS
+        }
+        present_audit_fields = {
+            field for field, key in replay_audit_keys.items() if key in mean_metric_dict
+        }
+        if present_audit_fields and present_audit_fields != set(
+            DSRL_REWARD_AUDIT_FIELDS
+        ):
+            missing = sorted(set(DSRL_REWARD_AUDIT_FIELDS) - present_audit_fields)
+            raise RuntimeError(
+                f"Tabero DSRL replay insertion audit is missing fields {missing}."
+            )
+
+        local_audit = {
+            field: mean_metric_dict.pop(key)
+            for field, key in replay_audit_keys.items()
+            if field in present_audit_fields
+        }
         mean_metric_dict = all_reduce_dict(
             mean_metric_dict, op=torch.distributed.ReduceOp.AVG
         )
+        if local_audit:
+            reward_max = local_audit.pop("reward_max")
+            global_audit = all_reduce_dict(
+                local_audit, op=torch.distributed.ReduceOp.SUM
+            )
+            global_audit.update(
+                all_reduce_dict(
+                    {"reward_max": reward_max},
+                    op=torch.distributed.ReduceOp.MAX,
+                )
+            )
+            mean_metric_dict.update(
+                {
+                    replay_audit_keys[field]: value
+                    for field, value in global_audit.items()
+                }
+            )
         return mean_metric_dict
 
     @Worker.timer("run_training")
@@ -1130,7 +1168,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             self.log_on_first_rank(
                 f"Replay buffer size {len(self.replay_buffer)} < {min_buffer_size}, skipping training"
             )
-            return {}
+            return self.process_train_metrics({})
 
         # Delay actor training until buffer has enough samples
         train_actor_steps = self.cfg.algorithm.get("train_actor_steps", 0)

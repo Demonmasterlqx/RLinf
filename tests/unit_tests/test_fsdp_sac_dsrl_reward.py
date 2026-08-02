@@ -13,6 +13,7 @@ from omegaconf import OmegaConf
 import rlinf.workers.actor.fsdp_sac_policy_worker as sac_worker_module
 from rlinf.models.embodiment.base_policy import ForwardType
 from rlinf.utils.dsrl_reward import (
+    DSRL_REWARD_AUDIT_FIELDS,
     chunk_bootstrap_discount,
     discounted_alive_masked_chunk_rewards,
 )
@@ -94,6 +95,66 @@ def test_dsrl_phase_start_clears_stale_model_gradients():
 
     assert worker.model.actor.weight.grad is None
     assert worker.model.critic.weight.grad is None
+
+
+def test_dsrl_replay_insertion_audit_uses_global_sum_and_max(monkeypatch):
+    worker = EmbodiedSACFSDPPolicy.__new__(EmbodiedSACFSDPPolicy)
+    local_audit = dict.fromkeys(DSRL_REWARD_AUDIT_FIELDS, 1.0)
+    local_audit["reward_max"] = 2.0
+    worker.replay_buffer = SimpleNamespace(
+        get_stats=lambda: {
+            "capacity_bytes": 100.0,
+            **{f"last_insert_{field}": value for field, value in local_audit.items()},
+        }
+    )
+    worker.demo_buffer = None
+
+    def fake_all_reduce(values, *, op):
+        if op == torch.distributed.ReduceOp.SUM:
+            return {key: value * 4 for key, value in values.items()}
+        return dict(values)
+
+    monkeypatch.setattr(sac_worker_module, "all_reduce_dict", fake_all_reduce)
+
+    metrics = worker.process_train_metrics({})
+
+    assert metrics["replay_buffer/capacity_bytes"] == 100
+    assert metrics["replay_buffer/last_insert_transition_count"] == 4
+    assert metrics["replay_buffer/last_insert_reward_sum"] == 4
+    assert metrics["replay_buffer/last_insert_reward_max"] == 2
+
+
+def test_dsrl_warmup_returns_replay_stats_instead_of_empty_metrics():
+    class NotReadyReplay:
+        def is_ready(self, _minimum):
+            return False
+
+        def __len__(self):
+            return 1
+
+    worker = EmbodiedSACFSDPPolicy.__new__(EmbodiedSACFSDPPolicy)
+    worker.cfg = OmegaConf.create(
+        {
+            "actor": {"enable_offload": False},
+            "algorithm": {"replay_buffer": {"min_buffer_size": 10}},
+        }
+    )
+    worker.replay_buffer = NotReadyReplay()
+    worker.log_on_first_rank = lambda _message: None
+    worker.process_train_metrics = lambda metrics: {
+        "replay_buffer/last_insert_reward_sum": 1.0,
+        "input_was_empty": float(not metrics),
+    }
+
+    undecorated_run_training = (
+        EmbodiedSACFSDPPolicy.run_training.__wrapped__.__wrapped__
+    )
+    metrics = undecorated_run_training(worker)
+
+    assert metrics == {
+        "replay_buffer/last_insert_reward_sum": 1.0,
+        "input_was_empty": 1.0,
+    }
 
 
 def test_dsrl_critic_requires_grad_is_restored_after_actor_exception():

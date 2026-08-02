@@ -191,7 +191,12 @@ env:
         terminal_reward: 1.0
         condition_reward_multipliers: null
       prompt_conditions:
-        enabled: False
+        enabled: True
+        assignment: cyclic
+        condition_cycle: [firm]
+        firm_adverbs: [firmly, tightly]
+        gentle_adverbs: [gently, softly]
+        prompt_seed: 0
       use_relative_mode: False
       marker_history_len: 8
       combined_marker_count: 198

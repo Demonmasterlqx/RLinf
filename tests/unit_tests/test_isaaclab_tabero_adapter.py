@@ -32,6 +32,7 @@ from rlinf.envs.isaaclab.tasks.tabero_tacfield import (
     ensure_tabero_root_task_description,
     resolve_tabero_tasks,
     stack_tabero_initial_states,
+    validate_tabero_firm_prompts,
     validate_tabero_task_assignment,
 )
 
@@ -139,8 +140,21 @@ def _terminal_safe_adapter(schedule: list[dict[int, str]], num_envs: int = 1):
     env._marker_motion_key = "gripper_marker_motion"
     env._force_key = None
     env._marker_history = TacManipMarkerMotionHistory(num_envs=num_envs, history_len=8)
-    env._prompt_condition_ids = ()
-    env._conditioned_prompts = ["pick soup"] * num_envs
+    env._prompt_cfg = OmegaConf.create(
+        {
+            "enabled": True,
+            "assignment": "cyclic",
+            "condition_cycle": ["firm"],
+            "firm_adverbs": ["firmly", "tightly"],
+            "gentle_adverbs": ["gently", "softly"],
+            "prompt_seed": 0,
+        }
+    )
+    env._prompt_rollout_round = 0
+    env._prompt_condition_ids = (0,) * num_envs
+    env._conditioned_prompts = ["pick soup firmly"] * num_envs
+    env._condition_squeeze_sum = torch.zeros(num_envs)
+    env._condition_squeeze_count = torch.zeros(num_envs, dtype=torch.long)
     env.task_description = "pick soup"
     env.ignore_terminations = False
     env.auto_reset = False
@@ -164,6 +178,18 @@ def _terminal_safe_adapter(schedule: list[dict[int, str]], num_envs: int = 1):
     )[0]
     env._tabero_task_shard_id = 0
     return env
+
+
+def test_terminal_safe_firm_prompt_validator_rejects_condition_pollution():
+    validate_tabero_firm_prompts(
+        ["pick soup firmly", "pick soup tightly"],
+        [0, 0],
+    )
+
+    with pytest.raises(ValueError, match="condition id 0"):
+        validate_tabero_firm_prompts(["pick soup gently"], [1])
+    with pytest.raises(ValueError, match="must contain 'firmly' or 'tightly'"):
+        validate_tabero_firm_prompts(["pick soup"], [0])
 
 
 def test_marker_motion_history_builds_tabero_prefix_with_front_padding():
@@ -357,6 +383,21 @@ def test_terminal_safe_chunk_preserves_first_done_and_uses_hold_padding(
     assert metrics["terminal_observation_captures"].item() == 1
     assert metrics["hdf5_reset_envs"].item() == 1
 
+    records = infos_list[-1]["_tabero_chunk_episode_records"]
+    assert records["env_index"].tolist() == [0]
+    assert records["primitive_step_index"].tolist() == [done_step]
+    assert records["condition_id"].tolist() == [0]
+    assert records["termination"].tolist() == [done_kind == "termination"]
+    assert records["truncation"].tolist() == [done_kind == "truncation"]
+    assert records["success_once"].tolist() == [
+        1.0 if done_kind == "termination" else 0.0
+    ]
+    assert records["return"].tolist() == [1.0 if done_kind == "termination" else 0.0]
+    assert records["episode_len"].tolist() == [float(done_step + 1)]
+    assert records["terminal_step_reward"].tolist() == [
+        1.0 if done_kind == "termination" else 0.0
+    ]
+
 
 def test_terminal_safe_chunk_without_done_executes_policy_and_skips_reset():
     chunk_size = 3
@@ -375,6 +416,7 @@ def test_terminal_safe_chunk_without_done_executes_policy_and_skips_reset():
     metrics = infos_list[-1]["chunk_boundary_metrics"]
     assert metrics["done_envs"].item() == 0
     assert metrics["post_done_hold_steps"].item() == 0
+    assert infos_list[-1]["_tabero_chunk_episode_records"] == {}
 
 
 def test_terminal_safe_chunk_resets_simultaneous_done_environments_together():
@@ -391,6 +433,11 @@ def test_terminal_safe_chunk_resets_simultaneous_done_environments_together():
     assert metrics["done_envs"].item() == 2
     assert metrics["post_done_hold_steps"].item() == 2
     assert metrics["terminal_observation_captures"].item() == 2
+    records = infos_list[-1]["_tabero_chunk_episode_records"]
+    assert records["env_index"].tolist() == [0, 1]
+    assert records["termination"].tolist() == [True, False]
+    assert records["truncation"].tolist() == [False, True]
+    assert records["success_once"].tolist() == [1.0, 0.0]
 
 
 def test_terminal_safe_chunk_preserves_ignore_terminations_output_semantics():
@@ -414,6 +461,8 @@ def test_terminal_safe_chunk_accepts_cpu_actions_with_cuda_lifecycle_masks():
     env.success_once = env.success_once.cuda()
     env.fail_once = env.fail_once.cuda()
     env.returns = env.returns.cuda()
+    env._condition_squeeze_sum = env._condition_squeeze_sum.cuda()
+    env._condition_squeeze_count = env._condition_squeeze_count.cuda()
 
     original_step = env.env.step
 

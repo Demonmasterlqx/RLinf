@@ -37,6 +37,44 @@ logger = logging.getLogger(__name__)
 _TERMINAL_RAW_OBSERVATION_KEY = "tabero_terminal_raw_observation"
 _TERMINAL_OBSERVATION_MASK_KEY = "tabero_terminal_observation_mask"
 _TERMINAL_SAFE_HDF5_MODE = "terminal_safe_hdf5_v1"
+_CHUNK_EPISODE_RECORDS_KEY = "_tabero_chunk_episode_records"
+_EPISODE_CONDITION_ID_KEY = "_tabero_condition_id"
+_EPISODE_SQUEEZE_PRED_MEAN_KEY = "_tabero_squeeze_pred_mean"
+
+
+def validate_tabero_firm_prompts(
+    prompts: list[str] | tuple[str, ...],
+    condition_ids: list[int] | tuple[int, ...],
+) -> None:
+    """Require the runtime prompt batch used by formal Tabero DSRL runs."""
+
+    if not prompts or len(prompts) != len(condition_ids):
+        raise ValueError(
+            "Tabero terminal-safe Firm prompts and condition ids must be non-empty "
+            "and batch aligned."
+        )
+    invalid_condition_ids = [
+        index
+        for index, condition_id in enumerate(condition_ids)
+        if int(condition_id) != 0
+    ]
+    if invalid_condition_ids:
+        raise ValueError(
+            "Tabero terminal-safe DSRL accepts only Firm condition id 0; invalid "
+            f"prompt rows={invalid_condition_ids}."
+        )
+    invalid_prompts = [
+        index
+        for index, prompt in enumerate(prompts)
+        if not any(
+            adverb in str(prompt).lower().split() for adverb in ("firmly", "tightly")
+        )
+    ]
+    if invalid_prompts:
+        raise ValueError(
+            "Tabero terminal-safe DSRL prompts must contain 'firmly' or 'tightly'; "
+            f"invalid prompt rows={invalid_prompts}."
+        )
 
 
 def _clone_nested_tensors(value: Any) -> Any:
@@ -1009,6 +1047,10 @@ class IsaaclabTaberoTacFieldEnv(IsaaclabBaseEnv):
             rollout_round=0,
         )
         self._prompt_condition_ids = tuple(condition_ids)
+        if self._chunk_boundary_mode == _TERMINAL_SAFE_HDF5_MODE:
+            validate_tabero_firm_prompts(
+                self._conditioned_prompts, self._prompt_condition_ids
+            )
         logger.info(
             "Assigned Tabero task shard=%d/%d suite=%s task_id=%d num_envs=%d",
             self._tabero_task_shard_id,
@@ -1181,6 +1223,10 @@ class IsaaclabTaberoTacFieldEnv(IsaaclabBaseEnv):
                     current_condition_ids[env_id] = condition_ids[env_id]
                 self._conditioned_prompts = current_prompts
                 self._prompt_condition_ids = tuple(current_condition_ids)
+            if self._chunk_boundary_mode == _TERMINAL_SAFE_HDF5_MODE:
+                validate_tabero_firm_prompts(
+                    self._conditioned_prompts, self._prompt_condition_ids
+                )
             logger.info(
                 "Tabero prompts shard=%d round=%d prompts=%s",
                 self._tabero_task_shard_id,
@@ -1294,6 +1340,8 @@ class IsaaclabTaberoTacFieldEnv(IsaaclabBaseEnv):
 
         infos["_tabero_hold_state"] = build_tabero_state(raw_obs["policy"])
         infos["_tabero_boundary_done"] = newly_done
+        infos["_tabero_boundary_termination"] = terminations.clone()
+        infos["_tabero_boundary_truncation"] = truncations.clone()
         infos["_tabero_terminal_capture"] = newly_done.clone()
         return (
             obs,
@@ -1343,6 +1391,7 @@ class IsaaclabTaberoTacFieldEnv(IsaaclabBaseEnv):
         terminations = []
         truncations = []
         executed_actions = []
+        episode_record_shards: dict[str, list[torch.Tensor]] = {}
 
         for step_index in range(chunk_size):
             actions = chunk_actions[:, step_index].clone()
@@ -1365,10 +1414,38 @@ class IsaaclabTaberoTacFieldEnv(IsaaclabBaseEnv):
                 self._terminal_safe_step(actions, active_mask=active_mask)
             )
             boundary_done = infos.pop("_tabero_boundary_done")
+            boundary_terminations = infos.pop("_tabero_boundary_termination")
+            boundary_truncations = infos.pop("_tabero_boundary_truncation")
             terminal_capture = infos.pop("_tabero_terminal_capture")
             latest_hold_state = infos.pop("_tabero_hold_state")
             newly_done = boundary_done & active_mask
             if newly_done.any():
+                episode = infos["final_info"]["episode"]
+                env_indices = torch.nonzero(newly_done, as_tuple=False).squeeze(-1)
+                selected_episode_fields = {
+                    "env_index": env_indices,
+                    "primitive_step_index": torch.full_like(env_indices, step_index),
+                    "condition_id": episode[_EPISODE_CONDITION_ID_KEY][newly_done],
+                    "termination": boundary_terminations[newly_done],
+                    "truncation": boundary_truncations[newly_done],
+                    "success_once": episode["success_once"][newly_done].to(
+                        torch.float32
+                    ),
+                    "return": episode["return"][newly_done].to(torch.float32),
+                    "episode_len": episode["episode_len"][newly_done].to(torch.float32),
+                    "reward": episode["reward"][newly_done].to(torch.float32),
+                    "reward_sum": episode["return"][newly_done].to(torch.float32),
+                    "terminal_step_reward": reward[newly_done].to(torch.float32),
+                    "squeeze_pred_mean": episode[_EPISODE_SQUEEZE_PRED_MEAN_KEY][
+                        newly_done
+                    ].to(torch.float32),
+                    "task_id": episode["task_id"][newly_done].to(torch.float32),
+                    "task_shard_id": episode["task_shard_id"][newly_done].to(
+                        torch.float32
+                    ),
+                }
+                for field, values in selected_episode_fields.items():
+                    episode_record_shards.setdefault(field, []).append(values.clone())
                 first_done_step[newly_done] = step_index
                 terminal_observation_captures += int(
                     terminal_capture[newly_done].sum().item()
@@ -1387,6 +1464,21 @@ class IsaaclabTaberoTacFieldEnv(IsaaclabBaseEnv):
         chunk_truncations = torch.stack(truncations, dim=1)
         past_dones = first_done_step >= 0
         hdf5_reset_envs = int(past_dones.sum().item())
+        episode_records = {
+            field: torch.cat(shards, dim=0)
+            for field, shards in episode_record_shards.items()
+        }
+        if episode_records:
+            record_count = int(episode_records["env_index"].numel())
+            if record_count != hdf5_reset_envs:
+                raise RuntimeError(
+                    "Tabero terminal-safe episode-record count mismatch: "
+                    f"records={record_count}, done_envs={hdf5_reset_envs}."
+                )
+            if torch.unique(episode_records["env_index"]).numel() != record_count:
+                raise RuntimeError(
+                    "Tabero terminal-safe chunk recorded one environment more than once."
+                )
         if past_dones.any():
             env_ids = torch.nonzero(past_dones, as_tuple=False).squeeze(-1)
             reset_obs, _ = self.reset(env_ids=env_ids)
@@ -1409,6 +1501,7 @@ class IsaaclabTaberoTacFieldEnv(IsaaclabBaseEnv):
             ),
             "hdf5_reset_envs": torch.tensor([hdf5_reset_envs], device=self.device),
         }
+        infos_list[-1][_CHUNK_EPISODE_RECORDS_KEY] = episode_records
         infos_list[-1]["_tabero_executed_chunk_actions"] = torch.stack(
             executed_actions, dim=1
         )
@@ -1446,6 +1539,8 @@ class IsaaclabTaberoTacFieldEnv(IsaaclabBaseEnv):
             squeeze_mean = (
                 self._condition_squeeze_sum / self._condition_squeeze_count.clamp(min=1)
             )
+            episode_info[_EPISODE_CONDITION_ID_KEY] = condition_ids.clone()
+            episode_info[_EPISODE_SQUEEZE_PRED_MEAN_KEY] = squeeze_mean.clone()
             episode_info["firm_success_once"] = _broadcast_condition_mean(
                 self.success_once.to(dtype=torch.float32), firm_mask, step_reward
             )
@@ -1463,6 +1558,16 @@ class IsaaclabTaberoTacFieldEnv(IsaaclabBaseEnv):
             )
             episode_info["gentle_squeeze_pred_mean"] = _broadcast_condition_mean(
                 squeeze_mean, gentle_mask, step_reward
+            )
+        else:
+            episode_info[_EPISODE_CONDITION_ID_KEY] = torch.full(
+                (self.num_envs,),
+                -1,
+                dtype=torch.int64,
+                device=step_reward.device,
+            )
+            episode_info[_EPISODE_SQUEEZE_PRED_MEAN_KEY] = torch.full_like(
+                step_reward, float("nan"), dtype=torch.float32
             )
         return infos
 

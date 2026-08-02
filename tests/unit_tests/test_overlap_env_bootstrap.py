@@ -286,6 +286,60 @@ class TestOverlapEnvBootstrap(unittest.TestCase):
 
         self.assertEqual(self.worker.record_env_metrics.call_count, 1)
 
+    def test_terminal_safe_reward_audit_records_every_non_auto_reset_chunk(self):
+        self.worker.cfg.env.train.auto_reset = False
+        self.worker.cfg.env.train.ignore_terminations = False
+        self.worker.env_list[0].reset.return_value = (
+            {"main_images": torch.zeros(2, 3, 224, 224)},
+            {},
+        )
+        self.worker.record_env_metrics = MagicMock()
+        mock_rollout_result = MagicMock()
+        mock_rollout_result.actions = torch.zeros(2, 28)
+        mock_rollout_result.bootstrap_values = None
+        mock_rollout_result.forward_inputs = {"action": torch.zeros(2, 28)}
+        mock_rollout_result.versions = torch.zeros(2, 1)
+        mock_rollout_result.intervene_flags = None
+        self.worker.recv_from = MagicMock(return_value=mock_rollout_result)
+        self.worker.env_interact_step = MagicMock(
+            return_value=(
+                EnvOutput(
+                    obs={"main_images": torch.zeros(2, 3, 224, 224)},
+                    dones=torch.zeros(2, 4, dtype=torch.bool),
+                    truncations=torch.zeros(2, 4, dtype=torch.bool),
+                    terminations=torch.zeros(2, 4, dtype=torch.bool),
+                ),
+                {"reward_audit/reward_sum": torch.tensor([1.0])},
+                {},
+            )
+        )
+        self.worker.send_env_batch = MagicMock()
+        self.worker.store_last_obs_and_intervened_info = MagicMock()
+        self.worker.finish_rollout = MagicMock()
+        self.worker.compute_bootstrap_rewards = MagicMock(
+            return_value=torch.zeros(2, 4)
+        )
+        self.worker._bootstrap_and_send_train = MagicMock(
+            return_value=[EnvOutput(obs={"m": torch.zeros(1)}, dones=torch.zeros(1, 4))]
+        )
+        self.worker.send_rollout_trajectories = MagicMock(
+            return_value=MagicMock(wait=MagicMock(return_value=None))
+        )
+
+        import asyncio
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(
+                self.worker.interact(MagicMock(), MagicMock(), None, None)
+            )
+        finally:
+            asyncio.set_event_loop(None)
+            loop.close()
+
+        self.assertEqual(self.worker.record_env_metrics.call_count, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

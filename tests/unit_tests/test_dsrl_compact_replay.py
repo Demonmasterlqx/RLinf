@@ -188,6 +188,76 @@ def test_compact_replay_samples_only_sac_fields_and_32d_actions():
     assert "forward_inputs" not in batch
 
 
+def test_compact_replay_reports_exact_last_insertion_reward_audit():
+    replay = CompactDSRLReplayBuffer(
+        seed=3,
+        capacity_transitions=8,
+        checkpoint_shard_transitions=2,
+        max_resident_gib=0.01,
+    )
+    first = _trajectory(traj_len=1, batch_size=2)
+    first.rewards[0, 0, 2] = 1.0
+    first.terminations[0, 0, 2] = True
+    second = _trajectory(traj_len=1, batch_size=1)
+    second.truncations[0, 0, 9] = True
+
+    replay.add_trajectories([first, second])
+    stats = replay.get_stats()
+
+    assert stats["last_insert_transition_count"] == 3
+    assert stats["last_insert_primitive_count"] == 30
+    assert stats["last_insert_nonzero_primitive_reward_count"] == 1
+    assert stats["last_insert_nonzero_macro_reward_count"] == 1
+    assert stats["last_insert_reward_sum"] == 1
+    assert stats["last_insert_reward_max"] == 1
+    assert stats["last_insert_termination_count"] == 1
+    assert stats["last_insert_truncation_count"] == 1
+    assert stats["last_insert_post_done_nonzero_reward_count"] == 0
+
+
+def test_compact_replay_last_insertion_audit_resets_on_clear_and_restore(tmp_path):
+    replay = CompactDSRLReplayBuffer(
+        seed=3,
+        capacity_transitions=8,
+        checkpoint_shard_transitions=2,
+        max_resident_gib=0.01,
+    )
+    trajectory = _trajectory(traj_len=1, batch_size=2)
+    trajectory.rewards[0, 0, 0] = 1.0
+    trajectory.terminations[0, 0, 0] = True
+    replay.add_trajectories([trajectory])
+    replay.save_checkpoint(str(tmp_path))
+
+    replay.clear()
+    assert replay.get_stats()["last_insert_transition_count"] == 0
+    assert replay.get_stats()["last_insert_reward_sum"] == 0
+
+    replay.load_checkpoint(str(tmp_path))
+    assert replay.total_samples == 2
+    assert replay.get_stats()["last_insert_transition_count"] == 0
+    assert replay.get_stats()["last_insert_reward_sum"] == 0
+
+
+def test_compact_replay_audits_original_insert_even_when_ring_wraps():
+    replay = CompactDSRLReplayBuffer(
+        seed=3,
+        capacity_transitions=2,
+        checkpoint_shard_transitions=2,
+        max_resident_gib=0.01,
+    )
+    trajectory = _trajectory(traj_len=1, batch_size=3)
+    trajectory.rewards[0, :, 0] = 1.0
+    trajectory.terminations[0, :, 0] = True
+
+    replay.add_trajectories([trajectory])
+    stats = replay.get_stats()
+
+    assert replay.total_samples == 2
+    assert stats["last_insert_transition_count"] == 3
+    assert stats["last_insert_reward_sum"] == 3
+    assert stats["last_insert_termination_count"] == 3
+
+
 def test_compact_replay_rejects_forward_inputs_and_wrong_action_horizon():
     replay = CompactDSRLReplayBuffer(
         seed=3,

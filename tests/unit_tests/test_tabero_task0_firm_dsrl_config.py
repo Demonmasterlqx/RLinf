@@ -100,7 +100,10 @@ def test_dsrl_smoke_config_preserves_task0_firm_tacfield_contract(monkeypatch):
     assert prompt.condition_cycle == ["firm"]
     assert prompt.firm_adverbs == ["firmly", "tightly"]
     assert prompt.prompt_seed == 0
-    assert cfg.env.eval.init_params.prompt_conditions.enabled is False
+    eval_prompt = cfg.env.eval.init_params.prompt_conditions
+    assert eval_prompt.enabled is True
+    assert eval_prompt.condition_cycle == ["firm"]
+    assert eval_prompt.firm_adverbs == ["firmly", "tightly"]
     assert cfg.env.train.use_step_penalty is False
 
 
@@ -213,6 +216,33 @@ def test_dsrl_smoke_config_validation_requires_terminal_safe_chunk_mode(
     cfg.env[split].init_params.chunk_boundary_mode = "legacy"
 
     with pytest.raises(ValueError, match=f"env.{split}.*chunk_boundary_mode"):
+        validate_embodied_cfg(cfg)
+
+
+@pytest.mark.parametrize("split", ["train", "eval"])
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("enabled", False),
+        ("condition_cycle", ["gentle"]),
+        ("condition_cycle", ["firm", "gentle"]),
+        ("firm_adverbs", ["firmly"]),
+        ("firm_adverbs", ["tightly", "firmly"]),
+    ],
+)
+def test_dsrl_smoke_config_validation_requires_exact_firm_prompts(
+    monkeypatch,
+    split,
+    field,
+    value,
+):
+    cfg = _load(monkeypatch)
+    cfg.env[split].init_params.prompt_conditions[field] = value
+
+    with pytest.raises(
+        ValueError,
+        match=f"(Firm.*env.{split}|env.{split}.*{field})",
+    ):
         validate_embodied_cfg(cfg)
 
 
