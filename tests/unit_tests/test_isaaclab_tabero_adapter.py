@@ -61,6 +61,17 @@ def _raw_tabero_obs(state_x: list[float], marker_offset: float = 0.0):
     }
 
 
+def _clone_nested_to_device(value, device: torch.device):
+    if torch.is_tensor(value):
+        return value.clone().to(device=device)
+    if isinstance(value, dict):
+        return {
+            key: _clone_nested_to_device(nested, device)
+            for key, nested in value.items()
+        }
+    return value
+
+
 class _TerminalSafeFakeEnv:
     device = torch.device("cpu")
 
@@ -392,6 +403,49 @@ def test_terminal_safe_chunk_preserves_ignore_terminations_output_semantics():
     assert not truncations.any()
     assert infos_list[0]["episode"]["success_at_end"].item() is True
     assert env.env.reset_calls[0].tolist() == [0]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_terminal_safe_chunk_accepts_cpu_actions_with_cuda_lifecycle_masks():
+    env = _terminal_safe_adapter([{0: "termination"}, {}])
+    env.device = torch.device("cuda")
+    env._elapsed_steps = env._elapsed_steps.cuda()
+    env.prev_step_reward = env.prev_step_reward.cuda()
+    env.success_once = env.success_once.cuda()
+    env.fail_once = env.fail_once.cuda()
+    env.returns = env.returns.cuda()
+
+    original_step = env.env.step
+
+    def cuda_step(actions):
+        raw_obs, rewards, terminations, truncations, extras = original_step(
+            actions.cpu()
+        )
+        return (
+            _clone_nested_to_device(raw_obs, env.device),
+            rewards.cuda(),
+            terminations.cuda(),
+            truncations.cuda(),
+            _clone_nested_to_device(extras, env.device),
+        )
+
+    env.env.step = cuda_step
+    original_reset = env.env.reset
+
+    def cuda_reset(seed=None, env_ids=None):
+        raw_obs, extras = original_reset(seed=seed, env_ids=env_ids.cpu())
+        return (
+            _clone_nested_to_device(raw_obs, env.device),
+            _clone_nested_to_device(extras, env.device),
+        )
+
+    env.env.reset = cuda_reset
+
+    _, _, _, _, infos_list = env.chunk_step(torch.ones((1, 2, 13)))
+
+    executed = infos_list[-1]["_tabero_executed_chunk_actions"]
+    assert executed.device.type == "cpu"
+    torch.testing.assert_close(executed[0, 1, 7:], torch.zeros(6))
 
 
 def test_build_tabero_state_uses_pose_axis_angle_and_gripper_scalar():

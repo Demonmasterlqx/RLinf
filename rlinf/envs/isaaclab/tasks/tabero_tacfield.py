@@ -1353,7 +1353,12 @@ class IsaaclabTaberoTacFieldEnv(IsaaclabBaseEnv):
                         "Tabero terminal-safe chunk has no state for a hold action."
                     )
                 hold_actions = self._build_hold_actions(actions, latest_hold_state)
-                actions[inactive_mask] = hold_actions[inactive_mask]
+                # Env-worker action preparation intentionally returns CPU tensors,
+                # while IsaacLab lifecycle masks live on the simulator device.
+                # Keep executed-action bookkeeping on the input device and move
+                # only the indexing mask for this replacement.
+                action_inactive_mask = inactive_mask.to(device=actions.device)
+                actions[action_inactive_mask] = hold_actions[action_inactive_mask]
                 post_done_hold_steps += int(inactive_mask.sum().item())
 
             obs, reward, step_terminations, step_truncations, infos = (
