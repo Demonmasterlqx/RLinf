@@ -354,6 +354,13 @@ command=(
 )
 if [[ "${MODE}" == "smoke" ]]; then
   command+=("runner.max_epochs=1" "runner.save_interval=1")
+  if [[ "${METHOD}" == "dsrl" ]]; then
+    command+=(
+      "algorithm.update_epoch=1"
+      "algorithm.replay_buffer.min_buffer_size=1"
+      "algorithm.train_actor_steps=1"
+    )
+  fi
 fi
 if [[ -n "${RESUME_DIR}" ]]; then
   command+=("runner.resume_dir=${RESUME_DIR}")

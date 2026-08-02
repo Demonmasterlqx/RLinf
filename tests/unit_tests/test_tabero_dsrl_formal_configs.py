@@ -209,6 +209,7 @@ def _dry_run(
     task_id: int,
     *extra: str,
     env_overrides: dict[str, str] | None = None,
+    mode: str = "formal",
 ):
     env = os.environ.copy()
     fake_bin = _fake_nvidia_smi(tmp_path)
@@ -220,13 +221,13 @@ def _dry_run(
             "TABERO_MIN_FREE_KIB": "1",
             "TABERO_TEST_MODEL_SHA256": "0" * 64,
             "TABERO_GPU_LOCK_DIR": str(tmp_path / "gpu-locks"),
-            "TABERO_MATRIX_RUN_ID": "20260728_120000_formal",
+            "TABERO_MATRIX_RUN_ID": f"20260728_120000_{mode}",
             "WANDB_RUN_ID": "matrix-dsrl-test",
         }
     )
     env.update(env_overrides or {})
     return subprocess.run(
-        ["bash", str(LAUNCHER), "dsrl", str(task_id), "formal", *extra, "--dry-run"],
+        ["bash", str(LAUNCHER), "dsrl", str(task_id), mode, *extra, "--dry-run"],
         cwd=REPO_ROOT,
         env=env,
         text=True,
@@ -290,6 +291,18 @@ def test_matrix_launcher_builds_exact_dsrl_formal_command(tmp_path, task_id):
     assert "TABERO_GIT_COMMIT=" in provenance
     assert f"TABERO_BASE_MODEL_SHA256={'0' * 64}" in provenance
     assert (output_dir / "config_snapshot.yaml").is_file()
+
+
+@pytest.mark.parametrize("task_id", [0, 5])
+def test_matrix_launcher_dsrl_smoke_runs_one_complete_update(tmp_path, task_id):
+    result = _dry_run(tmp_path, task_id, mode="smoke")
+
+    assert result.returncode == 0, result.stderr
+    assert "runner.max_epochs=1" in result.stdout
+    assert "runner.save_interval=1" in result.stdout
+    assert "algorithm.update_epoch=1" in result.stdout
+    assert "algorithm.replay_buffer.min_buffer_size=1" in result.stdout
+    assert "algorithm.train_actor_steps=1" in result.stdout
 
 
 def test_matrix_launcher_builds_task0_dsrl_60step_command(tmp_path):
