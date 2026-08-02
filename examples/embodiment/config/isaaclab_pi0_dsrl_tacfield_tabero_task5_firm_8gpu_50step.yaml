@@ -67,6 +67,7 @@ algorithm:
   dsrl_reward_semantics: discounted_alive_masked_v1
   dsrl_observation_semantics: main_wrist_shared_encoder_concat_v1
   dsrl_replay_semantics: main_wrist_bf16_64_transition_ring_v1
+  dsrl_transition_boundary_semantics: terminal_observation_first_done_hdf5_reset_v1
   tau: 0.005
   entropy_tuning:
     alpha_type: softplus
@@ -120,6 +121,7 @@ env:
       libero_assets_dir: /data/home/sim6g/code/tabero/Tabero/benchmarks/datasets/libero/USD
       hdf5_initial_states_path: /data/home/sim6g/code/tabero/Tabero/benchmarks/datasets/libero/assembled_hdf5/libero_object_task5_pick_up_the_tomato_sauce_and_place_it_in_the_basket_demo.hdf5
       hdf5_reset_assignment: cyclic
+      chunk_boundary_mode: terminal_safe_hdf5_v1
       task_suite: libero_object
       task_id: 5
       tasks:
@@ -184,6 +186,7 @@ env:
       libero_assets_dir: /data/home/sim6g/code/tabero/Tabero/benchmarks/datasets/libero/USD
       hdf5_initial_states_path: /data/home/sim6g/code/tabero/Tabero/benchmarks/datasets/libero/assembled_hdf5/libero_object_task5_pick_up_the_tomato_sauce_and_place_it_in_the_basket_demo.hdf5
       hdf5_reset_assignment: cyclic
+      chunk_boundary_mode: terminal_safe_hdf5_v1
       task_suite: libero_object
       task_id: 5
       tasks:

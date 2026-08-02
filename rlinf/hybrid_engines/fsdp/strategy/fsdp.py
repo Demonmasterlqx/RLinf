@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+from collections.abc import Iterable
 from contextlib import nullcontext
 from typing import ContextManager, Union
 
@@ -341,6 +342,9 @@ class FSDPStrategy(FSDPStrategyBase):
         self,
         model: FSDP,
         norm_type: Union[float, int] = 2.0,
+        *,
+        max_norm: float | None = None,
+        parameters: Iterable[nn.Parameter] | None = None,
     ) -> float:
         """
         Clip the gradients of the model parameters to a maximum norm specified in the configuration.
@@ -352,8 +356,19 @@ class FSDPStrategy(FSDPStrategyBase):
         Returns:
             - float: The total norm of the gradients before clipping.
         """
-        device = torch.device(f"{Worker.torch_device_type}:{os.environ['LOCAL_RANK']}")
-        max_norm = float(self.cfg.optim.clip_grad)
+        selected_parameters = None
+        selected_parameter_set = None
+        if parameters is not None:
+            selected_parameters = []
+            selected_ids = set()
+            for parameter in parameters:
+                if id(parameter) in selected_ids:
+                    continue
+                selected_ids.add(id(parameter))
+                selected_parameters.append(parameter)
+            selected_parameter_set = set(selected_parameters)
+
+        max_norm = float(self.cfg.optim.clip_grad if max_norm is None else max_norm)
         norm_type = float(norm_type)
         debug_nan_checks = self.cfg.get("debug_nan_checks", False)
         all_handles = getattr(model, "_all_handles", None)
@@ -363,10 +378,17 @@ class FSDPStrategy(FSDPStrategyBase):
         all_no_shard = all(not handle.uses_sharded_strategy for handle in all_handles)
         if all_no_shard:
             return (
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm, norm_type)
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters()
+                    if selected_parameters is None
+                    else selected_parameters,
+                    max_norm,
+                    norm_type,
+                )
                 .cpu()
                 .item()
             )
+        device = torch.device(f"{Worker.torch_device_type}:{os.environ['LOCAL_RANK']}")
         sharded_params_set, nonsharded_params_set = set(), set()
         sharded_params, nonsharded_params = [], []
         grads = []
@@ -379,6 +401,11 @@ class FSDPStrategy(FSDPStrategyBase):
 
             if handle._use_orig_params:
                 for p in handle.flat_param._params:
+                    if (
+                        selected_parameter_set is not None
+                        and p not in selected_parameter_set
+                    ):
+                        continue
                     if p not in target_set:
                         target_set.add(p)
                         target_list.append(p)
@@ -386,6 +413,11 @@ class FSDPStrategy(FSDPStrategyBase):
                             grads.append(p.grad)
             else:
                 fp = handle.flat_param
+                if (
+                    selected_parameter_set is not None
+                    and fp not in selected_parameter_set
+                ):
+                    continue
                 if fp not in target_set:
                     target_set.add(fp)
                     target_list.append(fp)
@@ -394,6 +426,8 @@ class FSDPStrategy(FSDPStrategyBase):
 
         # include non-FSDP-managed params (ignored modules etc.)
         for p in model.parameters():
+            if selected_parameter_set is not None and p not in selected_parameter_set:
+                continue
             not_fsdp_managed = (
                 p not in sharded_params_set and p not in nonsharded_params_set
             )
@@ -402,11 +436,15 @@ class FSDPStrategy(FSDPStrategyBase):
                 nonsharded_params.append(p)
                 if p.grad is not None:
                     grads.append(p.grad)
-        local_sharded_norm = get_grad_norm_for_mixed_precision(
-            sharded_params,
-            norm_type,
-            torch.tensor(0.0, device=device, dtype=torch.float32),
-            device,
+        local_sharded_norm = (
+            get_grad_norm_for_mixed_precision(
+                sharded_params,
+                norm_type,
+                torch.tensor(0.0, device=device, dtype=torch.float32),
+                device,
+            )
+            if sharded_params
+            else torch.tensor(0.0, device=device, dtype=torch.float32)
         )
         if debug_nan_checks and not torch.isfinite(local_sharded_norm):
             raise RuntimeError(

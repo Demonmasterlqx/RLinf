@@ -37,6 +37,7 @@ from rlinf.utils.dsrl_replay import (
     dsrl_replay_bytes_per_transition,
 )
 from rlinf.utils.dsrl_reward import DSRL_REWARD_SEMANTICS
+from rlinf.utils.dsrl_transition import DSRL_TRANSITION_BOUNDARY_SEMANTICS
 
 
 def _dtype_name(dtype: torch.dtype) -> str:
@@ -330,6 +331,7 @@ class CompactDSRLReplayBuffer:
             "replay_semantics": DSRL_REPLAY_SEMANTICS,
             "reward_semantics": DSRL_REWARD_SEMANTICS,
             "observation_semantics": DSRL_OBSERVATION_SEMANTICS,
+            "transition_boundary_semantics": DSRL_TRANSITION_BOUNDARY_SEMANTICS,
             "view_order": list(DSRL_REPLAY_VIEW_ORDER),
             "num_images": DSRL_REPLAY_NUM_IMAGES,
             "image_size": DSRL_REPLAY_IMAGE_SIZE,
@@ -411,6 +413,7 @@ class CompactDSRLReplayBuffer:
             "replay_semantics": DSRL_REPLAY_SEMANTICS,
             "reward_semantics": DSRL_REWARD_SEMANTICS,
             "observation_semantics": DSRL_OBSERVATION_SEMANTICS,
+            "transition_boundary_semantics": DSRL_TRANSITION_BOUNDARY_SEMANTICS,
             "view_order": list(DSRL_REPLAY_VIEW_ORDER),
             "num_images": DSRL_REPLAY_NUM_IMAGES,
             "image_size": DSRL_REPLAY_IMAGE_SIZE,

@@ -530,15 +530,7 @@ class EnvWorker(Worker):
         if isinstance(infos_list, (list, tuple)):
             infos = infos_list[-1] if infos_list else None
         chunk_dones = torch.logical_or(chunk_terminations, chunk_truncations)
-        final_obs = (
-            self._build_chunk_final_obs(obs_list, infos_list)
-            if self.use_external_reward_model
-            else (
-                infos["final_observation"]
-                if isinstance(infos, dict) and "final_observation" in infos
-                else None
-            )
-        )
+        final_obs = self._build_chunk_final_obs(obs_list, infos_list)
         if not self.cfg.env.train.auto_reset:
             if self.cfg.env.train.ignore_terminations:
                 if chunk_truncations[:, -1].any():
@@ -555,6 +547,12 @@ class EnvWorker(Worker):
                 final_info = infos["final_info"]
                 for key in final_info["episode"]:
                     env_info[key] = final_info["episode"][key][chunk_dones[:, -1]].cpu()
+
+        if isinstance(infos, dict) and "chunk_boundary_metrics" in infos:
+            for key, value in infos["chunk_boundary_metrics"].items():
+                env_info[f"chunk_boundary/{key}"] = (
+                    torch.as_tensor(value).reshape(-1).cpu()
+                )
 
         intervene_actions = (
             infos["intervene_action"] if "intervene_action" in infos else None
@@ -581,7 +579,11 @@ class EnvWorker(Worker):
             rlt_switch_flags=rlt_switch_flags,
         )
         chunk_step_payload = {
-            "chunk_actions": exec_actions,
+            "chunk_actions": (
+                infos.get("_tabero_executed_chunk_actions", exec_actions)
+                if isinstance(infos, dict)
+                else exec_actions
+            ),
             "obs_list": obs_list,
             "terminations": chunk_terminations,
             "truncations": chunk_truncations,
@@ -615,15 +617,7 @@ class EnvWorker(Worker):
         if isinstance(infos_list, (list, tuple)):
             infos = infos_list[-1] if infos_list else None
         chunk_dones = torch.logical_or(chunk_terminations, chunk_truncations)
-        final_obs = (
-            self._build_chunk_final_obs(obs_list, infos_list)
-            if self.use_external_reward_model
-            else (
-                infos["final_observation"]
-                if isinstance(infos, dict) and "final_observation" in infos
-                else None
-            )
-        )
+        final_obs = self._build_chunk_final_obs(obs_list, infos_list)
 
         current_dones = chunk_dones.any(dim=1)  # [num_envs] bool
         if self.cfg.env.eval.auto_reset:
@@ -1217,7 +1211,8 @@ class EnvWorker(Worker):
                     if self.collect_transitions and not self.enable_rlt:
                         next_obs = (
                             env_output.final_obs
-                            if env_output.dones.any() and self.cfg.env.train.auto_reset
+                            if env_output.dones.any()
+                            and env_output.final_obs is not None
                             else env_output.obs
                         )
                         if self.compact_dsrl_replay:

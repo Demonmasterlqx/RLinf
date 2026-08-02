@@ -26,6 +26,7 @@ from rlinf.utils.dsrl_rollout_sync import (
     DSRL_ROLLOUT_SYNC_PARAMETER_COUNT,
     DSRL_ROLLOUT_SYNC_TENSOR_COUNT,
 )
+from rlinf.utils.dsrl_transition import DSRL_TRANSITION_BOUNDARY_SEMANTICS
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 HELPER_PATH = REPO_ROOT / "examples/embodiment/tabero_dsrl_official_eval.py"
@@ -96,6 +97,7 @@ def bundle_fixture(tmp_path):
             "dtype": "bfloat16",
             "reward_semantics": DSRL_REWARD_SEMANTICS,
             "observation_semantics": DSRL_OBSERVATION_SEMANTICS,
+            "transition_boundary_semantics": DSRL_TRANSITION_BOUNDARY_SEMANTICS,
         },
     )
     manifest = {
@@ -104,6 +106,7 @@ def bundle_fixture(tmp_path):
         "algorithm": "dsrl-sac",
         "reward_semantics": DSRL_REWARD_SEMANTICS,
         "observation_semantics": DSRL_OBSERVATION_SEMANTICS,
+        "transition_boundary_semantics": DSRL_TRANSITION_BOUNDARY_SEMANTICS,
         "task_id": 0,
         "global_step": 50,
         "is_final": True,
@@ -198,6 +201,7 @@ def bundle_fixture(tmp_path):
         "global_step": 50,
         "reward_semantics": DSRL_REWARD_SEMANTICS,
         "observation_semantics": DSRL_OBSERVATION_SEMANTICS,
+        "transition_boundary_semantics": DSRL_TRANSITION_BOUNDARY_SEMANTICS,
         "source_checkpoint_sha256": manifest["source_checkpoint_sha256"],
         "base_model_sha256": manifest["base_model_sha256"],
         "actor_weights_sha256": manifest["actor_weights_sha256"],
@@ -213,6 +217,7 @@ def bundle_fixture(tmp_path):
             "formal_provenance": True,
             "reward_semantics": True,
             "observation_semantics": True,
+            "transition_boundary_semantics": True,
             "output_hashes": True,
         },
     }
@@ -246,6 +251,7 @@ def _retask_bundle_to_small4gpu40(bundle, manifest, audit):
             "dtype": "bfloat16",
             "reward_semantics": DSRL_REWARD_SEMANTICS,
             "observation_semantics": DSRL_OBSERVATION_SEMANTICS,
+            "transition_boundary_semantics": DSRL_TRANSITION_BOUNDARY_SEMANTICS,
         },
     )
     manifest.update(
@@ -287,6 +293,7 @@ def _retask_bundle_to_selected_step10(bundle, manifest, audit):
             "dtype": "bfloat16",
             "reward_semantics": DSRL_REWARD_SEMANTICS,
             "observation_semantics": DSRL_OBSERVATION_SEMANTICS,
+            "transition_boundary_semantics": DSRL_TRANSITION_BOUNDARY_SEMANTICS,
         },
     )
     manifest.update(
@@ -450,6 +457,7 @@ def test_validate_bundle_rejects_actor_keyspace(bundle_fixture):
             "dtype": "bfloat16",
             "reward_semantics": DSRL_REWARD_SEMANTICS,
             "observation_semantics": DSRL_OBSERVATION_SEMANTICS,
+            "transition_boundary_semantics": DSRL_TRANSITION_BOUNDARY_SEMANTICS,
         },
     )
     manifest["actor_weights_sha256"] = _sha256(actor_path)
@@ -485,6 +493,7 @@ def test_validate_bundle_rejects_coherently_rehashed_nonfinite_actor(
             "dtype": "bfloat16",
             "reward_semantics": DSRL_REWARD_SEMANTICS,
             "observation_semantics": DSRL_OBSERVATION_SEMANTICS,
+            "transition_boundary_semantics": DSRL_TRANSITION_BOUNDARY_SEMANTICS,
         },
     )
     manifest["actor_weights_sha256"] = _sha256(actor_path)
@@ -551,6 +560,12 @@ def test_validate_bundle_binds_source_git_commit_to_provenance(bundle_fixture):
         (
             lambda manifest: manifest.update(observation_semantics="single_camera_v1"),
             "observation_semantics",
+        ),
+        (
+            lambda manifest: manifest.update(
+                transition_boundary_semantics="cross_episode_chunk_v0"
+            ),
+            "transition_boundary_semantics",
         ),
         (
             lambda manifest: manifest.update(source_checkpoint_sha256="bad"),
@@ -641,6 +656,210 @@ def _raw_payload(task_id=0):
             }
         },
     }
+
+
+def _complete_metrics_payload(task_id=0):
+    payload = _raw_payload(task_id)
+    payload["metadata"].update(record_step_traces=True, replan_steps=10)
+    episodes = []
+    trace_rows = []
+    for experiment_index in range(50):
+        success = experiment_index < 41
+        episodes.append(
+            {
+                "experiment_index": experiment_index,
+                "hdf5_episode_index": experiment_index,
+                "success": success,
+                "end_reason": "success" if success else "max_steps",
+                "env_steps": 1,
+                "inference_chunks": 1,
+                "force_status": "complete",
+                "force_samples": {
+                    "predicted_action_steps": 1,
+                    "measured_force_steps": 1,
+                    "squeeze_pred_steps": 1,
+                    "squeeze_meas_steps": 1,
+                    "ap_pred_steps": 1,
+                    "ap_meas_steps": 1,
+                    "predicted_contact_steps": 1,
+                    "measured_contact_steps": 1,
+                    "predicted_contact_ratio": 1.0,
+                    "measured_contact_ratio": 1.0,
+                    "coverage_ratio": 1.0,
+                },
+                "squeeze_avg_pred": 2.0,
+                "squeeze_avg_meas": 2.0,
+                "squeeze_max_pred": 2.0,
+                "squeeze_max_meas": 2.0,
+                "ap_avg_pred": 0.0,
+                "ap_avg_meas": 0.0,
+                "ap_max_pred": 0.0,
+                "ap_max_meas": 0.0,
+                "trace_status": "complete",
+                "trace_rows": 1,
+                "trace_error": None,
+            }
+        )
+        trace_rows.append(
+            {
+                "schema_version": 1,
+                "task_suite": "libero_object",
+                "task_id": task_id,
+                "experiment_index": experiment_index,
+                "hdf5_episode_index": experiment_index,
+                "env_step_index": 0,
+                "inference_chunk_index": 0,
+                "action_in_chunk_index": 0,
+                "fL_pred_local": [0.0, 0.0, 1.0],
+                "fR_pred_local": [0.0, 0.0, -1.0],
+                "fL_meas_local": [0.0, 0.0, 1.0],
+                "fR_meas_local": [0.0, 0.0, -1.0],
+                "squeeze_pred": 2.0,
+                "squeeze_meas": 2.0,
+                "ap_pred": 0.0,
+                "ap_meas": 0.0,
+                "predicted_contact": True,
+                "measured_contact": True,
+            }
+        )
+    task = payload["results"][f"libero_object_task{task_id}"]
+    task.update(
+        avg_squeeze_pred=2.0,
+        avg_squeeze_meas=2.0,
+        task_squeeze_max_mean=2.0,
+        task_squeeze_max_meas_mean=2.0,
+        task_app_mean_mean=0.0,
+        task_ap_mean_meas_mean=0.0,
+        task_app_max_mean=0.0,
+        task_ap_max_meas_mean=0.0,
+        metrics_status="complete",
+        metrics_warnings=[],
+        step_statistics={
+            "all": {
+                "episodes": 50,
+                "env_steps_total": 50,
+                "env_steps_mean": 1.0,
+                "env_steps_min": 1,
+                "env_steps_max": 1,
+                "inference_chunks_total": 50,
+                "inference_chunks_mean": 1.0,
+                "inference_chunks_min": 1,
+                "inference_chunks_max": 1,
+            },
+            "successful": {
+                "episodes": 41,
+                "env_steps_total": 41,
+                "env_steps_mean": 1.0,
+                "env_steps_min": 1,
+                "env_steps_max": 1,
+                "inference_chunks_total": 41,
+                "inference_chunks_mean": 1.0,
+                "inference_chunks_min": 1,
+                "inference_chunks_max": 1,
+            },
+            "failed": {
+                "episodes": 9,
+                "env_steps_total": 9,
+                "env_steps_mean": 1.0,
+                "env_steps_min": 1,
+                "env_steps_max": 1,
+                "inference_chunks_total": 9,
+                "inference_chunks_mean": 1.0,
+                "inference_chunks_min": 1,
+                "inference_chunks_max": 1,
+            },
+        },
+        force_metric_episode_counts=dict.fromkeys(
+            (
+                "squeeze_avg_pred",
+                "squeeze_avg_meas",
+                "squeeze_max_pred",
+                "squeeze_max_meas",
+                "ap_avg_pred",
+                "ap_avg_meas",
+                "ap_max_pred",
+                "ap_max_meas",
+            ),
+            41,
+        ),
+        episodes=episodes,
+        step_trace={
+            "enabled": True,
+            "path": "../step_traces/libero_object_task0.jsonl",
+            "rows": 50,
+            "status": "complete",
+        },
+    )
+    return payload, trace_rows
+
+
+def _write_complete_metrics_evidence(tmp_path, task_id=0):
+    output_dir = tmp_path / "eval"
+    raw_dir = output_dir / "raw"
+    trace_dir = output_dir / "step_traces"
+    raw_dir.mkdir(parents=True)
+    trace_dir.mkdir()
+    payload, trace_rows = _complete_metrics_payload(task_id)
+    (raw_dir / "success_rates_openpi_tactile_1.json").write_text(json.dumps(payload))
+    (trace_dir / "libero_object_task0.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in trace_rows)
+    )
+    client_lines = [
+        f"[{episode}/50] Starting experiment...\n" for episode in range(1, 51)
+    ]
+    client_lines.extend(
+        [
+            f"TASK COMPLETED: libero_object - Task {task_id}\n",
+            "Success Rate: 82.00% (41/50 experiments)\n",
+            "Progress: 1/1 tasks completed\n",
+        ]
+    )
+    (output_dir / "client.log").write_text("".join(client_lines))
+    return output_dir, raw_dir, payload, trace_rows
+
+
+def test_metrics_validation_recomputes_episode_and_task_force_metrics(tmp_path):
+    helper = _load_helper()
+    output_dir, raw_dir, _, _ = _write_complete_metrics_evidence(tmp_path)
+
+    validation = helper.validate_metrics_and_trace(raw_dir, output_dir, 0)
+
+    assert validation["status"] == "completed"
+    assert validation["episodes"] == 50
+    assert validation["successful_episodes"] == 41
+    assert validation["env_steps"] == validation["trace_rows"] == 50
+    assert validation["force_metrics"]["squeeze_max_pred"] == 2.0
+
+
+def test_metrics_validation_rejects_partial_force_coverage(tmp_path):
+    helper = _load_helper()
+    output_dir, raw_dir, payload, _ = _write_complete_metrics_evidence(tmp_path)
+    payload["results"]["libero_object_task0"]["metrics_status"] = "partial"
+    (raw_dir / "success_rates_openpi_tactile_1.json").write_text(json.dumps(payload))
+
+    with pytest.raises(ValueError, match="metrics_status"):
+        helper.validate_metrics_and_trace(raw_dir, output_dir, 0)
+
+
+def test_metrics_validation_rejects_trace_force_mismatch(tmp_path):
+    helper = _load_helper()
+    output_dir, raw_dir, _, trace_rows = _write_complete_metrics_evidence(tmp_path)
+    trace_rows[0]["squeeze_pred"] = 99.0
+    (output_dir / "step_traces/libero_object_task0.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in trace_rows)
+    )
+
+    with pytest.raises(ValueError, match="squeeze_pred.*mismatch"):
+        helper.validate_metrics_and_trace(raw_dir, output_dir, 0)
+
+
+def test_metrics_validation_rejects_incomplete_client_log(tmp_path):
+    helper = _load_helper()
+    output_dir, raw_dir, _, _ = _write_complete_metrics_evidence(tmp_path)
+    (output_dir / "client.log").write_text("incomplete\n")
+
+    with pytest.raises(ValueError, match="client log"):
+        helper.validate_metrics_and_trace(raw_dir, output_dir, 0)
 
 
 def test_normalize_result_matches_prior_schema_and_is_no_clobber(tmp_path):
@@ -1263,6 +1482,7 @@ def _retask_bundle(bundle, task_id):
             "dtype": "bfloat16",
             "reward_semantics": DSRL_REWARD_SEMANTICS,
             "observation_semantics": DSRL_OBSERVATION_SEMANTICS,
+            "transition_boundary_semantics": DSRL_TRANSITION_BOUNDARY_SEMANTICS,
         },
     )
     manifest_path = bundle / "manifest.json"
@@ -1474,13 +1694,15 @@ def test_launcher_dry_run_writes_exact_commands_and_provenance(
         f"{project_root}/Tabero/benchmarks/datasets/libero/assembled_hdf5 "
         f"--require-hdf5 --output-dir {output}/raw --output-format both "
         "--seed 11 --prompt-seed 0 --prompt-adverbs firmly tightly "
-        "--send-dsrl-raw-image --sim-device cuda:1 "
+        "--send-dsrl-raw-image --record-step-traces "
+        f"--step-trace-dir {output}/step_traces --sim-device cuda:1 "
         "--sim-kit-args=--/renderer/activeGpu=1 --headless"
     )
     run_env = (output / "run.env").read_text()
     assert "TABERO_METHOD=dsrl\n" in run_env
     assert f"TABERO_TASK_ID={task_id}\n" in run_env
     assert "TABERO_RUN_MODE=formal\n" in run_env
+    assert "TABERO_RECORD_STEP_TRACES=true\n" in run_env
     assert f"TABERO_DSRL_BUNDLE={bundle.resolve()}\n" in run_env
     assert (
         f"WANDB_RUN_ID=tabero-official-dsrl-task{task_id}-20260728-120000-formal\n"

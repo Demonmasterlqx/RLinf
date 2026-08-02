@@ -35,6 +35,10 @@ from rlinf.utils.dsrl_rollout_sync import (
     DSRL_ROLLOUT_SYNC_PARAMETER_COUNT,
     DSRL_ROLLOUT_SYNC_TENSOR_COUNT,
 )
+from rlinf.utils.dsrl_transition import (
+    DSRL_TRANSITION_BOUNDARY_SEMANTICS,
+    TABERO_DSRL_CHUNK_BOUNDARY_MODE,
+)
 
 
 def _sha256(path):
@@ -102,6 +106,7 @@ def _checkpoint(
         "reward_semantics": DSRL_REWARD_SEMANTICS,
         "observation_semantics": DSRL_OBSERVATION_SEMANTICS,
         "replay_semantics": DSRL_REPLAY_SEMANTICS,
+        "transition_boundary_semantics": DSRL_TRANSITION_BOUNDARY_SEMANTICS,
         "checkpoint_version": DSRL_TRAINABLE_CHECKPOINT_VERSION,
         "manifest_version": 2,
         "task_id": task_id,
@@ -148,11 +153,14 @@ def _formal_config(task_id, base_model, *, profile="formal"):
             "logger": {"logger_backends": ["tensorboard", "wandb"]},
         },
         "algorithm": {
+            "adv_type": "embodied_sac",
+            "loss_type": "embodied_sac",
             "update_epoch": 20 if is_custom else 200,
             "gamma": 0.999,
             "dsrl_reward_semantics": DSRL_REWARD_SEMANTICS,
             "dsrl_observation_semantics": DSRL_OBSERVATION_SEMANTICS,
             "dsrl_replay_semantics": DSRL_REPLAY_SEMANTICS,
+            "dsrl_transition_boundary_semantics": (DSRL_TRANSITION_BOUNDARY_SEMANTICS),
             "replay_buffer": {
                 "backend": DSRL_REPLAY_BACKEND,
                 "capacity_transitions": DSRL_REPLAY_CAPACITY_TRANSITIONS,
@@ -169,14 +177,23 @@ def _formal_config(task_id, base_model, *, profile="formal"):
                 "rollout_epoch": 1 if is_custom else 2,
                 "init_params": {
                     "task_id": task_id,
+                    "chunk_boundary_mode": TABERO_DSRL_CHUNK_BOUNDARY_MODE,
                     "prompt_conditions": {
                         "condition_cycle": ["firm"],
                         "firm_adverbs": ["firmly", "tightly"],
                     },
                 },
-            }
+            },
+            "eval": {
+                "init_params": {
+                    "chunk_boundary_mode": TABERO_DSRL_CHUNK_BOUNDARY_MODE,
+                }
+            },
         },
-        "rollout": {"model": {"model_path": str(base_model.resolve())}},
+        "rollout": {
+            "collect_transitions": True,
+            "model": {"model_path": str(base_model.resolve())},
+        },
         "actor": {
             "rollout_sync_prefixes": [
                 "dsrl_action_noise_net.",
@@ -186,12 +203,18 @@ def _formal_config(task_id, base_model, *, profile="formal"):
             ],
             "model": {
                 "model_path": str(base_model.resolve()),
+                "num_action_chunks": 10,
+                "action_dim": 13,
+                "num_q_heads": 10,
                 "openpi": {
                     "use_dsrl": True,
                     "dsrl_use_tactile": True,
                     "dsrl_num_images": 2,
                     "dsrl_state_dim": 7,
                     "dsrl_action_noise_dim": 32,
+                    "dsrl_num_q_heads": 10,
+                    "action_chunk": 10,
+                    "action_env_dim": 13,
                 },
             },
             "fsdp_config": {
@@ -420,6 +443,9 @@ def test_export_writes_strict_actor_bundle_and_audit(tmp_path):
     assert manifest["algorithm"] == "dsrl-sac"
     assert manifest["reward_semantics"] == DSRL_REWARD_SEMANTICS
     assert manifest["observation_semantics"] == DSRL_OBSERVATION_SEMANTICS
+    assert (
+        manifest["transition_boundary_semantics"] == DSRL_TRANSITION_BOUNDARY_SEMANTICS
+    )
     assert manifest["task_id"] == 5
     assert manifest["global_step"] == 50
     assert manifest["is_final"] is True
@@ -484,6 +510,7 @@ def test_export_writes_strict_actor_bundle_and_audit(tmp_path):
     assert audit["format_version"] == 2
     assert audit["reward_semantics"] == DSRL_REWARD_SEMANTICS
     assert audit["observation_semantics"] == DSRL_OBSERVATION_SEMANTICS
+    assert audit["transition_boundary_semantics"] == DSRL_TRANSITION_BOUNDARY_SEMANTICS
     assert all(audit["checks"].values())
     assert audit["actor_weights_sha256"] == _sha256(actor_path)
     assert audit["manifest_sha256"] == _sha256(output_dir / "manifest.json")
@@ -533,6 +560,7 @@ def test_export_accepts_final_task5_small4gpu40_profile(tmp_path):
         ({"reward_semantics": None}, "reward_semantics"),
         ({"observation_semantics": None}, "observation_semantics"),
         ({"replay_semantics": None}, "replay_semantics"),
+        ({"transition_boundary_semantics": None}, "transition_boundary_semantics"),
         ({"checkpoint_version": 2}, "checkpoint_version"),
         ({"manifest_version": 1}, "manifest_version"),
         ({"task_id": 0}, "task_id"),
@@ -602,6 +630,12 @@ def test_export_rejects_wrong_small4gpu40_metadata(
         ("algorithm.dsrl_reward_semantics", "legacy"),
         ("algorithm.dsrl_observation_semantics", "single_camera_v1"),
         ("algorithm.dsrl_replay_semantics", "trajectory_v0"),
+        (
+            "algorithm.dsrl_transition_boundary_semantics",
+            "cross_episode_chunk_v0",
+        ),
+        ("env.train.init_params.chunk_boundary_mode", "legacy"),
+        ("env.eval.init_params.chunk_boundary_mode", "legacy"),
         ("algorithm.replay_buffer.backend", "trajectory"),
         ("algorithm.replay_buffer.capacity_transitions", 99_999),
         ("algorithm.replay_buffer.checkpoint_shard_transitions", 2048),
@@ -803,6 +837,10 @@ def test_export_rejects_non_allowlisted_selected_checkpoint_paths(
         ({"method": "pirl"}, "method"),
         ({"observation_semantics": "single_camera_v1"}, "observation_semantics"),
         ({"replay_semantics": "trajectory_v0"}, "replay_semantics"),
+        (
+            {"transition_boundary_semantics": "cross_episode_chunk_v0"},
+            "transition_boundary_semantics",
+        ),
         ({"checkpoint_version": 2}, "checkpoint_version"),
         ({"manifest_version": 1}, "manifest_version"),
         ({"task_id": 5}, "task"),
@@ -930,6 +968,12 @@ def test_export_rejects_config_snapshot_for_other_task(tmp_path):
         ("algorithm.gamma", 0.99),
         ("algorithm.dsrl_observation_semantics", "single_camera_v1"),
         ("algorithm.dsrl_replay_semantics", "trajectory_v0"),
+        (
+            "algorithm.dsrl_transition_boundary_semantics",
+            "cross_episode_chunk_v0",
+        ),
+        ("env.train.init_params.chunk_boundary_mode", "legacy"),
+        ("env.eval.init_params.chunk_boundary_mode", "legacy"),
         ("algorithm.replay_buffer.backend", "trajectory"),
         ("algorithm.replay_buffer.capacity_transitions", 99_999),
         ("algorithm.replay_buffer.checkpoint_shard_transitions", 2048),

@@ -45,6 +45,116 @@ def _marker_motion(num_envs: int, offset: float = 0.0) -> torch.Tensor:
     return motion
 
 
+def _raw_tabero_obs(state_x: list[float], marker_offset: float = 0.0):
+    num_envs = len(state_x)
+    eef_pose = torch.zeros((num_envs, 7), dtype=torch.float32)
+    eef_pose[:, 0] = torch.tensor(state_x)
+    eef_pose[:, 3] = 1.0
+    return {
+        "policy": {
+            "agentview_rgb": torch.zeros((num_envs, 4, 4, 3), dtype=torch.uint8),
+            "eye_in_hand_rgb": torch.ones((num_envs, 4, 4, 3), dtype=torch.uint8),
+            "eef_pose": eef_pose,
+            "gripper_pos": torch.full((num_envs, 1), 0.03),
+            "gripper_marker_motion": _marker_motion(num_envs, offset=marker_offset),
+        }
+    }
+
+
+class _TerminalSafeFakeEnv:
+    device = torch.device("cpu")
+
+    def __init__(self, schedule: list[dict[int, str]], num_envs: int):
+        self.num_envs = num_envs
+        self.schedule = schedule
+        self.step_index = 0
+        self.actions = []
+        self.reset_calls = []
+
+    def step(self, actions):
+        step_index = self.step_index
+        self.step_index += 1
+        self.actions.append(actions.clone())
+        done_spec = self.schedule[step_index]
+        terminations = torch.zeros(self.num_envs, dtype=torch.bool)
+        truncations = torch.zeros(self.num_envs, dtype=torch.bool)
+        for env_id, done_kind in done_spec.items():
+            if done_kind == "termination":
+                terminations[env_id] = True
+            elif done_kind == "truncation":
+                truncations[env_id] = True
+            else:
+                raise AssertionError(done_kind)
+        dones = terminations | truncations
+        post_step_x = [10.0 + step_index + env_id for env_id in range(self.num_envs)]
+        raw_obs = _raw_tabero_obs(post_step_x, marker_offset=10.0 + step_index)
+        extras = {}
+        if dones.any():
+            terminal_x = [
+                100.0 + step_index + env_id if dones[env_id] else post_step_x[env_id]
+                for env_id in range(self.num_envs)
+            ]
+            extras[getattr(tabero_tacfield, "_TERMINAL_RAW_OBSERVATION_KEY")] = (
+                _raw_tabero_obs(terminal_x, marker_offset=100.0 + step_index)
+            )
+            extras[getattr(tabero_tacfield, "_TERMINAL_OBSERVATION_MASK_KEY")] = (
+                dones.clone()
+            )
+        rewards = terminations.to(dtype=torch.float32)
+        return raw_obs, rewards, terminations, truncations, extras
+
+    def reset(self, seed=None, env_ids=None):
+        del seed
+        env_ids = torch.as_tensor(env_ids, dtype=torch.long)
+        self.reset_calls.append(env_ids.clone())
+        return (
+            _raw_tabero_obs(
+                [200.0 + env_id for env_id in range(self.num_envs)],
+                marker_offset=200.0,
+            ),
+            {},
+        )
+
+
+def _terminal_safe_adapter(schedule: list[dict[int, str]], num_envs: int = 1):
+    env = object.__new__(IsaaclabTaberoTacFieldEnv)
+    env.num_envs = num_envs
+    env.device = torch.device("cpu")
+    env.cfg = SimpleNamespace(max_episode_steps=100)
+    env.env = _TerminalSafeFakeEnv(schedule, num_envs)
+    env._chunk_boundary_mode = getattr(tabero_tacfield, "_TERMINAL_SAFE_HDF5_MODE")
+    env._main_image_key = "agentview_rgb"
+    env._wrist_image_key = "eye_in_hand_rgb"
+    env._marker_motion_key = "gripper_marker_motion"
+    env._force_key = None
+    env._marker_history = TacManipMarkerMotionHistory(num_envs=num_envs, history_len=8)
+    env._prompt_condition_ids = ()
+    env._conditioned_prompts = ["pick soup"] * num_envs
+    env.task_description = "pick soup"
+    env.ignore_terminations = False
+    env.auto_reset = False
+    env.prev_step_reward = torch.zeros(num_envs)
+    env.success_once = torch.zeros(num_envs, dtype=torch.bool)
+    env.fail_once = torch.zeros(num_envs, dtype=torch.bool)
+    env.returns = torch.zeros(num_envs)
+    env._elapsed_steps = torch.zeros(num_envs, dtype=torch.int32)
+    env._tabero_task = resolve_tabero_tasks(
+        OmegaConf.create(
+            {
+                "tasks": [
+                    {
+                        "task_suite": "libero_object",
+                        "task_id": 0,
+                        "task_description": "pick soup",
+                    }
+                ]
+            }
+        )
+    )[0]
+    env._tabero_task_shard_id = 0
+    return env
+
+
 def test_marker_motion_history_builds_tabero_prefix_with_front_padding():
     history = TacManipMarkerMotionHistory(num_envs=2, history_len=8)
 
@@ -77,6 +187,211 @@ def test_marker_motion_history_reset_reinitializes_selected_envs():
     new_init_env1 = _marker_motion(2, 20.0)[1, :, 0].reshape(198, 2)
     torch.testing.assert_close(updated[0, 0], original_init_env0)
     torch.testing.assert_close(updated[1, 0], new_init_env1)
+
+
+def test_marker_motion_history_update_mask_freezes_inactive_environment():
+    history = TacManipMarkerMotionHistory(num_envs=2, history_len=8)
+    initial = history.update(_marker_motion(2, offset=0.0))
+
+    updated = history.update(
+        _marker_motion(2, offset=20.0),
+        update_mask=torch.tensor([False, True]),
+    )
+
+    torch.testing.assert_close(updated[0], initial[0])
+    assert not torch.equal(updated[1], initial[1])
+
+
+def test_hdf5_wrapper_captures_terminal_observation_before_internal_reset():
+    class FakeObservationManager:
+        def compute(self, update_history=False):
+            assert update_history is False
+            return _raw_tabero_obs([100.0, 101.0], marker_offset=100.0)
+
+    class FakeEnv:
+        num_envs = 2
+        device = torch.device("cpu")
+
+        def __init__(self):
+            self.observation_manager = FakeObservationManager()
+            self.reset_ids = []
+
+        def _reset_idx(self, env_ids):
+            self.reset_ids.append(torch.as_tensor(env_ids).clone())
+
+        def step(self, action):
+            del action
+            self._reset_idx(torch.tensor([0]))
+            return (
+                _raw_tabero_obs([10.0, 11.0], marker_offset=10.0),
+                torch.tensor([1.0, 0.0]),
+                torch.tensor([True, False]),
+                torch.tensor([False, False]),
+                {},
+            )
+
+    wrapped = TaberoHdf5ResetWrapper(
+        FakeEnv(),
+        dataset_handler=SimpleNamespace(),
+        episode_names=["demo_0"],
+        shard_id=0,
+        total_shards=1,
+        capture_terminal_observation=True,
+    )
+
+    _, _, _, _, extras = wrapped.step(torch.zeros((2, 13)))
+
+    terminal = extras[getattr(tabero_tacfield, "_TERMINAL_RAW_OBSERVATION_KEY")]
+    mask = extras[getattr(tabero_tacfield, "_TERMINAL_OBSERVATION_MASK_KEY")]
+    assert mask.tolist() == [True, False]
+    assert terminal["policy"]["eef_pose"][0, 0].item() == 100.0
+
+
+def test_hdf5_wrapper_accumulates_terminal_rows_across_multiple_internal_resets():
+    class FakeObservationManager:
+        def __init__(self):
+            self.calls = 0
+
+        def compute(self, update_history=False):
+            assert update_history is False
+            observations = (
+                _raw_tabero_obs([100.0, 11.0], marker_offset=100.0)
+                if self.calls == 0
+                else _raw_tabero_obs([10.0, 101.0], marker_offset=200.0)
+            )
+            self.calls += 1
+            return observations
+
+    class FakeEnv:
+        num_envs = 2
+        device = torch.device("cpu")
+
+        def __init__(self):
+            self.observation_manager = FakeObservationManager()
+
+        def _reset_idx(self, env_ids):
+            del env_ids
+
+        def step(self, action):
+            del action
+            self._reset_idx(torch.tensor([0]))
+            self._reset_idx(torch.tensor([1]))
+            return (
+                _raw_tabero_obs([10.0, 11.0], marker_offset=10.0),
+                torch.ones(2),
+                torch.tensor([True, True]),
+                torch.tensor([False, False]),
+                {},
+            )
+
+    wrapped = TaberoHdf5ResetWrapper(
+        FakeEnv(),
+        dataset_handler=SimpleNamespace(),
+        episode_names=["demo_0"],
+        shard_id=0,
+        total_shards=1,
+        capture_terminal_observation=True,
+    )
+
+    _, _, _, _, extras = wrapped.step(torch.zeros((2, 13)))
+
+    terminal = extras[getattr(tabero_tacfield, "_TERMINAL_RAW_OBSERVATION_KEY")]
+    mask = extras[getattr(tabero_tacfield, "_TERMINAL_OBSERVATION_MASK_KEY")]
+    assert mask.tolist() == [True, True]
+    assert terminal["policy"]["eef_pose"][:, 0].tolist() == [100.0, 101.0]
+
+
+@pytest.mark.parametrize("done_step", [0, 1, 3])
+@pytest.mark.parametrize("done_kind", ["termination", "truncation"])
+def test_terminal_safe_chunk_preserves_first_done_and_uses_hold_padding(
+    done_step, done_kind
+):
+    chunk_size = 4
+    schedule = [{} for _ in range(chunk_size)]
+    schedule[done_step] = {0: done_kind}
+    env = _terminal_safe_adapter(schedule)
+    policy_actions = torch.full((1, chunk_size, 13), 9.0)
+
+    obs_list, rewards, terminations, truncations, infos_list = env.chunk_step(
+        policy_actions
+    )
+
+    expected_done = torch.zeros((1, chunk_size), dtype=torch.bool)
+    expected_done[0, done_step] = True
+    if done_kind == "termination":
+        torch.testing.assert_close(terminations, expected_done)
+        assert not truncations.any()
+        assert rewards[0, done_step].item() == 1.0
+    else:
+        torch.testing.assert_close(truncations, expected_done)
+        assert not terminations.any()
+        assert rewards.sum().item() == 0.0
+    assert rewards[0, done_step + 1 :].sum().item() == 0.0
+
+    terminal_obs = infos_list[done_step]["final_observation"]
+    assert terminal_obs["states"][0, 0].item() == 100.0 + done_step
+    assert obs_list[-1]["states"][0, 0].item() == 200.0
+    assert env.env.reset_calls[0].tolist() == [0]
+
+    for padding_step in range(done_step + 1, chunk_size):
+        executed = env.env.actions[padding_step][0]
+        torch.testing.assert_close(executed[7:], torch.zeros(6))
+        assert executed[0].item() == pytest.approx(9.0 + padding_step)
+
+    metrics = infos_list[-1]["chunk_boundary_metrics"]
+    assert metrics["done_envs"].item() == 1
+    assert metrics["early_done_envs"].item() == int(done_step < chunk_size - 1)
+    assert metrics["post_done_hold_steps"].item() == chunk_size - done_step - 1
+    assert metrics["post_done_policy_actions"].item() == 0
+    assert metrics["terminal_observation_captures"].item() == 1
+    assert metrics["hdf5_reset_envs"].item() == 1
+
+
+def test_terminal_safe_chunk_without_done_executes_policy_and_skips_reset():
+    chunk_size = 3
+    env = _terminal_safe_adapter([{} for _ in range(chunk_size)])
+    policy_actions = torch.arange(chunk_size * 13, dtype=torch.float32).reshape(
+        1, chunk_size, 13
+    )
+
+    _, rewards, terminations, truncations, infos_list = env.chunk_step(policy_actions)
+
+    assert not terminations.any()
+    assert not truncations.any()
+    assert rewards.sum().item() == 0.0
+    assert env.env.reset_calls == []
+    torch.testing.assert_close(torch.stack(env.env.actions, dim=1), policy_actions)
+    metrics = infos_list[-1]["chunk_boundary_metrics"]
+    assert metrics["done_envs"].item() == 0
+    assert metrics["post_done_hold_steps"].item() == 0
+
+
+def test_terminal_safe_chunk_resets_simultaneous_done_environments_together():
+    env = _terminal_safe_adapter(
+        [{}, {0: "termination", 1: "truncation"}, {}], num_envs=2
+    )
+
+    _, _, terminations, truncations, infos_list = env.chunk_step(torch.ones((2, 3, 13)))
+
+    assert terminations[0, 1]
+    assert truncations[1, 1]
+    assert env.env.reset_calls[0].tolist() == [0, 1]
+    metrics = infos_list[-1]["chunk_boundary_metrics"]
+    assert metrics["done_envs"].item() == 2
+    assert metrics["post_done_hold_steps"].item() == 2
+    assert metrics["terminal_observation_captures"].item() == 2
+
+
+def test_terminal_safe_chunk_preserves_ignore_terminations_output_semantics():
+    env = _terminal_safe_adapter([{0: "termination"}, {}])
+    env.ignore_terminations = True
+
+    _, _, terminations, truncations, infos_list = env.chunk_step(torch.ones((1, 2, 13)))
+
+    assert not terminations.any()
+    assert not truncations.any()
+    assert infos_list[0]["episode"]["success_at_end"].item() is True
+    assert env.env.reset_calls[0].tolist() == [0]
 
 
 def test_build_tabero_state_uses_pose_axis_angle_and_gripper_scalar():

@@ -34,6 +34,49 @@ from ..isaaclab_env import IsaaclabBaseEnv
 
 logger = logging.getLogger(__name__)
 
+_TERMINAL_RAW_OBSERVATION_KEY = "tabero_terminal_raw_observation"
+_TERMINAL_OBSERVATION_MASK_KEY = "tabero_terminal_observation_mask"
+_TERMINAL_SAFE_HDF5_MODE = "terminal_safe_hdf5_v1"
+
+
+def _clone_nested_tensors(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.clone()
+    if isinstance(value, dict):
+        return {key: _clone_nested_tensors(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_clone_nested_tensors(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_clone_nested_tensors(item) for item in value)
+    return value
+
+
+def _replace_batch_rows(base: Any, replacement: Any, mask: torch.Tensor) -> Any:
+    """Clone ``base`` and replace batch-aligned rows selected by ``mask``."""
+
+    if isinstance(base, torch.Tensor) and isinstance(replacement, torch.Tensor):
+        result = base.clone()
+        dst_mask = mask.to(device=result.device, dtype=torch.bool)
+        src_mask = mask.to(device=replacement.device, dtype=torch.bool)
+        result[dst_mask] = replacement[src_mask].to(device=result.device)
+        return result
+    if isinstance(base, dict) and isinstance(replacement, dict):
+        return {
+            key: _replace_batch_rows(base[key], replacement[key], mask)
+            if key in replacement
+            else _clone_nested_tensors(base[key])
+            for key in base
+        }
+    if isinstance(base, list) and isinstance(replacement, list):
+        result = list(base)
+        selected = mask.detach().to(device="cpu", dtype=torch.bool).tolist()
+        if len(result) == len(selected) and len(replacement) == len(selected):
+            for index, should_replace in enumerate(selected):
+                if should_replace:
+                    result[index] = replacement[index]
+        return result
+    return _clone_nested_tensors(base)
+
 
 def _cfg_get(cfg: Any, name: str, default: Any = None) -> Any:
     return getattr(cfg, name, default) if cfg is not None else default
@@ -248,6 +291,7 @@ class TaberoHdf5ResetWrapper:
         episode_names: list[str],
         shard_id: int,
         total_shards: int,
+        capture_terminal_observation: bool = False,
     ) -> None:
         self._env = env
         self._dataset_handler = dataset_handler
@@ -256,6 +300,50 @@ class TaberoHdf5ResetWrapper:
         self._total_shards = int(total_shards)
         self._bootstrap_reset_done = False
         self._rollout_round = 0
+        self._capture_terminal_observation = bool(capture_terminal_observation)
+        self._capture_terminal_on_reset = False
+        self._step_terminal_observation: Any | None = None
+        self._step_terminal_mask = torch.zeros(
+            int(self._env.num_envs), dtype=torch.bool, device=self._env.device
+        )
+        if self._capture_terminal_observation:
+            self._install_terminal_observation_capture()
+
+    def _install_terminal_observation_capture(self) -> None:
+        if not hasattr(self._env, "_reset_idx") or not hasattr(
+            self._env, "observation_manager"
+        ):
+            raise ValueError(
+                "Tabero terminal-safe HDF5 mode requires IsaacLab _reset_idx "
+                "and observation_manager support."
+            )
+
+        original_reset_idx = self._env._reset_idx
+
+        def reset_idx_with_terminal_capture(env_ids) -> None:
+            if self._capture_terminal_on_reset:
+                terminal_obs = self._env.observation_manager.compute(
+                    update_history=False
+                )
+                env_ids_tensor = torch.as_tensor(
+                    env_ids, device=self._env.device, dtype=torch.long
+                )
+                capture_mask = torch.zeros_like(self._step_terminal_mask)
+                capture_mask[env_ids_tensor] = True
+                if self._step_terminal_observation is None:
+                    self._step_terminal_observation = _clone_nested_tensors(
+                        terminal_obs
+                    )
+                else:
+                    self._step_terminal_observation = _replace_batch_rows(
+                        self._step_terminal_observation,
+                        terminal_obs,
+                        capture_mask,
+                    )
+                self._step_terminal_mask[env_ids_tensor] = True
+            original_reset_idx(env_ids)
+
+        self._env._reset_idx = reset_idx_with_terminal_capture
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._env, name)
@@ -306,6 +394,31 @@ class TaberoHdf5ResetWrapper:
         )
         self._rollout_round += 1
         return reset_result
+
+    def step(self, action: torch.Tensor):
+        if not self._capture_terminal_observation:
+            return self._env.step(action)
+
+        self._step_terminal_observation = None
+        self._step_terminal_mask.zero_()
+        self._capture_terminal_on_reset = True
+        try:
+            obs, reward, terminations, truncations, extras = self._env.step(action)
+        finally:
+            self._capture_terminal_on_reset = False
+
+        dones = torch.logical_or(terminations, truncations).to(dtype=torch.bool)
+        if dones.any():
+            if self._step_terminal_observation is None or not torch.all(
+                self._step_terminal_mask[dones]
+            ):
+                raise RuntimeError(
+                    "IsaacLab reset did not provide every Tabero terminal observation."
+                )
+            extras = dict(extras or {})
+            extras[_TERMINAL_RAW_OBSERVATION_KEY] = self._step_terminal_observation
+            extras[_TERMINAL_OBSERVATION_MASK_KEY] = self._step_terminal_mask.clone()
+        return obs, reward, terminations, truncations, extras
 
     def close(self) -> None:
         try:
@@ -749,7 +862,11 @@ class TacManipMarkerMotionHistory:
         if self._history is not None:
             self._history[env_ids] = 0
 
-    def update(self, marker_motion: torch.Tensor) -> torch.Tensor:
+    def update(
+        self,
+        marker_motion: torch.Tensor,
+        update_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Update and return shape ``(N, 1 + history_len, 2 * markers, 2)``."""
 
         if marker_motion.ndim != 5:
@@ -783,7 +900,21 @@ class TacManipMarkerMotionHistory:
         assert self._history is not None
         assert self._initialized is not None
 
-        new_envs = ~self._initialized
+        if update_mask is None:
+            update_mask = torch.ones(
+                self.num_envs, device=current_pos.device, dtype=torch.bool
+            )
+        else:
+            update_mask = torch.as_tensor(
+                update_mask, device=current_pos.device, dtype=torch.bool
+            )
+            if update_mask.shape != (self.num_envs,):
+                raise ValueError(
+                    "marker history update_mask must have shape "
+                    f"({self.num_envs},), got {tuple(update_mask.shape)}."
+                )
+
+        new_envs = ~self._initialized & update_mask
         if new_envs.any():
             self._reference[new_envs] = init_pos[new_envs]
             self._history[new_envs] = current_pos[new_envs, None].expand(
@@ -791,7 +922,7 @@ class TacManipMarkerMotionHistory:
             )
             self._initialized[new_envs] = True
 
-        existing_envs = ~new_envs
+        existing_envs = self._initialized & update_mask & ~new_envs
         if existing_envs.any():
             self._history[existing_envs] = torch.roll(
                 self._history[existing_envs], shifts=-1, dims=1
@@ -829,6 +960,9 @@ class IsaaclabTaberoTacFieldEnv(IsaaclabBaseEnv):
         self._hdf5_reset_assignment = str(
             _cfg_get(init_params, "hdf5_reset_assignment", "cyclic")
         )
+        self._chunk_boundary_mode = str(
+            _cfg_get(init_params, "chunk_boundary_mode", "legacy")
+        )
         if self._hdf5_initial_states_path is not None:
             hdf5_path = Path(str(self._hdf5_initial_states_path)).expanduser()
             if not hdf5_path.is_file():
@@ -840,6 +974,13 @@ class IsaaclabTaberoTacFieldEnv(IsaaclabBaseEnv):
                     "Tabero hdf5_reset_assignment currently supports only 'cyclic'."
                 )
             self._hdf5_initial_states_path = str(hdf5_path)
+        if (
+            self._chunk_boundary_mode == _TERMINAL_SAFE_HDF5_MODE
+            and self._hdf5_initial_states_path is None
+        ):
+            raise ValueError(
+                "Tabero terminal-safe HDF5 mode requires hdf5_initial_states_path."
+            )
         self._tabero_tasks = resolve_tabero_tasks(init_params)
         validate_tabero_task_assignment(
             self._tabero_tasks,
@@ -999,6 +1140,9 @@ class IsaaclabTaberoTacFieldEnv(IsaaclabBaseEnv):
                     episode_names=episode_names,
                     shard_id=self._tabero_task_shard_id,
                     total_shards=self.total_num_processes,
+                    capture_terminal_observation=(
+                        self._chunk_boundary_mode == _TERMINAL_SAFE_HDF5_MODE
+                    ),
                 )
             return env, sim_app
 
@@ -1006,9 +1150,19 @@ class IsaaclabTaberoTacFieldEnv(IsaaclabBaseEnv):
 
     def reset(self, seed=None, env_ids: torch.Tensor | None = None):
         self._marker_history.reset(env_ids)
+        target_mask = None
+        target_env_ids = None
+        if env_ids is not None:
+            target_env_ids = torch.as_tensor(
+                env_ids, device=self.device, dtype=torch.long
+            )
+            target_mask = torch.zeros(
+                self.num_envs, device=self.device, dtype=torch.bool
+            )
+            target_mask[target_env_ids] = True
         if getattr(self, "_prompt_condition_ids", ()):
             self._prompt_rollout_round += 1
-            self._conditioned_prompts, condition_ids = build_tabero_conditioned_prompts(
+            conditioned_prompts, condition_ids = build_tabero_conditioned_prompts(
                 instruction=self._tabero_task.task_description,
                 task_suite=self._tabero_task.task_suite,
                 task_id=self._tabero_task.task_id,
@@ -1016,7 +1170,17 @@ class IsaaclabTaberoTacFieldEnv(IsaaclabBaseEnv):
                 prompt_cfg=self._prompt_cfg,
                 rollout_round=self._prompt_rollout_round,
             )
-            self._prompt_condition_ids = tuple(condition_ids)
+            if target_env_ids is None:
+                self._conditioned_prompts = conditioned_prompts
+                self._prompt_condition_ids = tuple(condition_ids)
+            else:
+                current_prompts = list(self._conditioned_prompts)
+                current_condition_ids = list(self._prompt_condition_ids)
+                for env_id in target_env_ids.detach().cpu().tolist():
+                    current_prompts[env_id] = conditioned_prompts[env_id]
+                    current_condition_ids[env_id] = condition_ids[env_id]
+                self._conditioned_prompts = current_prompts
+                self._prompt_condition_ids = tuple(current_condition_ids)
             logger.info(
                 "Tabero prompts shard=%d round=%d prompts=%s",
                 self._tabero_task_shard_id,
@@ -1028,18 +1192,228 @@ class IsaaclabTaberoTacFieldEnv(IsaaclabBaseEnv):
                 self._condition_squeeze_sum.zero_()
                 self._condition_squeeze_count.zero_()
             else:
-                env_ids = env_ids.to(device=self.device, dtype=torch.long)
-                self._condition_squeeze_sum[env_ids] = 0
-                self._condition_squeeze_count[env_ids] = 0
-        return super().reset(seed=seed, env_ids=env_ids)
+                self._condition_squeeze_sum[target_env_ids] = 0
+                self._condition_squeeze_count[target_env_ids] = 0
+
+        if target_env_ids is None:
+            raw_obs, _ = self.env.reset(seed=seed)
+        else:
+            raw_obs, _ = self.env.reset(seed=seed, env_ids=target_env_ids)
+        obs = self._wrap_obs(raw_obs, marker_update_mask=target_mask)
+        self._reset_metrics(target_env_ids)
+        return obs, {}
 
     def step(self, actions=None, auto_reset=True):
+        if self._chunk_boundary_mode == _TERMINAL_SAFE_HDF5_MODE:
+            active_mask = torch.ones(
+                self.num_envs, device=self.device, dtype=torch.bool
+            )
+            return self._terminal_safe_step(actions, active_mask=active_mask)
         if getattr(self, "_prompt_condition_ids", ()) and actions is not None:
             actions_tensor = torch.as_tensor(actions, device=self.device)
             squeeze = compute_tabero_predicted_squeeze(actions_tensor)
             self._condition_squeeze_sum += squeeze.to(dtype=torch.float32)
             self._condition_squeeze_count += 1
         return super().step(actions=actions, auto_reset=auto_reset)
+
+    def _terminal_safe_step(
+        self,
+        actions: torch.Tensor,
+        *,
+        active_mask: torch.Tensor,
+    ):
+        active_mask = torch.as_tensor(active_mask, device=self.device, dtype=torch.bool)
+        if active_mask.shape != (self.num_envs,):
+            raise ValueError(
+                "terminal-safe active_mask must have shape "
+                f"({self.num_envs},), got {tuple(active_mask.shape)}."
+            )
+
+        actions_tensor = torch.as_tensor(actions, device=self.device)
+        if getattr(self, "_prompt_condition_ids", ()):
+            squeeze = compute_tabero_predicted_squeeze(actions_tensor)
+            self._condition_squeeze_sum[active_mask] += squeeze[active_mask].to(
+                dtype=torch.float32
+            )
+            self._condition_squeeze_count[active_mask] += 1
+
+        raw_obs, step_reward, raw_terminations, raw_truncations, raw_infos = (
+            self.env.step(actions_tensor)
+        )
+        step_reward = step_reward.clone()
+        raw_terminations = raw_terminations.clone().to(dtype=torch.bool)
+        raw_truncations = raw_truncations.clone().to(dtype=torch.bool)
+        raw_infos = dict(raw_infos or {})
+
+        self._elapsed_steps[active_mask] += 1
+        horizon_truncations = active_mask & (
+            self.elapsed_steps >= self.cfg.max_episode_steps
+        )
+        terminations = raw_terminations & active_mask
+        truncations = (raw_truncations | horizon_truncations) & active_mask
+        newly_done = terminations | truncations
+
+        captured_mask = torch.as_tensor(
+            raw_infos.get(
+                _TERMINAL_OBSERVATION_MASK_KEY,
+                torch.zeros(self.num_envs, device=self.device, dtype=torch.bool),
+            ),
+            device=self.device,
+            dtype=torch.bool,
+        )
+        captured_raw_obs = raw_infos.get(_TERMINAL_RAW_OBSERVATION_KEY)
+        internal_done = active_mask & (raw_terminations | raw_truncations)
+        if internal_done.any() and (
+            captured_raw_obs is None or not torch.all(captured_mask[internal_done])
+        ):
+            raise RuntimeError(
+                "Tabero terminal-safe step is missing an IsaacLab terminal frame."
+            )
+
+        wrapped_source = raw_obs
+        if captured_raw_obs is not None and captured_mask.any():
+            wrapped_source = _replace_batch_rows(
+                raw_obs, captured_raw_obs, captured_mask & active_mask
+            )
+        obs = self._wrap_obs(wrapped_source, marker_update_mask=active_mask)
+
+        step_reward = torch.where(active_mask, step_reward, 0.0)
+        infos = self._record_metrics(step_reward, terminations, {})
+        final_info = {"episode": _clone_nested_tensors(infos["episode"])}
+        returned_terminations = terminations.clone()
+        if self.ignore_terminations:
+            infos["episode"]["success_at_end"] = terminations.clone()
+            returned_terminations.zero_()
+
+        if newly_done.any():
+            infos["final_observation"] = _clone_nested_tensors(obs)
+            infos["final_info"] = final_info
+            infos["_final_info"] = newly_done.clone()
+            infos["_final_observation"] = newly_done.clone()
+            infos["_elapsed_steps"] = newly_done.clone()
+
+        infos["_tabero_hold_state"] = build_tabero_state(raw_obs["policy"])
+        infos["_tabero_boundary_done"] = newly_done
+        infos["_tabero_terminal_capture"] = newly_done.clone()
+        return (
+            obs,
+            step_reward,
+            returned_terminations,
+            truncations,
+            infos,
+        )
+
+    @staticmethod
+    def _build_hold_actions(
+        action_template: torch.Tensor, hold_state: torch.Tensor
+    ) -> torch.Tensor:
+        if action_template.ndim != 2 or action_template.shape[-1] != 13:
+            raise ValueError(
+                "Tabero terminal-safe hold expects actions with shape (N, 13); "
+                f"got {tuple(action_template.shape)}."
+            )
+        hold_actions = torch.zeros_like(action_template)
+        hold_actions[:, :7] = hold_state.to(
+            device=action_template.device, dtype=action_template.dtype
+        )
+        return hold_actions
+
+    def chunk_step(self, chunk_actions: torch.Tensor):
+        if self._chunk_boundary_mode != _TERMINAL_SAFE_HDF5_MODE:
+            return super().chunk_step(chunk_actions)
+        if chunk_actions.ndim != 3 or chunk_actions.shape[-1] != 13:
+            raise ValueError(
+                "Tabero terminal-safe chunk expects shape (N, chunk, 13); "
+                f"got {tuple(chunk_actions.shape)}."
+            )
+
+        chunk_size = int(chunk_actions.shape[1])
+        if chunk_size <= 0:
+            raise ValueError("Tabero terminal-safe chunk must contain an action.")
+        active_mask = torch.ones(self.num_envs, device=self.device, dtype=torch.bool)
+        first_done_step = torch.full(
+            (self.num_envs,), -1, device=self.device, dtype=torch.long
+        )
+        latest_hold_state: torch.Tensor | None = None
+        post_done_hold_steps = 0
+        terminal_observation_captures = 0
+        obs_list = []
+        infos_list = []
+        rewards = []
+        terminations = []
+        truncations = []
+        executed_actions = []
+
+        for step_index in range(chunk_size):
+            actions = chunk_actions[:, step_index].clone()
+            inactive_mask = ~active_mask
+            if inactive_mask.any():
+                if latest_hold_state is None:
+                    raise RuntimeError(
+                        "Tabero terminal-safe chunk has no state for a hold action."
+                    )
+                hold_actions = self._build_hold_actions(actions, latest_hold_state)
+                actions[inactive_mask] = hold_actions[inactive_mask]
+                post_done_hold_steps += int(inactive_mask.sum().item())
+
+            obs, reward, step_terminations, step_truncations, infos = (
+                self._terminal_safe_step(actions, active_mask=active_mask)
+            )
+            boundary_done = infos.pop("_tabero_boundary_done")
+            terminal_capture = infos.pop("_tabero_terminal_capture")
+            latest_hold_state = infos.pop("_tabero_hold_state")
+            newly_done = boundary_done & active_mask
+            if newly_done.any():
+                first_done_step[newly_done] = step_index
+                terminal_observation_captures += int(
+                    terminal_capture[newly_done].sum().item()
+                )
+                active_mask = active_mask & ~newly_done
+
+            obs_list.append(obs)
+            infos_list.append(infos)
+            rewards.append(reward)
+            terminations.append(step_terminations)
+            truncations.append(step_truncations)
+            executed_actions.append(actions)
+
+        chunk_rewards = torch.stack(rewards, dim=1)
+        chunk_terminations = torch.stack(terminations, dim=1)
+        chunk_truncations = torch.stack(truncations, dim=1)
+        past_dones = first_done_step >= 0
+        hdf5_reset_envs = int(past_dones.sum().item())
+        if past_dones.any():
+            env_ids = torch.nonzero(past_dones, as_tuple=False).squeeze(-1)
+            reset_obs, _ = self.reset(env_ids=env_ids)
+            obs_list[-1] = _replace_batch_rows(obs_list[-1], reset_obs, past_dones)
+
+        early_done_envs = int(
+            ((first_done_step >= 0) & (first_done_step < chunk_size - 1)).sum().item()
+        )
+        infos_list[-1]["chunk_boundary_metrics"] = {
+            "done_envs": torch.tensor([hdf5_reset_envs], device=self.device),
+            "early_done_envs": torch.tensor([early_done_envs], device=self.device),
+            "post_done_hold_steps": torch.tensor(
+                [post_done_hold_steps], device=self.device
+            ),
+            "post_done_policy_actions": torch.zeros(
+                1, device=self.device, dtype=torch.long
+            ),
+            "terminal_observation_captures": torch.tensor(
+                [terminal_observation_captures], device=self.device
+            ),
+            "hdf5_reset_envs": torch.tensor([hdf5_reset_envs], device=self.device),
+        }
+        infos_list[-1]["_tabero_executed_chunk_actions"] = torch.stack(
+            executed_actions, dim=1
+        )
+        return (
+            obs_list,
+            chunk_rewards,
+            chunk_terminations,
+            chunk_truncations,
+            infos_list,
+        )
 
     def _record_metrics(self, step_reward, terminations, infos):
         infos = super()._record_metrics(step_reward, terminations, infos)
@@ -1087,11 +1461,15 @@ class IsaaclabTaberoTacFieldEnv(IsaaclabBaseEnv):
             )
         return infos
 
-    def _wrap_obs(self, obs):
+    def _wrap_obs(
+        self,
+        obs,
+        marker_update_mask: torch.Tensor | None = None,
+    ):
         policy_obs = obs["policy"]
         state = build_tabero_state(policy_obs)
         tactile_marker_motion = self._marker_history.update(
-            policy_obs[self._marker_motion_key]
+            policy_obs[self._marker_motion_key], update_mask=marker_update_mask
         )
 
         env_obs = {

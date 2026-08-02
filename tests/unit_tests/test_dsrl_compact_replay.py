@@ -29,6 +29,7 @@ from rlinf.utils.dsrl_replay import (
     compact_tabero_dsrl_observation,
     dsrl_replay_bytes_per_transition,
 )
+from rlinf.utils.dsrl_transition import DSRL_TRANSITION_BOUNDARY_SEMANTICS
 from rlinf.workers.env.env_worker import (
     project_compact_dsrl_rollout_inputs,
     project_compact_dsrl_step_result,
@@ -351,6 +352,9 @@ def test_compact_replay_ring_wrap_and_checkpoint_round_trip(tmp_path):
 
     metadata = json.loads((tmp_path / "metadata.json").read_text())
     assert metadata["replay_semantics"] == DSRL_REPLAY_SEMANTICS
+    assert (
+        metadata["transition_boundary_semantics"] == DSRL_TRANSITION_BOUNDARY_SEMANTICS
+    )
     assert metadata["num_shards"] == 3
     assert len(list(tmp_path.glob("shard_*.pt"))) == 3
 
@@ -370,4 +374,27 @@ def test_compact_replay_rejects_missing_or_wrong_metadata_before_loading(tmp_pat
 
     (tmp_path / "metadata.json").write_text(json.dumps({"replay_semantics": "legacy"}))
     with pytest.raises(ValueError, match="metadata 'format' mismatch"):
+        CompactDSRLReplayBuffer.validate_checkpoint_metadata(str(tmp_path))
+
+
+@pytest.mark.parametrize("semantics", [None, "cross_episode_chunk_v0"])
+def test_compact_replay_rejects_wrong_transition_boundary_semantics(
+    tmp_path,
+    semantics,
+):
+    replay = CompactDSRLReplayBuffer(
+        capacity_transitions=5,
+        checkpoint_shard_transitions=2,
+        max_resident_gib=0.01,
+    )
+    replay.save_checkpoint(str(tmp_path))
+    metadata_path = tmp_path / "metadata.json"
+    metadata = json.loads(metadata_path.read_text())
+    if semantics is None:
+        metadata.pop("transition_boundary_semantics")
+    else:
+        metadata["transition_boundary_semantics"] = semantics
+    metadata_path.write_text(json.dumps(metadata))
+
+    with pytest.raises(ValueError, match="transition_boundary_semantics"):
         CompactDSRLReplayBuffer.validate_checkpoint_metadata(str(tmp_path))

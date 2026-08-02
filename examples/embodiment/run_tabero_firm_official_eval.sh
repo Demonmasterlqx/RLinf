@@ -416,6 +416,7 @@ RUN_ENV_TEMP="$(mktemp "${OUTPUT_DIR}/.run.env.XXXXXX")"
   printf 'TABERO_RUN_MODE=formal\n'
   printf 'TABERO_DSRL_TRAINING_PROFILE=%s\n' "${TRAINING_PROFILE}"
   printf 'TABERO_EXPECTED_EPISODES=50\n'
+  printf 'TABERO_RECORD_STEP_TRACES=true\n'
   printf 'TABERO_DSRL_BUNDLE=%s\n' "${DSRL_BUNDLE}"
   printf 'TABERO_OUTPUT_DIR=%s\n' "${OUTPUT_DIR}"
   printf 'TABERO_START_TIME_UTC=%s\n' "${START_TIME_UTC}"
@@ -467,6 +468,8 @@ client_command=(
   --prompt-seed 0
   --prompt-adverbs firmly tightly
   --send-dsrl-raw-image
+  --record-step-traces
+  --step-trace-dir "${OUTPUT_DIR}/step_traces"
   --sim-device cuda:1
   --sim-kit-args=--/renderer/activeGpu=1
   --headless

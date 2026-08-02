@@ -20,6 +20,10 @@ from rlinf.utils.dsrl_replay import (
     DSRL_REPLAY_SEMANTICS,
 )
 from rlinf.utils.dsrl_reward import DSRL_REWARD_SEMANTICS
+from rlinf.utils.dsrl_transition import (
+    DSRL_TRANSITION_BOUNDARY_SEMANTICS,
+    TABERO_DSRL_CHUNK_BOUNDARY_MODE,
+)
 
 FORMAL_8GPU_50STEP_PROFILE = "formal_8gpu_50step"
 TASK5_4GPU_40STEP_SMALL_PROFILE = "task5_4gpu_40step_small"
@@ -29,6 +33,29 @@ TASK0_8GPU_60STEP_SELECTED_PROFILE_TEMPLATE = "task0_8gpu_60step_selected_step{s
 TASK0_8GPU_60STEP_SELECTED_STEPS = (10, 20, 30, 40, 50)
 
 _COMPACT_REPLAY_REQUIREMENTS = (
+    ("algorithm.adv_type", "embodied_sac"),
+    ("algorithm.loss_type", "embodied_sac"),
+    ("rollout.collect_transitions", True),
+    ("actor.model.num_action_chunks", 10),
+    ("actor.model.action_dim", 13),
+    ("actor.model.num_q_heads", 10),
+    ("actor.model.openpi.action_chunk", 10),
+    ("actor.model.openpi.action_env_dim", 13),
+    ("actor.model.openpi.dsrl_state_dim", 7),
+    ("actor.model.openpi.dsrl_action_noise_dim", 32),
+    ("actor.model.openpi.dsrl_num_q_heads", 10),
+    (
+        "algorithm.dsrl_transition_boundary_semantics",
+        DSRL_TRANSITION_BOUNDARY_SEMANTICS,
+    ),
+    (
+        "env.train.init_params.chunk_boundary_mode",
+        TABERO_DSRL_CHUNK_BOUNDARY_MODE,
+    ),
+    (
+        "env.eval.init_params.chunk_boundary_mode",
+        TABERO_DSRL_CHUNK_BOUNDARY_MODE,
+    ),
     ("algorithm.dsrl_replay_semantics", DSRL_REPLAY_SEMANTICS),
     ("algorithm.replay_buffer.backend", DSRL_REPLAY_BACKEND),
     (

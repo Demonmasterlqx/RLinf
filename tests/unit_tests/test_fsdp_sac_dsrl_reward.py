@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.nn as nn
 from omegaconf import OmegaConf
 
 import rlinf.workers.actor.fsdp_sac_policy_worker as sac_worker_module
@@ -19,6 +20,80 @@ from rlinf.workers.actor.fsdp_sac_policy_worker import EmbodiedSACFSDPPolicy
 
 GAMMA = 0.999
 CHUNK_LENGTH = 10
+
+
+class _SeparatedActorCritic(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.actor = nn.Linear(2, 2, bias=False)
+        self.critic = nn.Linear(2, 1, bias=False)
+
+
+def _gradient_partition_worker():
+    worker = EmbodiedSACFSDPPolicy.__new__(EmbodiedSACFSDPPolicy)
+    worker.model = _SeparatedActorCritic()
+    worker.optimizer = torch.optim.SGD(worker.model.actor.parameters(), lr=0.1)
+    worker.qf_optimizer = torch.optim.SGD(worker.model.critic.parameters(), lr=0.1)
+    worker.use_dsrl = True
+    worker._cache_optimizer_parameter_sets()
+    return worker
+
+
+def test_dsrl_optimizer_parameter_sets_are_disjoint_and_complete():
+    worker = _gradient_partition_worker()
+
+    assert {id(parameter) for parameter in worker._actor_parameters} == {
+        id(worker.model.actor.weight)
+    }
+    assert {id(parameter) for parameter in worker._critic_parameters} == {
+        id(worker.model.critic.weight)
+    }
+
+
+def test_dsrl_critic_and_actor_backward_keep_parameter_gradients_isolated():
+    worker = _gradient_partition_worker()
+    inputs = torch.tensor([[1.0, -2.0]])
+
+    worker._zero_model_and_optimizer_gradients(worker.qf_optimizer)
+    critic_loss = worker.model.critic(inputs).square().sum()
+    critic_loss.backward()
+    worker._assert_no_parameter_gradients(worker._actor_parameters, "critic")
+    assert worker.model.critic.weight.grad is not None
+
+    worker._zero_model_and_optimizer_gradients(worker.optimizer)
+    action = worker.model.actor(inputs)
+    action.retain_grad()
+    with worker._temporarily_freeze_parameters(worker._critic_parameters):
+        actor_loss = -worker.model.critic(action).sum()
+        actor_loss.backward()
+
+    worker._assert_no_parameter_gradients(worker._critic_parameters, "actor")
+    assert action.grad is not None
+    assert torch.count_nonzero(action.grad).item() > 0
+    assert worker.model.actor.weight.grad is not None
+    assert torch.count_nonzero(worker.model.actor.weight.grad).item() > 0
+
+
+def test_dsrl_phase_start_clears_stale_model_gradients():
+    worker = _gradient_partition_worker()
+    worker.model.actor.weight.grad = torch.ones_like(worker.model.actor.weight)
+    worker.model.critic.weight.grad = torch.ones_like(worker.model.critic.weight)
+
+    worker._zero_model_and_optimizer_gradients(worker.optimizer)
+
+    assert worker.model.actor.weight.grad is None
+    assert worker.model.critic.weight.grad is None
+
+
+def test_dsrl_critic_requires_grad_is_restored_after_actor_exception():
+    worker = _gradient_partition_worker()
+
+    with pytest.raises(RuntimeError, match="actor failed"):
+        with worker._temporarily_freeze_parameters(worker._critic_parameters):
+            assert worker.model.critic.weight.requires_grad is False
+            raise RuntimeError("actor failed")
+
+    assert worker.model.critic.weight.requires_grad is True
 
 
 def _chunk_tensors(dtype=torch.float32):

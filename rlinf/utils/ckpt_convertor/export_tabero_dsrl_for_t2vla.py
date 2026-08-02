@@ -48,6 +48,7 @@ from rlinf.utils.dsrl_rollout_sync import (
     DSRL_ROLLOUT_SYNC_TENSOR_COUNT,
     validate_dsrl_rollout_state_dict,
 )
+from rlinf.utils.dsrl_transition import DSRL_TRANSITION_BOUNDARY_SEMANTICS
 from rlinf.utils.tabero_dsrl_profiles import (
     FORMAL_8GPU_50STEP_PROFILE,
     TABERO_DSRL_TRAINING_PROFILE_CHOICES,
@@ -236,6 +237,14 @@ def _validate_metadata(
             "selected DSRL checkpoint replay_semantics must be "
             f"{DSRL_REPLAY_SEMANTICS!r}"
         )
+    if (
+        metadata.get("transition_boundary_semantics")
+        != DSRL_TRANSITION_BOUNDARY_SEMANTICS
+    ):
+        raise ValueError(
+            "selected DSRL checkpoint transition_boundary_semantics must be "
+            f"{DSRL_TRANSITION_BOUNDARY_SEMANTICS!r}"
+        )
     _require_strict_int(
         metadata.get("checkpoint_version"),
         DSRL_TRAINABLE_CHECKPOINT_VERSION,
@@ -379,6 +388,10 @@ def _validate_config_snapshot(
     require_value("algorithm.dsrl_reward_semantics", DSRL_REWARD_SEMANTICS)
     require_value("algorithm.dsrl_observation_semantics", DSRL_OBSERVATION_SEMANTICS)
     require_value("algorithm.dsrl_replay_semantics", DSRL_REPLAY_SEMANTICS)
+    require_value(
+        "algorithm.dsrl_transition_boundary_semantics",
+        DSRL_TRANSITION_BOUNDARY_SEMANTICS,
+    )
     require_value("algorithm.replay_buffer.backend", DSRL_REPLAY_BACKEND)
     require_value(
         "algorithm.replay_buffer.capacity_transitions",
@@ -674,6 +687,7 @@ def export_tabero_dsrl_bundle(
                 "dtype": "bfloat16",
                 "reward_semantics": DSRL_REWARD_SEMANTICS,
                 "observation_semantics": DSRL_OBSERVATION_SEMANTICS,
+                "transition_boundary_semantics": (DSRL_TRANSITION_BOUNDARY_SEMANTICS),
             },
         )
         saved_actor = load_file(actor_path, device="cpu")
@@ -692,6 +706,7 @@ def export_tabero_dsrl_bundle(
             "algorithm": "dsrl-sac",
             "reward_semantics": DSRL_REWARD_SEMANTICS,
             "observation_semantics": DSRL_OBSERVATION_SEMANTICS,
+            "transition_boundary_semantics": DSRL_TRANSITION_BOUNDARY_SEMANTICS,
             "task_id": task_id,
             "global_step": profile.global_step,
             "is_final": metadata["is_final"],
@@ -790,6 +805,7 @@ def export_tabero_dsrl_bundle(
             "global_step": profile.global_step,
             "reward_semantics": DSRL_REWARD_SEMANTICS,
             "observation_semantics": DSRL_OBSERVATION_SEMANTICS,
+            "transition_boundary_semantics": DSRL_TRANSITION_BOUNDARY_SEMANTICS,
             "source_checkpoint_sha256": checkpoint_hash,
             "base_model_sha256": actual_base_hash,
             "actor_weights_sha256": actor_hash,
@@ -805,6 +821,7 @@ def export_tabero_dsrl_bundle(
                 "formal_provenance": True,
                 "reward_semantics": True,
                 "observation_semantics": True,
+                "transition_boundary_semantics": True,
                 "output_hashes": True,
             },
         }

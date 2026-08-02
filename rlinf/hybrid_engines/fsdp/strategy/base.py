@@ -114,6 +114,9 @@ class FSDPStrategyBase(ABC):
         self,
         model: Union[FSDP, FSDPModule],
         norm_type: Union[float, int] = 2.0,
+        *,
+        max_norm: float | None = None,
+        parameters: Iterable[nn.Parameter] | None = None,
     ) -> float:
         """
         Clip the gradients of the model parameters to a maximum norm.
@@ -121,6 +124,8 @@ class FSDPStrategyBase(ABC):
         Args:
             model (Union[FSDP, FSDPModule]): The model whose gradients are to be clipped.
             norm_type (Union[float,int]): The type of the used p-norm.
+            max_norm: Optional override for the configured clipping threshold.
+            parameters: Optional optimizer-owned parameter subset.
 
         Returns:
             float: The total norm of the parameters before clipping.
@@ -241,7 +246,9 @@ class FSDPStrategyBase(ABC):
                         checkpoint_id=dcp_save_path,
                     )
                 else:
-                    raise ValueError(f"Unsupported checkpoint_format: {checkpoint_format}")
+                    raise ValueError(
+                        f"Unsupported checkpoint_format: {checkpoint_format}"
+                    )
 
             except BaseException as e:
                 import traceback

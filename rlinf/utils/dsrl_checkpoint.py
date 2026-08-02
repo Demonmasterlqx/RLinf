@@ -28,10 +28,11 @@ from rlinf.utils.dsrl_rollout_sync import (
     DSRL_ROLLOUT_SYNC_MANIFEST_V2,
     normalize_fsdp_parameter_name,
 )
+from rlinf.utils.dsrl_transition import DSRL_TRANSITION_BOUNDARY_SEMANTICS
 
 DSRL_TARGET_FORMAT = "tabero_dsrl_target"
 DSRL_TARGET_VERSION = 3
-DSRL_TRAINABLE_CHECKPOINT_VERSION = 3
+DSRL_TRAINABLE_CHECKPOINT_VERSION = 4
 DSRL_TRAINABLE_MANIFEST_VERSION = 2
 DSRL_TARGET_MANIFEST_VERSION = 2
 DSRL_TARGET_PREFIXES = (
@@ -314,6 +315,7 @@ def build_compact_target_payload(
             "world_size": world_size,
             "reward_semantics": DSRL_REWARD_SEMANTICS,
             "observation_semantics": DSRL_OBSERVATION_SEMANTICS,
+            "transition_boundary_semantics": DSRL_TRANSITION_BOUNDARY_SEMANTICS,
             "manifest_version": DSRL_TARGET_MANIFEST_VERSION,
             "tensor_count": len(model_state),
             "parameter_count": parameter_count,
@@ -352,6 +354,13 @@ def _validate_compact_metadata(
             "OpenPI DSRL compact target observation semantics mismatch: "
             f"expected {DSRL_OBSERVATION_SEMANTICS!r}, got "
             f"{observation_semantics!r}."
+        )
+    transition_semantics = metadata.get("transition_boundary_semantics")
+    if transition_semantics != DSRL_TRANSITION_BOUNDARY_SEMANTICS:
+        raise ValueError(
+            "OpenPI DSRL compact target transition boundary semantics mismatch: "
+            f"expected {DSRL_TRANSITION_BOUNDARY_SEMANTICS!r}, got "
+            f"{transition_semantics!r}."
         )
     manifest_version = _require_strict_int(
         metadata.get("manifest_version"), label="manifest_version", minimum=1
@@ -437,6 +446,13 @@ def validate_target_payload_contract(payload: Any) -> None:
             f"expected {DSRL_OBSERVATION_SEMANTICS!r}, got "
             f"{observation_semantics!r}."
         )
+    transition_semantics = metadata.get("transition_boundary_semantics")
+    if transition_semantics != DSRL_TRANSITION_BOUNDARY_SEMANTICS:
+        raise ValueError(
+            "OpenPI DSRL compact target transition boundary semantics mismatch: "
+            f"expected {DSRL_TRANSITION_BOUNDARY_SEMANTICS!r}, got "
+            f"{transition_semantics!r}."
+        )
     manifest_version = _require_strict_int(
         metadata.get("manifest_version"), label="manifest_version", minimum=1
     )
@@ -491,6 +507,7 @@ def restore_target_payload(
         "format": "compact_v3",
         "reward_semantics": DSRL_REWARD_SEMANTICS,
         "observation_semantics": DSRL_OBSERVATION_SEMANTICS,
+        "transition_boundary_semantics": DSRL_TRANSITION_BOUNDARY_SEMANTICS,
         "tensor_count": len(model_state),
         "parameter_count": sum(tensor.numel() for tensor in model_state.values()),
         "shadow_tensor_count": len(shadow_state),

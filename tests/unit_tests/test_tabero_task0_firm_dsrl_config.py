@@ -28,6 +28,10 @@ from rlinf.utils.dsrl_replay import (
     DSRL_REPLAY_SEMANTICS,
 )
 from rlinf.utils.dsrl_reward import DSRL_REWARD_SEMANTICS
+from rlinf.utils.dsrl_transition import (
+    DSRL_TRANSITION_BOUNDARY_SEMANTICS,
+    TABERO_DSRL_CHUNK_BOUNDARY_MODE,
+)
 
 CONFIG_PATH = (
     Path(__file__).resolve().parents[2]
@@ -83,6 +87,7 @@ def test_dsrl_smoke_config_preserves_task0_firm_tacfield_contract(monkeypatch):
         )
         assert split.hdf5_initial_states_path == HDF5_PATH
         assert split.hdf5_reset_assignment == "cyclic"
+        assert split.chunk_boundary_mode == TABERO_DSRL_CHUNK_BOUNDARY_MODE
         assert split.success.required_consecutive_steps == 8
         assert split.marker_history_len == 8
         assert split.combined_marker_count == 198
@@ -116,6 +121,10 @@ def test_dsrl_smoke_runs_one_complete_sac_update(monkeypatch):
     assert cfg.algorithm.dsrl_reward_semantics == DSRL_REWARD_SEMANTICS
     assert cfg.algorithm.dsrl_observation_semantics == DSRL_OBSERVATION_SEMANTICS
     assert cfg.algorithm.dsrl_replay_semantics == DSRL_REPLAY_SEMANTICS
+    assert (
+        cfg.algorithm.dsrl_transition_boundary_semantics
+        == DSRL_TRANSITION_BOUNDARY_SEMANTICS
+    )
     assert cfg.algorithm.replay_buffer.backend == DSRL_REPLAY_BACKEND
     assert (
         cfg.algorithm.replay_buffer.capacity_transitions
@@ -177,6 +186,33 @@ def test_dsrl_smoke_config_validation_rejects_wrong_replay_semantics(
         cfg.algorithm.dsrl_replay_semantics = semantics
 
     with pytest.raises(ValueError, match="dsrl_replay_semantics"):
+        validate_embodied_cfg(cfg)
+
+
+@pytest.mark.parametrize("semantics", [None, "cross_episode_chunk_v0"])
+def test_dsrl_smoke_config_validation_rejects_wrong_transition_semantics(
+    monkeypatch,
+    semantics,
+):
+    cfg = _load(monkeypatch)
+    if semantics is None:
+        del cfg.algorithm.dsrl_transition_boundary_semantics
+    else:
+        cfg.algorithm.dsrl_transition_boundary_semantics = semantics
+
+    with pytest.raises(ValueError, match="dsrl_transition_boundary_semantics"):
+        validate_embodied_cfg(cfg)
+
+
+@pytest.mark.parametrize("split", ["train", "eval"])
+def test_dsrl_smoke_config_validation_requires_terminal_safe_chunk_mode(
+    monkeypatch,
+    split,
+):
+    cfg = _load(monkeypatch)
+    cfg.env[split].init_params.chunk_boundary_mode = "legacy"
+
+    with pytest.raises(ValueError, match=f"env.{split}.*chunk_boundary_mode"):
         validate_embodied_cfg(cfg)
 
 

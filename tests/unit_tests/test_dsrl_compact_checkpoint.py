@@ -40,6 +40,7 @@ from rlinf.utils.dsrl_rollout_sync import (
     DSRL_ROLLOUT_SYNC_MANIFEST_V2,
     DSRL_ROLLOUT_SYNC_PREFIXES,
 )
+from rlinf.utils.dsrl_transition import DSRL_TRANSITION_BOUNDARY_SEMANTICS
 from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
 from rlinf.workers.actor.fsdp_sac_policy_worker import EmbodiedSACFSDPPolicy
 
@@ -187,6 +188,7 @@ def _write_reward_semantics_sidecar(
     semantics=DSRL_REWARD_SEMANTICS,
     observation_semantics=DSRL_OBSERVATION_SEMANTICS,
     replay_semantics=DSRL_REPLAY_SEMANTICS,
+    transition_boundary_semantics=DSRL_TRANSITION_BOUNDARY_SEMANTICS,
     checkpoint_version=DSRL_TRAINABLE_CHECKPOINT_VERSION,
     manifest_version=2,
 ):
@@ -199,6 +201,7 @@ def _write_reward_semantics_sidecar(
                 "reward_semantics": semantics,
                 "observation_semantics": observation_semantics,
                 "replay_semantics": replay_semantics,
+                "transition_boundary_semantics": transition_boundary_semantics,
                 "checkpoint_version": checkpoint_version,
                 "manifest_version": manifest_version,
             },
@@ -265,6 +268,7 @@ def test_compact_target_save_contains_only_critic_and_exact_shadow(
         "world_size": 4,
         "reward_semantics": DSRL_REWARD_SEMANTICS,
         "observation_semantics": DSRL_OBSERVATION_SEMANTICS,
+        "transition_boundary_semantics": DSRL_TRANSITION_BOUNDARY_SEMANTICS,
         "manifest_version": 2,
         "tensor_count": len(runtime),
         "parameter_count": sum(param.numel() for param in runtime.values()),
@@ -308,6 +312,7 @@ def test_compact_target_round_trip_restores_parameters_and_shadow_exactly(
         "format": "compact_v3",
         "reward_semantics": DSRL_REWARD_SEMANTICS,
         "observation_semantics": DSRL_OBSERVATION_SEMANTICS,
+        "transition_boundary_semantics": DSRL_TRANSITION_BOUNDARY_SEMANTICS,
         "tensor_count": len(expected_model),
         "parameter_count": sum(tensor.numel() for tensor in expected_model.values()),
         "shadow_tensor_count": len(expected_shadow),
@@ -335,6 +340,7 @@ def _valid_compact_payload(worker):
             "world_size": 4,
             "reward_semantics": DSRL_REWARD_SEMANTICS,
             "observation_semantics": DSRL_OBSERVATION_SEMANTICS,
+            "transition_boundary_semantics": DSRL_TRANSITION_BOUNDARY_SEMANTICS,
             "manifest_version": 2,
             "tensor_count": len(model),
             "parameter_count": parameter_count,
@@ -388,6 +394,16 @@ def _valid_compact_payload(worker):
                 "observation_semantics", "single_camera_v1"
             ),
             "observation semantics mismatch",
+        ),
+        (
+            lambda p: p["metadata"].pop("transition_boundary_semantics"),
+            "transition boundary semantics mismatch",
+        ),
+        (
+            lambda p: p["metadata"].__setitem__(
+                "transition_boundary_semantics", "cross_episode_chunk_v0"
+            ),
+            "transition boundary semantics mismatch",
         ),
         (
             lambda p: p["metadata"].__setitem__("manifest_version", 1),
@@ -563,6 +579,10 @@ def test_dsrl_sidecar_saves_exact_direct_trainable_manifest(tmp_path, distribute
     assert payload["metadata"]["reward_semantics"] == DSRL_REWARD_SEMANTICS
     assert payload["metadata"]["observation_semantics"] == DSRL_OBSERVATION_SEMANTICS
     assert payload["metadata"]["replay_semantics"] == DSRL_REPLAY_SEMANTICS
+    assert (
+        payload["metadata"]["transition_boundary_semantics"]
+        == DSRL_TRANSITION_BOUNDARY_SEMANTICS
+    )
     assert (
         payload["metadata"]["checkpoint_version"] == DSRL_TRAINABLE_CHECKPOINT_VERSION
     )
@@ -925,6 +945,26 @@ def test_compact_dsrl_resume_rejects_wrong_replay_semantics_before_any_restore(
     )
 
     with pytest.raises(ValueError, match="replay semantics mismatch"):
+        worker.load_checkpoint(str(tmp_path))
+
+    assert worker._strategy.load_calls == []
+    assert worker.replay_buffer.total_samples == 0
+
+
+@pytest.mark.parametrize(
+    "transition_boundary_semantics", [None, "cross_episode_chunk_v0"]
+)
+def test_compact_dsrl_resume_rejects_wrong_transition_boundary_semantics(
+    tmp_path,
+    transition_boundary_semantics,
+):
+    worker = _worker()
+    _write_reward_semantics_sidecar(
+        tmp_path,
+        transition_boundary_semantics=transition_boundary_semantics,
+    )
+
+    with pytest.raises(ValueError, match="transition boundary semantics mismatch"):
         worker.load_checkpoint(str(tmp_path))
 
     assert worker._strategy.load_calls == []

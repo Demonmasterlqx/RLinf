@@ -15,6 +15,7 @@
 
 import os
 from collections.abc import Mapping
+from contextlib import contextmanager
 from typing import Optional
 
 import numpy as np
@@ -60,6 +61,7 @@ from rlinf.utils.dsrl_rollout_sync import (
     validate_dsrl_rollout_state_dict,
     validate_dsrl_rollout_sync_config,
 )
+from rlinf.utils.dsrl_transition import DSRL_TRANSITION_BOUNDARY_SEMANTICS
 from rlinf.utils.metric_utils import (
     append_to_dict,
     compute_split_num,
@@ -199,6 +201,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         )
         self.optimizer = optimizers[0]
         self.qf_optimizer = optimizers[1]
+        self._cache_optimizer_parameter_sets()
 
         # SAC alpha
         # Initialize temperature parameter for automatic entropy tuning
@@ -227,6 +230,74 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         self.grad_scaler = self.build_grad_scaler(
             self.cfg.actor.fsdp_config.grad_scaler
         )
+
+    @staticmethod
+    def _unique_optimizer_parameters(optimizer: torch.optim.Optimizer) -> tuple:
+        parameters = []
+        parameter_ids = set()
+        for group in optimizer.param_groups:
+            for parameter in group["params"]:
+                if id(parameter) in parameter_ids:
+                    continue
+                parameter_ids.add(id(parameter))
+                parameters.append(parameter)
+        return tuple(parameters)
+
+    def _cache_optimizer_parameter_sets(self) -> None:
+        self._actor_parameters = self._unique_optimizer_parameters(self.optimizer)
+        self._critic_parameters = self._unique_optimizer_parameters(self.qf_optimizer)
+        actor_ids = {id(parameter) for parameter in self._actor_parameters}
+        critic_ids = {id(parameter) for parameter in self._critic_parameters}
+        overlap = actor_ids & critic_ids
+        if overlap:
+            raise ValueError(
+                "SAC actor and critic optimizer parameter sets must be disjoint; "
+                f"found {len(overlap)} shared parameters."
+            )
+
+        if self.use_dsrl:
+            trainable_ids = {
+                id(parameter)
+                for parameter in self.model.parameters()
+                if parameter.requires_grad
+            }
+            optimizer_ids = actor_ids | critic_ids
+            if optimizer_ids != trainable_ids:
+                raise ValueError(
+                    "Tabero DSRL actor/critic optimizers must cover every trainable "
+                    "model parameter exactly once; "
+                    f"missing={len(trainable_ids - optimizer_ids)}, "
+                    f"unexpected={len(optimizer_ids - trainable_ids)}."
+                )
+
+    def _zero_model_and_optimizer_gradients(
+        self, optimizer: torch.optim.Optimizer
+    ) -> None:
+        self.model.zero_grad(set_to_none=True)
+        optimizer.zero_grad(set_to_none=True)
+
+    @staticmethod
+    def _assert_no_parameter_gradients(parameters: tuple, phase: str) -> None:
+        unexpected = sum(parameter.grad is not None for parameter in parameters)
+        if unexpected:
+            raise RuntimeError(
+                f"SAC {phase} phase populated {unexpected} gradients outside its "
+                "optimizer parameter set."
+            )
+
+    @staticmethod
+    @contextmanager
+    def _temporarily_freeze_parameters(parameters: tuple):
+        original_requires_grad = [parameter.requires_grad for parameter in parameters]
+        try:
+            for parameter in parameters:
+                parameter.requires_grad_(False)
+            yield
+        finally:
+            for parameter, requires_grad in zip(
+                parameters, original_requires_grad, strict=True
+            ):
+                parameter.requires_grad_(requires_grad)
 
     def build_lr_schedulers(self):
         self.lr_scheduler = self.build_lr_scheduler(
@@ -413,6 +484,9 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                     "format": "trainable_weights",
                     "reward_semantics": DSRL_REWARD_SEMANTICS,
                     "observation_semantics": DSRL_OBSERVATION_SEMANTICS,
+                    "transition_boundary_semantics": (
+                        DSRL_TRANSITION_BOUNDARY_SEMANTICS
+                    ),
                     "replay_semantics": DSRL_REPLAY_SEMANTICS,
                     "checkpoint_version": DSRL_TRAINABLE_CHECKPOINT_VERSION,
                     "manifest_version": DSRL_TRAINABLE_MANIFEST_VERSION,
@@ -517,6 +591,13 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                 "OpenPI DSRL checkpoint observation semantics mismatch: "
                 f"expected {DSRL_OBSERVATION_SEMANTICS!r}, got "
                 f"{observation_semantics!r}. Legacy checkpoints cannot be resumed."
+            )
+        transition_semantics = payload["metadata"].get("transition_boundary_semantics")
+        if transition_semantics != DSRL_TRANSITION_BOUNDARY_SEMANTICS:
+            raise ValueError(
+                "OpenPI DSRL checkpoint transition boundary semantics mismatch: "
+                f"expected {DSRL_TRANSITION_BOUNDARY_SEMANTICS!r}, got "
+                f"{transition_semantics!r}. Legacy checkpoints cannot be resumed."
             )
         replay_semantics = payload["metadata"].get("replay_semantics")
         if replay_semantics != DSRL_REPLAY_SEMANTICS:
@@ -889,7 +970,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                 drq.apply_drq(batch["next_obs"], pad=4)
             train_micro_batch_list[i] = batch
 
-        self.qf_optimizer.zero_grad()
+        self._zero_model_and_optimizer_gradients(self.qf_optimizer)
         gbs_critic_loss = []
         all_critic_metrics = {}
         for batch in train_micro_batch_list:
@@ -901,8 +982,11 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         all_critic_metrics = {
             f"critic/{key}": np.mean(value) for key, value in all_critic_metrics.items()
         }
-        qf_grad_norm = self.model.clip_grad_norm_(
-            max_norm=self.cfg.actor.critic_optim.clip_grad
+        self._assert_no_parameter_gradients(self._actor_parameters, "critic")
+        qf_grad_norm = self._strategy.clip_grad_norm_(
+            model=self.model,
+            max_norm=self.cfg.actor.critic_optim.clip_grad,
+            parameters=self._critic_parameters,
         )
 
         self.qf_optimizer.step()
@@ -916,23 +1000,29 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         }
 
         if self.update_step % self.critic_actor_ratio == 0 and train_actor:
-            self.optimizer.zero_grad()
+            self._zero_model_and_optimizer_gradients(self.optimizer)
             gbs_actor_loss = []
             gbs_entropy = []
             all_actor_metrics = {}
-            for batch in train_micro_batch_list:
-                actor_loss, entropy, q_metrics = self.forward_actor(batch)
-                actor_loss = actor_loss / self.gradient_accumulation
-                actor_loss.backward()
-                gbs_actor_loss.append(actor_loss.item() * self.gradient_accumulation)
-                gbs_entropy.append(entropy.item())
-                append_to_dict(all_actor_metrics, q_metrics)
+            with self._temporarily_freeze_parameters(self._critic_parameters):
+                for batch in train_micro_batch_list:
+                    actor_loss, entropy, q_metrics = self.forward_actor(batch)
+                    actor_loss = actor_loss / self.gradient_accumulation
+                    actor_loss.backward()
+                    gbs_actor_loss.append(
+                        actor_loss.item() * self.gradient_accumulation
+                    )
+                    gbs_entropy.append(entropy.item())
+                    append_to_dict(all_actor_metrics, q_metrics)
             all_actor_metrics = {
                 f"actor/{key}": np.mean(value)
                 for key, value in all_actor_metrics.items()
             }
-            actor_grad_norm = self.model.clip_grad_norm_(
-                max_norm=self.cfg.actor.optim.clip_grad
+            self._assert_no_parameter_gradients(self._critic_parameters, "actor")
+            actor_grad_norm = self._strategy.clip_grad_norm_(
+                model=self.model,
+                max_norm=self.cfg.actor.optim.clip_grad,
+                parameters=self._actor_parameters,
             )
             self.optimizer.step()
             self.lr_scheduler.step()
@@ -941,6 +1031,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             gbs_alpha_loss = [0]
             alpha_grad_norm = 0
             if self.alpha_optimizer is not None:
+                self.model.zero_grad(set_to_none=True)
                 self.alpha_optimizer.zero_grad()
                 gbs_alpha_loss = []
                 for batch in train_micro_batch_list:

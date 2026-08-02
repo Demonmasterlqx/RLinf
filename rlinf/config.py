@@ -14,9 +14,11 @@
 
 import dataclasses
 import importlib.util
+import json
 import logging
 import os
 from dataclasses import asdict
+from pathlib import Path
 from typing import TYPE_CHECKING, Callable, ClassVar, Optional, Union
 
 import torch
@@ -39,6 +41,10 @@ from rlinf.utils.dsrl_replay import (
 )
 from rlinf.utils.dsrl_reward import DSRL_REWARD_SEMANTICS
 from rlinf.utils.dsrl_rollout_sync import validate_dsrl_rollout_sync_config
+from rlinf.utils.dsrl_transition import (
+    DSRL_TRANSITION_BOUNDARY_SEMANTICS,
+    TABERO_DSRL_CHUNK_BOUNDARY_MODE,
+)
 from rlinf.utils.placement import (
     HybridComponentPlacement,
     ModelParallelComponentPlacement,
@@ -857,6 +863,75 @@ def validate_embodied_cfg(cfg):
             "config_name"
         ) == "pi0_lora_tacfield_tabero" and openpi_cfg.get("dsrl_use_tactile", False)
         if is_tabero_tactile_dsrl:
+            required_algorithm_values = {
+                "adv_type": "embodied_sac",
+                "loss_type": "embodied_sac",
+            }
+            for key, expected in required_algorithm_values.items():
+                actual = algorithm_cfg.get(key)
+                if actual != expected:
+                    raise ValueError(
+                        "Tabero tactile OpenPI DSRL requires "
+                        f"algorithm.{key}={expected!r}; got {actual!r}."
+                    )
+            if cfg.rollout.get("collect_transitions") is not True:
+                raise ValueError(
+                    "Tabero tactile OpenPI DSRL requires "
+                    "rollout.collect_transitions=true."
+                )
+
+            required_model_values = {
+                "num_action_chunks": 10,
+                "action_dim": 13,
+                "num_q_heads": 10,
+            }
+            for key, expected in required_model_values.items():
+                actual = model_cfg.get(key)
+                if actual != expected:
+                    raise ValueError(
+                        "Tabero tactile OpenPI DSRL requires "
+                        f"actor.model.{key}={expected}; got {actual!r}."
+                    )
+            required_openpi_values = {
+                "action_chunk": 10,
+                "action_env_dim": 13,
+                "dsrl_state_dim": 7,
+                "dsrl_action_noise_dim": 32,
+                "dsrl_num_q_heads": 10,
+            }
+            for key, expected in required_openpi_values.items():
+                actual = openpi_cfg.get(key)
+                if actual != expected:
+                    raise ValueError(
+                        "Tabero tactile OpenPI DSRL requires "
+                        f"actor.model.openpi.{key}={expected}; got {actual!r}."
+                    )
+
+            base_config_path = (
+                Path(str(model_cfg.get("model_path", ""))) / "config.json"
+            )
+            if not base_config_path.is_file():
+                raise ValueError(
+                    "Tabero tactile OpenPI DSRL requires a readable base "
+                    f"config.json at {base_config_path}."
+                )
+            try:
+                with base_config_path.open(encoding="utf-8") as file:
+                    base_model_config = json.load(file)
+            except (OSError, json.JSONDecodeError) as error:
+                raise ValueError(
+                    "Tabero tactile OpenPI DSRL could not read base config.json "
+                    f"at {base_config_path}: {error}"
+                ) from error
+            required_base_values = {"action_horizon": 50, "action_dim": 32}
+            for key, expected in required_base_values.items():
+                actual = base_model_config.get(key)
+                if actual != expected:
+                    raise ValueError(
+                        "Tabero tactile OpenPI DSRL requires Pi0 base "
+                        f"config.json {key}={expected}; got {actual!r}."
+                    )
+
             reward_semantics = algorithm_cfg.get("dsrl_reward_semantics")
             if reward_semantics != DSRL_REWARD_SEMANTICS:
                 raise ValueError(
@@ -879,6 +954,34 @@ def validate_embodied_cfg(cfg):
                     "algorithm.dsrl_replay_semantics="
                     f"{DSRL_REPLAY_SEMANTICS!r}; got {replay_semantics!r}."
                 )
+            transition_semantics = algorithm_cfg.get(
+                "dsrl_transition_boundary_semantics"
+            )
+            if transition_semantics != DSRL_TRANSITION_BOUNDARY_SEMANTICS:
+                raise ValueError(
+                    "Tabero tactile OpenPI DSRL requires "
+                    "algorithm.dsrl_transition_boundary_semantics="
+                    f"{DSRL_TRANSITION_BOUNDARY_SEMANTICS!r}; got "
+                    f"{transition_semantics!r}."
+                )
+            chunk_boundary_mode = cfg.env.train.init_params.get("chunk_boundary_mode")
+            if chunk_boundary_mode != TABERO_DSRL_CHUNK_BOUNDARY_MODE:
+                raise ValueError(
+                    "Tabero tactile OpenPI DSRL requires "
+                    "env.train.init_params.chunk_boundary_mode="
+                    f"{TABERO_DSRL_CHUNK_BOUNDARY_MODE!r}; got "
+                    f"{chunk_boundary_mode!r}."
+                )
+            eval_cfg = cfg.env.get("eval")
+            if eval_cfg is not None:
+                eval_boundary_mode = eval_cfg.init_params.get("chunk_boundary_mode")
+                if eval_boundary_mode != TABERO_DSRL_CHUNK_BOUNDARY_MODE:
+                    raise ValueError(
+                        "Tabero tactile OpenPI DSRL requires "
+                        "env.eval.init_params.chunk_boundary_mode="
+                        f"{TABERO_DSRL_CHUNK_BOUNDARY_MODE!r}; got "
+                        f"{eval_boundary_mode!r}."
+                    )
             replay_cfg = algorithm_cfg.get("replay_buffer", {})
             required_replay_values = {
                 "backend": DSRL_REPLAY_BACKEND,

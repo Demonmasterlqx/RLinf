@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import Iterable
 from contextlib import nullcontext
 from typing import ContextManager, Union
 
@@ -157,6 +158,9 @@ class FSDP2Strategy(FSDPStrategyBase):
         self,
         model: FSDPModule,
         norm_type: Union[float, int] = 2.0,
+        *,
+        max_norm: float | None = None,
+        parameters: Iterable[nn.Parameter] | None = None,
     ) -> float:
         """
         Clip the gradients of the model parameters by total norm.
@@ -168,14 +172,17 @@ class FSDP2Strategy(FSDPStrategyBase):
         Returns:
             - float: The total norm of the gradients before clipping.
         """
+        selected_parameters = (
+            list(model.parameters()) if parameters is None else list(parameters)
+        )
         grad_norm = get_grad_norm(
-            model.parameters(),
+            selected_parameters,
             dp_group=self._dp_group,
             norm_type=norm_type,
         )
         clip_grad_by_total_norm_(
-            model.parameters(),
-            max_grad_norm=self.cfg.optim.clip_grad,
+            selected_parameters,
+            max_grad_norm=(self.cfg.optim.clip_grad if max_norm is None else max_norm),
             total_norm=grad_norm,
         )
         return grad_norm

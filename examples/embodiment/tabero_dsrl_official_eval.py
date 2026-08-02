@@ -10,7 +10,9 @@ import ctypes
 import fcntl
 import hashlib
 import json
+import math
 import os
+import re
 import signal
 import socket
 import stat
@@ -34,6 +36,7 @@ from rlinf.utils.dsrl_rollout_sync import (
     DSRL_ROLLOUT_SYNC_PARAMETER_COUNT,
     DSRL_ROLLOUT_SYNC_TENSOR_COUNT,
 )
+from rlinf.utils.dsrl_transition import DSRL_TRANSITION_BOUNDARY_SEMANTICS
 from rlinf.utils.tabero_dsrl_profiles import (
     FORMAL_8GPU_50STEP_PROFILE,
     TABERO_DSRL_TRAINING_PROFILE_CHOICES,
@@ -59,6 +62,7 @@ EXPECTED_AUDIT_CHECKS = {
     "formal_provenance",
     "reward_semantics",
     "observation_semantics",
+    "transition_boundary_semantics",
     "output_hashes",
 }
 EXPECTED_AUDIT_KEYS = {
@@ -69,6 +73,7 @@ EXPECTED_AUDIT_KEYS = {
     "global_step",
     "reward_semantics",
     "observation_semantics",
+    "transition_boundary_semantics",
     "source_checkpoint_sha256",
     "base_model_sha256",
     "actor_weights_sha256",
@@ -81,6 +86,7 @@ EXPECTED_MANIFEST_KEYS = {
     "algorithm",
     "reward_semantics",
     "observation_semantics",
+    "transition_boundary_semantics",
     "task_id",
     "global_step",
     "is_final",
@@ -168,6 +174,26 @@ EXPECTED_ARCHITECTURE = {
     "hidden_dims": [128, 128, 128],
     "feature_dim": 256,
     "noise_dim": 32,
+}
+FORCE_METRIC_KEYS = (
+    "squeeze_avg_pred",
+    "squeeze_avg_meas",
+    "squeeze_max_pred",
+    "squeeze_max_meas",
+    "ap_avg_pred",
+    "ap_avg_meas",
+    "ap_max_pred",
+    "ap_max_meas",
+)
+LEGACY_FORCE_FIELDS = {
+    "squeeze_avg_pred": "avg_squeeze_pred",
+    "squeeze_avg_meas": "avg_squeeze_meas",
+    "squeeze_max_pred": "task_squeeze_max_mean",
+    "squeeze_max_meas": "task_squeeze_max_meas_mean",
+    "ap_avg_pred": "task_app_mean_mean",
+    "ap_avg_meas": "task_ap_mean_meas_mean",
+    "ap_max_pred": "task_app_max_mean",
+    "ap_max_meas": "task_ap_max_meas_mean",
 }
 PROVENANCE_KEYS = {
     "TABERO_PROVENANCE_VERSION",
@@ -297,6 +323,7 @@ def _validate_actor(
                 "dtype": "bfloat16",
                 "reward_semantics": DSRL_REWARD_SEMANTICS,
                 "observation_semantics": DSRL_OBSERVATION_SEMANTICS,
+                "transition_boundary_semantics": (DSRL_TRANSITION_BOUNDARY_SEMANTICS),
             }
             if metadata != expected_metadata:
                 raise ValueError(
@@ -439,6 +466,11 @@ def validate_bundle(
         DSRL_OBSERVATION_SEMANTICS,
         "manifest observation_semantics",
     )
+    _require_exact(
+        manifest.get("transition_boundary_semantics"),
+        DSRL_TRANSITION_BOUNDARY_SEMANTICS,
+        "manifest transition_boundary_semantics",
+    )
     _require_exact(manifest.get("task_id"), task_id, "manifest task_id")
     _require_exact(
         manifest.get("global_step"), profile.global_step, "manifest global_step"
@@ -556,6 +588,11 @@ def validate_bundle(
         DSRL_OBSERVATION_SEMANTICS,
         "audit observation_semantics",
     )
+    _require_exact(
+        audit.get("transition_boundary_semantics"),
+        DSRL_TRANSITION_BOUNDARY_SEMANTICS,
+        "audit transition_boundary_semantics",
+    )
     checks = audit.get("checks")
     if (
         not isinstance(checks, dict)
@@ -641,6 +678,414 @@ def capture_repo_provenance(
             f"formal official evaluation requires clean repositories; dirty={dirty}"
         )
     return states
+
+
+def _finite_number(value: Any, label: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{label} must be numeric")
+    value = float(value)
+    if not math.isfinite(value):
+        raise ValueError(f"{label} must be finite")
+    return value
+
+
+def _force_vector(value: Any, label: str) -> tuple[float, float, float]:
+    if not isinstance(value, list) or len(value) != 3:
+        raise ValueError(f"{label} must be a length-3 list")
+    return tuple(_finite_number(component, label) for component in value)
+
+
+def _force_scalars(
+    left: tuple[float, float, float],
+    right: tuple[float, float, float],
+) -> tuple[float, float, bool]:
+    squeeze = 2.0 * min(abs(left[2]), abs(right[2]))
+    common = min(abs(left[2]), abs(right[2]))
+    sign_left = 0.0 if left[2] == 0 else math.copysign(1.0, left[2])
+    sign_right = 0.0 if right[2] == 0 else math.copysign(1.0, right[2])
+    applied = (
+        left[0] + right[0],
+        left[1] + right[1],
+        left[2] + right[2] - common * (sign_left + sign_right),
+    )
+    applied_norm = math.sqrt(sum(component * component for component in applied))
+    contact = (
+        math.sqrt(sum(component * component for component in left))
+        + math.sqrt(sum(component * component for component in right))
+        > 1e-6
+    )
+    return squeeze, applied_norm, contact
+
+
+def _mean(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    return math.fsum(values) / len(values)
+
+
+def _top_five_percent_mean(values: list[float]) -> float:
+    nonzero = sorted((value for value in values if value > 0), reverse=True)
+    if not nonzero:
+        return 0.0
+    count = max(1, math.ceil(0.05 * len(nonzero)))
+    return _mean(nonzero[:count])
+
+
+def _require_close(actual: Any, expected: float, label: str, *, rounded=False) -> None:
+    actual_value = _finite_number(actual, label)
+    absolute_tolerance = 5e-4 if rounded else 1e-5
+    if not math.isclose(
+        actual_value,
+        expected,
+        rel_tol=1e-6,
+        abs_tol=absolute_tolerance,
+    ):
+        raise ValueError(
+            f"{label} mismatch: expected={expected}, actual={actual_value}"
+        )
+
+
+def _episode_trace_force_metrics(
+    rows: list[dict[str, Any]],
+) -> tuple[dict[str, float], dict[str, int | float]]:
+    squeeze_pred_values: list[float] = []
+    squeeze_meas_values: list[float] = []
+    ap_pred_values: list[float] = []
+    ap_meas_values: list[float] = []
+    pred_contact_ap: list[float] = []
+    pred_contact_squeeze: list[float] = []
+    predicted_contact_steps = 0
+    measured_contact_steps = 0
+    for row_index, row in enumerate(rows):
+        prefix = f"trace episode {row.get('experiment_index')} row {row_index}"
+        left_pred = _force_vector(row.get("fL_pred_local"), f"{prefix} fL_pred")
+        right_pred = _force_vector(row.get("fR_pred_local"), f"{prefix} fR_pred")
+        left_meas = _force_vector(row.get("fL_meas_local"), f"{prefix} fL_meas")
+        right_meas = _force_vector(row.get("fR_meas_local"), f"{prefix} fR_meas")
+        squeeze_pred, ap_pred, predicted_contact = _force_scalars(left_pred, right_pred)
+        squeeze_meas, ap_meas, measured_contact = _force_scalars(left_meas, right_meas)
+        _require_close(row.get("squeeze_pred"), squeeze_pred, f"{prefix} squeeze_pred")
+        _require_close(row.get("squeeze_meas"), squeeze_meas, f"{prefix} squeeze_meas")
+        _require_close(row.get("ap_pred"), ap_pred, f"{prefix} ap_pred")
+        _require_close(row.get("ap_meas"), ap_meas, f"{prefix} ap_meas")
+        if type(row.get("predicted_contact")) is not bool:
+            raise ValueError(f"{prefix} predicted_contact must be boolean")
+        if type(row.get("measured_contact")) is not bool:
+            raise ValueError(f"{prefix} measured_contact must be boolean")
+        if row["predicted_contact"] != predicted_contact:
+            raise ValueError(f"{prefix} predicted_contact mismatch")
+        if row["measured_contact"] != measured_contact:
+            raise ValueError(f"{prefix} measured_contact mismatch")
+        squeeze_pred_values.append(squeeze_pred)
+        squeeze_meas_values.append(squeeze_meas)
+        ap_pred_values.append(ap_pred)
+        ap_meas_values.append(ap_meas)
+        if predicted_contact:
+            predicted_contact_steps += 1
+            pred_contact_squeeze.append(squeeze_pred)
+            pred_contact_ap.append(ap_pred)
+        if measured_contact:
+            measured_contact_steps += 1
+    return (
+        {
+            "squeeze_avg_pred": _mean(squeeze_pred_values),
+            "squeeze_avg_meas": _mean(squeeze_meas_values),
+            "squeeze_max_pred": _top_five_percent_mean(pred_contact_squeeze),
+            "squeeze_max_meas": _top_five_percent_mean(squeeze_meas_values),
+            "ap_avg_pred": _mean(pred_contact_ap),
+            "ap_avg_meas": _mean(ap_meas_values),
+            "ap_max_pred": _top_five_percent_mean(pred_contact_ap),
+            "ap_max_meas": _top_five_percent_mean(ap_meas_values),
+        },
+        {
+            "predicted_contact_steps": predicted_contact_steps,
+            "measured_contact_steps": measured_contact_steps,
+            "predicted_contact_ratio": predicted_contact_steps / len(rows),
+            "measured_contact_ratio": measured_contact_steps / len(rows),
+        },
+    )
+
+
+def _validate_client_log(
+    client_log: Path, task_id: int, success_count: int, success_rate: float
+) -> None:
+    if not client_log.is_file():
+        raise ValueError(f"client log is missing: {client_log}")
+    try:
+        content = client_log.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        raise ValueError(f"client log is not valid UTF-8: {error}") from error
+    positions = []
+    for episode in range(1, 51):
+        marker = f"[{episode}/50] Starting experiment..."
+        if content.count(marker) != 1:
+            raise ValueError(f"client log must contain exactly one {marker!r}")
+        positions.append(content.index(marker))
+    if positions != sorted(positions):
+        raise ValueError("client log experiment markers are out of order")
+    if f"TASK COMPLETED: libero_object - Task {task_id}" not in content:
+        raise ValueError("client log is missing the completed task summary")
+    if "Progress: 1/1 tasks completed" not in content:
+        raise ValueError("client log is missing final progress")
+    summary_pattern = re.compile(
+        r"Success Rate:\s*([0-9]+(?:\.[0-9]+)?)%\s*"
+        r"\(([0-9]+)/50 experiments\)"
+    )
+    summaries = summary_pattern.findall(content)
+    if not summaries:
+        raise ValueError("client log is missing the success-rate summary")
+    logged_rate, logged_count = summaries[-1]
+    if int(logged_count) != success_count or not math.isclose(
+        float(logged_rate), success_rate, abs_tol=5e-3
+    ):
+        raise ValueError("client log success-rate summary does not match raw JSON")
+
+
+def validate_metrics_and_trace(
+    raw_dir: str | Path,
+    output_dir: str | Path,
+    task_id: int,
+) -> dict[str, Any]:
+    """Strictly validate episode, force, step-trace, and client-log evidence."""
+
+    raw_dir = Path(raw_dir).resolve()
+    output_dir = Path(output_dir).resolve()
+    candidates = sorted(raw_dir.glob("success_rates_openpi_tactile_*.json"))
+    if len(candidates) != 1:
+        raise ValueError("metrics validation requires exactly one raw success JSON")
+    raw_path = candidates[0].resolve()
+    payload = _read_json(raw_path, "raw success rates")
+    metadata = payload.get("metadata")
+    result_key = f"libero_object_task{task_id}"
+    result = payload.get("results", {}).get(result_key)
+    if not isinstance(metadata, dict) or not isinstance(result, dict):
+        raise ValueError("metrics validation requires metadata and the task result")
+    _require_exact(metadata.get("record_step_traces"), True, "record_step_traces")
+    _require_exact(metadata.get("replan_steps"), 10, "replan_steps")
+    _require_exact(result.get("metrics_status"), "complete", "metrics_status")
+    _require_exact(result.get("metrics_warnings"), [], "metrics_warnings")
+
+    episodes = result.get("episodes")
+    if not isinstance(episodes, list) or len(episodes) != 50:
+        raise ValueError("metrics validation requires exactly 50 episodes")
+    by_index: dict[int, dict[str, Any]] = {}
+    total_env_steps = 0
+    for episode in episodes:
+        if not isinstance(episode, dict):
+            raise ValueError("each episode metric must be an object")
+        experiment_index = episode.get("experiment_index")
+        if type(experiment_index) is not int or experiment_index in by_index:
+            raise ValueError("episode experiment indices must be unique integers")
+        by_index[experiment_index] = episode
+        env_steps = episode.get("env_steps")
+        chunks = episode.get("inference_chunks")
+        if type(env_steps) is not int or not 1 <= env_steps <= 300:
+            raise ValueError(f"episode {experiment_index} has invalid env_steps")
+        if type(chunks) is not int or not 1 <= chunks <= 30:
+            raise ValueError(f"episode {experiment_index} has invalid chunks")
+        if not (chunks - 1) * 10 + 1 <= env_steps <= chunks * 10:
+            raise ValueError(f"episode {experiment_index} step/chunk mismatch")
+        if type(episode.get("success")) is not bool:
+            raise ValueError(f"episode {experiment_index} success must be boolean")
+        if not isinstance(episode.get("end_reason"), str):
+            raise ValueError(f"episode {experiment_index} end_reason is invalid")
+        _require_exact(episode.get("force_status"), "complete", "episode force_status")
+        _require_exact(episode.get("trace_status"), "complete", "episode trace_status")
+        _require_exact(episode.get("trace_rows"), env_steps, "episode trace_rows")
+        samples = episode.get("force_samples")
+        if not isinstance(samples, dict):
+            raise ValueError(f"episode {experiment_index} force_samples is invalid")
+        for key in (
+            "predicted_action_steps",
+            "measured_force_steps",
+            "squeeze_pred_steps",
+            "squeeze_meas_steps",
+            "ap_pred_steps",
+            "ap_meas_steps",
+        ):
+            _require_exact(samples.get(key), env_steps, f"episode samples {key}")
+        _require_close(samples.get("coverage_ratio"), 1.0, "coverage_ratio")
+        for key in FORCE_METRIC_KEYS:
+            _finite_number(episode.get(key), f"episode {experiment_index} {key}")
+        total_env_steps += env_steps
+    if set(by_index) != set(range(50)):
+        raise ValueError("episodes must cover experiment_index 0..49")
+
+    successful_episodes = [episode for episode in episodes if episode["success"]]
+    _require_exact(
+        len(successful_episodes),
+        result.get("successful_experiments"),
+        "episode success count",
+    )
+    metric_counts = result.get("force_metric_episode_counts")
+    if not isinstance(metric_counts, dict):
+        raise ValueError("force_metric_episode_counts must be an object")
+    for key in FORCE_METRIC_KEYS:
+        _require_exact(metric_counts.get(key), len(successful_episodes), f"count {key}")
+
+    step_statistics = result.get("step_statistics")
+    if not isinstance(step_statistics, dict):
+        raise ValueError("step_statistics must be an object")
+    step_groups = {
+        "all": episodes,
+        "successful": successful_episodes,
+        "failed": [episode for episode in episodes if not episode["success"]],
+    }
+    for group_name, group_episodes in step_groups.items():
+        summary = step_statistics.get(group_name)
+        if not isinstance(summary, dict):
+            raise ValueError(f"step_statistics {group_name} is invalid")
+        _require_exact(summary.get("episodes"), len(group_episodes), "step episodes")
+        for field in ("env_steps", "inference_chunks"):
+            values = [episode[field] for episode in group_episodes]
+            expected_values = {
+                f"{field}_total": sum(values),
+                f"{field}_mean": _mean(values) if values else None,
+                f"{field}_min": min(values) if values else None,
+                f"{field}_max": max(values) if values else None,
+            }
+            for key, expected in expected_values.items():
+                if expected is None:
+                    _require_exact(summary.get(key), None, f"step statistics {key}")
+                elif key.endswith("_mean"):
+                    _require_close(summary.get(key), expected, f"step statistics {key}")
+                else:
+                    _require_exact(summary.get(key), expected, f"step statistics {key}")
+
+    trace_descriptor = result.get("step_trace")
+    if not isinstance(trace_descriptor, dict):
+        raise ValueError("step_trace descriptor must be an object")
+    _require_exact(trace_descriptor.get("enabled"), True, "step_trace enabled")
+    _require_exact(trace_descriptor.get("status"), "complete", "step_trace status")
+    _require_exact(trace_descriptor.get("rows"), total_env_steps, "step_trace rows")
+    trace_relative_path = trace_descriptor.get("path")
+    if not isinstance(trace_relative_path, str) or not trace_relative_path:
+        raise ValueError("step_trace path must be non-empty")
+    trace_path = (raw_dir / trace_relative_path).resolve()
+    if not trace_path.is_relative_to(output_dir) or not trace_path.is_file():
+        raise ValueError(f"step trace is missing or outside output: {trace_path}")
+
+    required_row_fields = {
+        "schema_version",
+        "task_suite",
+        "task_id",
+        "experiment_index",
+        "hdf5_episode_index",
+        "env_step_index",
+        "inference_chunk_index",
+        "action_in_chunk_index",
+        "fL_pred_local",
+        "fR_pred_local",
+        "fL_meas_local",
+        "fR_meas_local",
+        "squeeze_pred",
+        "squeeze_meas",
+        "ap_pred",
+        "ap_meas",
+        "predicted_contact",
+        "measured_contact",
+    }
+    rows_by_episode = {index: [] for index in range(50)}
+    row_count = 0
+    try:
+        with trace_path.open(encoding="utf-8") as trace_file:
+            for line_number, line in enumerate(trace_file, start=1):
+                if not line.strip():
+                    raise ValueError(f"step trace line {line_number} is blank")
+                try:
+                    row = json.loads(
+                        line,
+                        object_pairs_hook=_reject_duplicate_pairs,
+                        parse_constant=_reject_nonfinite,
+                    )
+                except (json.JSONDecodeError, ValueError) as error:
+                    raise ValueError(
+                        f"step trace line {line_number} is invalid: {error}"
+                    ) from error
+                if not isinstance(row, dict) or set(row) != required_row_fields:
+                    raise ValueError(
+                        f"step trace line {line_number} has an invalid field set"
+                    )
+                _require_exact(row["schema_version"], 1, "trace schema_version")
+                _require_exact(row["task_suite"], "libero_object", "trace task_suite")
+                _require_exact(row["task_id"], task_id, "trace task_id")
+                experiment_index = row["experiment_index"]
+                if (
+                    type(experiment_index) is not int
+                    or experiment_index not in by_index
+                ):
+                    raise ValueError(
+                        f"step trace line {line_number} has invalid episode"
+                    )
+                expected_step = len(rows_by_episode[experiment_index])
+                _require_exact(row["env_step_index"], expected_step, "env_step_index")
+                _require_exact(
+                    row["inference_chunk_index"], expected_step // 10, "chunk index"
+                )
+                _require_exact(
+                    row["action_in_chunk_index"], expected_step % 10, "action index"
+                )
+                _require_exact(
+                    row["hdf5_episode_index"],
+                    by_index[experiment_index].get("hdf5_episode_index"),
+                    "trace HDF5 episode",
+                )
+                rows_by_episode[experiment_index].append(row)
+                row_count += 1
+    except (OSError, UnicodeDecodeError) as error:
+        raise ValueError(f"could not read step trace: {error}") from error
+    _require_exact(row_count, total_env_steps, "actual step trace rows")
+
+    recomputed_episodes: dict[str, dict[str, float]] = {}
+    for experiment_index, episode in by_index.items():
+        rows = rows_by_episode[experiment_index]
+        _require_exact(len(rows), episode["env_steps"], "episode trace coverage")
+        force_metrics, contact_metrics = _episode_trace_force_metrics(rows)
+        recomputed_episodes[str(experiment_index)] = force_metrics
+        for key, expected in force_metrics.items():
+            _require_close(
+                episode.get(key), expected, f"episode {experiment_index} {key}"
+            )
+        samples = episode["force_samples"]
+        for key, expected in contact_metrics.items():
+            if key.endswith("_steps"):
+                _require_exact(samples.get(key), expected, f"episode samples {key}")
+            else:
+                _require_close(samples.get(key), expected, f"episode samples {key}")
+
+    recomputed_task_metrics: dict[str, float | None] = {}
+    for key in FORCE_METRIC_KEYS:
+        values = [
+            recomputed_episodes[str(episode["experiment_index"])][key]
+            for episode in successful_episodes
+        ]
+        expected = _mean(values) if values else None
+        recomputed_task_metrics[key] = expected
+        legacy_field = LEGACY_FORCE_FIELDS[key]
+        if expected is None:
+            _require_exact(result.get(legacy_field), None, legacy_field)
+        else:
+            _require_close(
+                result.get(legacy_field), expected, legacy_field, rounded=True
+            )
+
+    _validate_client_log(
+        output_dir / "client.log",
+        task_id,
+        len(successful_episodes),
+        float(result["success_rate"]),
+    )
+    return {
+        "schema_version": 1,
+        "status": "completed",
+        "raw_result": str(raw_path),
+        "step_trace": str(trace_path),
+        "episodes": 50,
+        "successful_episodes": len(successful_episodes),
+        "env_steps": total_env_steps,
+        "trace_rows": row_count,
+        "force_metrics": recomputed_task_metrics,
+    }
 
 
 def _parse_normalized_result(
@@ -1222,9 +1667,35 @@ def _preflight(args: argparse.Namespace) -> None:
 
 def _finalize(args: argparse.Namespace) -> None:
     normalized_path = args.output_dir / "normalized_result.json"
+    validation_path = args.output_dir / "metrics_validation.json"
     if normalized_path.exists():
         raise FileExistsError(f"output already exists: {normalized_path}")
+    if validation_path.exists():
+        raise FileExistsError(f"output already exists: {validation_path}")
     normalized = _parse_normalized_result(args.raw_dir, args.bundle, args.task_id)
+    validate_bundle(
+        args.bundle,
+        args.task_id,
+        args.base_model,
+        training_profile=args.training_profile,
+    )
+    try:
+        validation = validate_metrics_and_trace(
+            args.raw_dir,
+            args.output_dir,
+            args.task_id,
+        )
+    except Exception as error:
+        _atomic_write_json(
+            validation_path,
+            {
+                "schema_version": 1,
+                "status": "failed",
+                "error": f"{type(error).__name__}: {error}",
+            },
+        )
+        raise
+    _atomic_write_json(validation_path, validation)
     write_receipts(
         normalized,
         args.output_dir / "output",

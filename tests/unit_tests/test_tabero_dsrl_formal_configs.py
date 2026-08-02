@@ -21,6 +21,10 @@ from rlinf.utils.dsrl_replay import (
     DSRL_REPLAY_SEMANTICS,
 )
 from rlinf.utils.dsrl_reward import DSRL_REWARD_SEMANTICS
+from rlinf.utils.dsrl_transition import (
+    DSRL_TRANSITION_BOUNDARY_SEMANTICS,
+    TABERO_DSRL_CHUNK_BOUNDARY_MODE,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_DIR = REPO_ROOT / "examples" / "embodiment" / "config"
@@ -69,6 +73,10 @@ def test_formal_dsrl_configs_preserve_training_contract(monkeypatch, task_id):
     assert cfg.algorithm.dsrl_reward_semantics == DSRL_REWARD_SEMANTICS
     assert cfg.algorithm.dsrl_observation_semantics == DSRL_OBSERVATION_SEMANTICS
     assert cfg.algorithm.dsrl_replay_semantics == DSRL_REPLAY_SEMANTICS
+    assert (
+        cfg.algorithm.dsrl_transition_boundary_semantics
+        == DSRL_TRANSITION_BOUNDARY_SEMANTICS
+    )
     assert cfg.algorithm.replay_buffer.backend == DSRL_REPLAY_BACKEND
     assert (
         cfg.algorithm.replay_buffer.capacity_transitions
@@ -126,6 +134,7 @@ def test_formal_dsrl_configs_select_exact_task_and_firm_prompt(monkeypatch, task
         assert split.task_description == expected["instruction"]
         assert split.hdf5_initial_states_path.endswith(expected["hdf5"])
         assert split.hdf5_reset_assignment == "cyclic"
+        assert split.chunk_boundary_mode == TABERO_DSRL_CHUNK_BOUNDARY_MODE
         assert split.success.required_consecutive_steps == 8
         assert split.marker_history_len == 8
         assert split.combined_marker_count == 198
