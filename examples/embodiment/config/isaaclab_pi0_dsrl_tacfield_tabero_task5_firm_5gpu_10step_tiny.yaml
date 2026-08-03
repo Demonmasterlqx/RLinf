@@ -28,13 +28,13 @@ cluster:
 runner:
   task_type: embodied
   logger:
-    log_path: "/data/home/sim6g/code/tabero/results/tabero_task5_firm_dsrl_5gpu_20step_small_${oc.env:TABERO_MATRIX_RUN_ID}"
+    log_path: "/data/home/sim6g/code/tabero/results/tabero_task5_firm_dsrl_5gpu_10step_tiny_${oc.env:TABERO_MATRIX_RUN_ID}"
     project_name: tabero-rlinf
-    experiment_name: "tabero_task5_firm_dsrl_5gpu_20step_small_${oc.env:TABERO_MATRIX_RUN_ID}"
+    experiment_name: "tabero_task5_firm_dsrl_5gpu_10step_tiny_${oc.env:TABERO_MATRIX_RUN_ID}"
     logger_backends:
     - tensorboard
     - wandb
-  max_epochs: 20
+  max_epochs: 10
   max_steps: -1
   only_eval: false
   val_check_interval: -1
@@ -333,8 +333,8 @@ actor:
     trainable_checkpoint_metadata:
       method: dsrl
       task_id: 5
-      training_config: isaaclab_pi0_dsrl_tacfield_tabero_task5_firm_5gpu_20step_small
-      target_global_step: 20
+      training_config: isaaclab_pi0_dsrl_tacfield_tabero_task5_firm_5gpu_10step_tiny
+      target_global_step: 10
 reward:
   use_reward_model: false
 critic:
