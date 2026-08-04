@@ -528,6 +528,7 @@ def get_lr_scheduler(
     last_epoch: int = -1,
     min_lr: float = 0.0,
     min_lr_rate: float | None = None,
+    num_decay_steps: int | None = None,
 ):
     # only one of min_lr and min_lr_rate should be set. If min_lr_rate is set, min_lr will be ignored.
     if min_lr_rate is not None:
@@ -559,12 +560,20 @@ def get_lr_scheduler(
         )
     elif lr_scheduler in ("openpi_cosine", "ref_warmup_cosine"):
         # Warmup starts at peak/(warmup+1) (not 0), ramps linearly to the peak at
-        # `num_warmup_steps`, then cosine-decays to `min_lr` over the remaining
-        # `num_training_steps - num_warmup_steps` steps. Returned as a multiplier on
-        # the optimizer's base lr (the peak).
+        # `num_warmup_steps`, then cosine-decays to `min_lr` by
+        # `num_decay_steps`. Training beyond that point stays at `min_lr`.
+        # Returned as a multiplier on the optimizer's base lr (the peak).
         from torch.optim.lr_scheduler import LambdaLR
 
         base_lr = optimizer.param_groups[0]["lr"]
+        decay_steps = (
+            num_training_steps if num_decay_steps is None else int(num_decay_steps)
+        )
+        if decay_steps <= num_warmup_steps:
+            raise ValueError(
+                "num_decay_steps must be greater than num_warmup_steps; got "
+                f"{decay_steps} <= {num_warmup_steps}."
+            )
         if min_lr_rate is not None:
             min_mult = min_lr_rate
         elif min_lr and base_lr > 0:
@@ -579,7 +588,7 @@ def get_lr_scheduler(
                     1, num_warmup_steps
                 )
             progress = (current_step - num_warmup_steps) / max(
-                1, num_training_steps - num_warmup_steps
+                1, decay_steps - num_warmup_steps
             )
             progress = min(1.0, progress)
             cosine = 0.5 * (1.0 + math.cos(math.pi * progress))

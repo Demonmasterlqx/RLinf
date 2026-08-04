@@ -177,16 +177,21 @@ class SFTRunner:
         self.metric_logger.finish()
 
     def _save_checkpoint(self, is_best: bool = False) -> None:
-        checkpoint_root = os.path.join(
-            self.cfg.runner.logger.log_path,
-            self.cfg.runner.logger.experiment_name,
-        )
+        configured_checkpoint_root = self.cfg.runner.get("checkpoint_root", None)
+        if configured_checkpoint_root is None:
+            run_root = os.path.join(
+                self.cfg.runner.logger.log_path,
+                self.cfg.runner.logger.experiment_name,
+            )
+            checkpoint_root = os.path.join(run_root, "checkpoints")
+        else:
+            checkpoint_root = os.path.abspath(str(configured_checkpoint_root))
         if is_best:
-            base_output_dir = os.path.join(checkpoint_root, "checkpoints/best_model")
+            base_output_dir = os.path.join(checkpoint_root, "best_model")
         else:
             base_output_dir = os.path.join(
                 checkpoint_root,
-                f"checkpoints/global_step_{self.global_step}",
+                f"global_step_{self.global_step}",
             )
         actor_save_path = os.path.join(base_output_dir, "actor")
         os.makedirs(actor_save_path, exist_ok=True)

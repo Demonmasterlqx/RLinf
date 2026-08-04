@@ -43,6 +43,82 @@ def _to_numpy(x):
     return np.asarray(x.detach().cpu()) if torch.is_tensor(x) else x
 
 
+def _uses_expert_future_tactile(config: Any) -> bool:
+    """Return whether actions contain control followed by future force slots."""
+    tactile_type = str(getattr(config, "tactile_type", "no")).lower()
+    return tactile_type.endswith("expert_his_c_fut")
+
+
+def _reduce_sft_action_loss(
+    elementwise_loss: torch.Tensor, config: Any
+) -> dict[str, torch.Tensor]:
+    """Reduce PI0 elementwise flow loss using the configured action layout.
+
+    Tabero ``expert_his_c_fut`` actions contain control, force, and optional
+    padding dimensions. This mirrors the reference OpenPI weighted loss while
+    retaining scalar components for training diagnostics.
+    """
+    if not _uses_expert_future_tactile(config):
+        return {"loss": elementwise_loss.mean()}
+
+    action_dim = int(getattr(config, "action_dim", elementwise_loss.shape[-1]))
+    effective_action_dim = int(
+        getattr(config, "effective_action_dim", action_dim) or action_dim
+    )
+    tactile_dim = int(getattr(config, "tactile_dim", 0))
+    control_dim = effective_action_dim - tactile_dim
+    if elementwise_loss.shape[-1] != action_dim:
+        raise ValueError(
+            "PI0 SFT loss width does not match action_dim: "
+            f"{elementwise_loss.shape[-1]} != {action_dim}."
+        )
+    if not 0 < control_dim < effective_action_dim <= action_dim:
+        raise ValueError(
+            "expert_his_c_fut requires 0 < control_dim < "
+            "effective_action_dim <= action_dim; got "
+            f"control_dim={control_dim}, effective_action_dim="
+            f"{effective_action_dim}, action_dim={action_dim}."
+        )
+
+    tactile_slice = slice(control_dim, effective_action_dim)
+    action_loss = elementwise_loss[..., :control_dim].mean()
+    tactile_loss = elementwise_loss[..., tactile_slice].mean()
+    components = {
+        "action_loss": action_loss,
+        "tactile_loss": tactile_loss,
+    }
+
+    padding_loss = None
+    if effective_action_dim < action_dim:
+        padding_loss = elementwise_loss[..., effective_action_dim:].mean()
+        components["padding_loss"] = padding_loss
+
+    tactile_weight = float(getattr(config, "tactile_loss_weight", 0.1))
+    padding_weight = float(getattr(config, "padding_loss_weight", 0.0))
+    loss_mode = str(getattr(config, "expert_his_c_fut_loss_mode", "weighted_full"))
+    if loss_mode == "weighted_full":
+        weights = torch.ones(
+            action_dim,
+            device=elementwise_loss.device,
+            dtype=elementwise_loss.dtype,
+        )
+        weights[tactile_slice] = tactile_weight
+        if effective_action_dim < action_dim:
+            weights[effective_action_dim:] = padding_weight
+        total_loss = (elementwise_loss * weights).mean()
+    elif loss_mode == "split":
+        total_loss = action_loss + tactile_weight * tactile_loss
+        if padding_loss is not None:
+            total_loss = total_loss + padding_weight * padding_loss
+    else:
+        raise ValueError(
+            "Unsupported expert_his_c_fut_loss_mode "
+            f"{loss_mode!r}; expected 'weighted_full' or 'split'."
+        )
+
+    return {"loss": total_loss, **components}
+
+
 @dataclass(frozen=True)
 class OpenPi0Config(Pi0Config):
     # config for rl
@@ -571,7 +647,12 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             raise NotImplementedError
 
     def sft_forward(self, data, use_action_chunk_loss: bool = False, **kwargs):
-        if hasattr(self, "gradient_checkpointing_disable"):
+        gradient_checkpointing_enabled = getattr(
+            self, "_rlinf_gradient_checkpointing_enabled", False
+        )
+        if not gradient_checkpointing_enabled and hasattr(
+            self, "gradient_checkpointing_disable"
+        ):
             self.gradient_checkpointing_disable()
 
         if isinstance(data, tuple):
@@ -641,9 +722,14 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             loss = super().forward(observation, actions)
         if use_action_chunk_loss:
             loss = loss[:, : self.config.action_chunk, : self.config.action_env_dim]
-        vla_loss = loss.mean()
+            loss_output = {"loss": loss.mean()}
+        else:
+            loss_output = _reduce_sft_action_loss(loss, self.config)
+        vla_loss = loss_output["loss"]
         if not self.config.use_rlt:
-            return vla_loss
+            if len(loss_output) == 1:
+                return vla_loss
+            return loss_output
 
         rlt_param = next(self.rlt_module.parameters())
         prefix_output = prefix_output.to(device=rlt_param.device, dtype=rlt_param.dtype)
@@ -654,6 +740,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             "loss": total_loss,
             "vla_loss": vla_loss,
             "rlt_loss": rlt_loss,
+            **{name: value for name, value in loss_output.items() if name != "loss"},
         }
 
     def _sft_forward_with_rlt_prefix(self, observation, actions):
@@ -691,14 +778,24 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         def forward_func(
             prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
         ):
-            (prefix_output, suffix_out), _ = self.paligemma_with_expert.forward(
-                attention_mask=att_2d_masks_4d,
-                position_ids=position_ids,
-                past_key_values=None,
-                inputs_embeds=[prefix_embs, suffix_embs],
-                use_cache=False,
-                adarms_cond=[None, adarms_cond],
-            )
+            paired_model = self.paligemma_with_expert
+            paired_training = paired_model.training
+            if not getattr(self, "_rlinf_gradient_checkpointing_enabled", False):
+                # RLinf/openpi's paired forward force-enables expert checkpointing
+                # solely from its own `training` flag.  Clear only that wrapper
+                # flag for this call; all child modules remain in train mode.
+                paired_model.training = False
+            try:
+                (prefix_output, suffix_out), _ = paired_model.forward(
+                    attention_mask=att_2d_masks_4d,
+                    position_ids=position_ids,
+                    past_key_values=None,
+                    inputs_embeds=[prefix_embs, suffix_embs],
+                    use_cache=False,
+                    adarms_cond=[None, adarms_cond],
+                )
+            finally:
+                paired_model.training = paired_training
             return prefix_output, suffix_out
 
         prefix_output, suffix_out = self._apply_checkpoint(

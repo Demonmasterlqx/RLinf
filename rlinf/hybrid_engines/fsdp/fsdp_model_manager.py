@@ -264,7 +264,18 @@ class FSDPModelManager:
         module = self.model_provider_func()
 
         # Enable gradient checkpointing if configured
-        if self._cfg.fsdp_config.get("gradient_checkpointing", False):
+        gradient_checkpointing_enabled = self._cfg.fsdp_config.get(
+            "gradient_checkpointing", False
+        )
+        # OpenPI's paired PaliGemma/expert forward otherwise force-enables expert
+        # checkpointing during training.  Propagate the explicit RLinf choice so
+        # the model wrapper can enforce both the enabled and disabled cases.
+        setattr(
+            module,
+            "_rlinf_gradient_checkpointing_enabled",
+            gradient_checkpointing_enabled,
+        )
+        if gradient_checkpointing_enabled:
             use_reentrant = self._cfg.fsdp_config.get(
                 "gradient_checkpointing_use_reentrant", True
             )
@@ -632,6 +643,7 @@ class FSDPModelManager:
             LRScheduler: The learning rate scheduler.
         """
         total_steps = optim_config.get("total_training_steps", 0)
+        decay_steps = optim_config.get("lr_decay_steps", total_steps)
         num_warmup_steps = int(optim_config.get("lr_warmup_steps", -1))
         lr_scheduler = optim_config.get("lr_scheduler", "constant")
         num_cycles = optim_config.get("num_cycles", 0.5)
@@ -646,6 +658,7 @@ class FSDPModelManager:
             optimizer=optimizer,
             num_warmup_steps=num_warmup_steps,
             num_training_steps=total_steps,
+            num_decay_steps=decay_steps,
             num_cycles=num_cycles,
             min_lr=min_lr,
             min_lr_rate=min_lr_rate,

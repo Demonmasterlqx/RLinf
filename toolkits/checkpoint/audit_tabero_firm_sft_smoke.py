@@ -21,7 +21,11 @@ def _group(name: str) -> str:
     return "unexpected"
 
 
-def audit(step1_path: Path, step2_path: Path) -> dict:
+def audit(
+    step1_path: Path,
+    step2_path: Path,
+    expected_steps: tuple[int, int] = (1, 2),
+) -> dict:
     checkpoints = [
         torch.load(path, map_location="cpu", weights_only=False)
         for path in (step1_path, step2_path)
@@ -59,7 +63,7 @@ def audit(step1_path: Path, step2_path: Path) -> dict:
             raise ValueError(f"No nonzero step1-to-step2 change in {group}.")
 
     metadata = [checkpoint["metadata"] for checkpoint in checkpoints]
-    if [item["global_step"] for item in metadata] != [1, 2]:
+    if [item["global_step"] for item in metadata] != list(expected_steps):
         raise ValueError(f"Unexpected checkpoint steps: {metadata}")
     if [item["is_final"] for item in metadata] != [False, True]:
         raise ValueError(f"Unexpected finality flags: {metadata}")
@@ -86,9 +90,14 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--step1", type=Path, required=True)
     parser.add_argument("--step2", type=Path, required=True)
+    parser.add_argument("--expected-steps", type=int, nargs=2, default=(1, 2))
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    result = audit(args.step1.resolve(), args.step2.resolve())
+    result = audit(
+        args.step1.resolve(),
+        args.step2.resolve(),
+        expected_steps=tuple(args.expected_steps),
+    )
     args.output.write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result, indent=2))
 

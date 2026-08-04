@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import itertools
+import json
 import os
 from typing import Any
 
@@ -26,11 +28,42 @@ from rlinf.workers.sft.fsdp_sft_worker import FSDPSftWorker
 
 
 class _OpenPiTactileDataLoader:
-    """Preserve RLinf-local tactile fields dropped by OpenPI Observation."""
+    """Expose finite OpenPI epochs and preserve RLinf-local tactile fields."""
 
     def __init__(self, delegate):
         self._delegate = delegate
         self._data_loader = delegate._data_loader
+        self._pytorch_data_loader = self._resolve_pytorch_data_loader()
+
+    def _resolve_pytorch_data_loader(self):
+        return getattr(self._data_loader, "_data_loader", None) or getattr(
+            self._data_loader, "torch_loader", None
+        )
+
+    @property
+    def sampler(self):
+        if self._pytorch_data_loader is None:
+            return None
+        return getattr(self._pytorch_data_loader, "sampler", None)
+
+    @property
+    def dataset(self):
+        if self._pytorch_data_loader is None:
+            return None
+        return getattr(self._pytorch_data_loader, "dataset", None)
+
+    def __len__(self):
+        if self._pytorch_data_loader is None:
+            raise TypeError("The wrapped OpenPI loader does not expose __len__.")
+        return len(self._pytorch_data_loader)
+
+    def set_epoch(self, epoch: int) -> None:
+        sampler = self.sampler
+        if sampler is not None and hasattr(sampler, "set_epoch"):
+            sampler.set_epoch(epoch)
+        dataset = self.dataset
+        if dataset is not None and hasattr(dataset, "set_epoch"):
+            dataset.set_epoch(epoch)
 
     def data_config(self):
         return self._delegate.data_config()
@@ -38,7 +71,10 @@ class _OpenPiTactileDataLoader:
     def __iter__(self):
         from openpi.models import model as _model
 
-        for batch in self._data_loader:
+        batches = iter(self._data_loader)
+        if self._pytorch_data_loader is not None:
+            batches = itertools.islice(batches, len(self))
+        for batch in batches:
             observation = _model.Observation.from_dict(batch)
             payload = {
                 "observation": observation,
@@ -141,6 +177,54 @@ class FSDPVlaSftWorker(FSDPSftWorker):
                     step_metrics[key] = value
         return loss, step_metrics
 
+    def _save_openpi_data_state(self, save_path: str) -> None:
+        with open(
+            os.path.join(save_path, "data_state.json"),
+            "w",
+            encoding="utf-8",
+        ) as handle:
+            json.dump(
+                {
+                    "data_epoch": self._data_epoch,
+                    "data_iter_offset": self._data_iter_offset,
+                },
+                handle,
+            )
+
+    def _load_openpi_data_state(self, load_path: str) -> None:
+        state_path = os.path.join(load_path, "data_state.json")
+        if not os.path.isfile(state_path):
+            raise FileNotFoundError(
+                f"OpenPI SFT checkpoint is missing data_state.json: {state_path}"
+            )
+        with open(state_path, encoding="utf-8") as handle:
+            state = json.load(handle)
+        self._data_epoch = int(state["data_epoch"])
+        self._data_iter_offset = int(state["data_iter_offset"])
+        if self._data_epoch < 0 or self._data_iter_offset < 0:
+            raise ValueError(
+                f"OpenPI data checkpoint has negative epoch or offset: {state}."
+            )
+        if self._data_iter_offset > len(self.data_loader):
+            raise ValueError(
+                "OpenPI data checkpoint offset exceeds the epoch length: "
+                f"{self._data_iter_offset} > {len(self.data_loader)}."
+            )
+
+        # Loading the FSDP checkpoint restores the model RNG. Advancing the
+        # loader to its saved cursor must not consume that model RNG stream.
+        restored_rng_state = get_rng_state()
+        self.data_loader.set_epoch(self._data_epoch)
+        self.data_iter = iter(self.data_loader)
+        for _ in range(self._data_iter_offset):
+            try:
+                next(self.data_iter)
+            except StopIteration as error:
+                raise RuntimeError(
+                    "OpenPI data checkpoint offset could not be restored."
+                ) from error
+        set_rng_state(restored_rng_state)
+
     def save_checkpoint(self, save_path: str, step: int = 0) -> None:
         super().save_checkpoint(save_path, step)
 
@@ -162,6 +246,10 @@ class FSDPVlaSftWorker(FSDPSftWorker):
                 torch.save(all_rng_states, os.path.join(save_path, "rng.pt"))
 
             torch.distributed.barrier()
+        elif isinstance(self.data_loader, _OpenPiTactileDataLoader):
+            if self._rank == 0:
+                self._save_openpi_data_state(save_path)
+            torch.distributed.barrier()
 
     def load_checkpoint(self, load_path: str) -> None:
         super().load_checkpoint(load_path)
@@ -180,6 +268,9 @@ class FSDPVlaSftWorker(FSDPSftWorker):
                 set_rng_state(all_rng_states[self._rank])
 
             torch.distributed.barrier()
+        elif isinstance(self.data_loader, _OpenPiTactileDataLoader):
+            self._load_openpi_data_state(load_path)
+            torch.distributed.barrier()
 
     def get_max_steps_per_epoch(self):
         if self.data_loader is None:
@@ -188,7 +279,7 @@ class FSDPVlaSftWorker(FSDPSftWorker):
         if model_type == SupportedModel.OPENPI_PYTORCH:
             return max(1, len(self.data_loader) // self.gradient_accumulation)
         if model_type == SupportedModel.OPENPI:
-            num_batches = len(self._openpi_pytorch_dataloader(self.data_loader))
+            num_batches = len(self.data_loader)
             return max(1, num_batches // self.gradient_accumulation)
         return super().get_max_steps_per_epoch()
 

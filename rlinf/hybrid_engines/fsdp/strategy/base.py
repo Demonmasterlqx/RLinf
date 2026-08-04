@@ -357,10 +357,21 @@ class FSDPStrategyBase(ABC):
                         f"[Checkpoint] loading DCP checkpoint from {dcp_load_path}"
                     )
 
-                dcp.load(
-                    {"fsdp_checkpoint": training_state},
-                    checkpoint_id=dcp_load_path,
-                )
+                # DCP serializes its load plans as Python objects.  Letting those
+                # object collectives use the default NCCL group makes PyTorch put
+                # their staging tensors on CUDA, which is fragile when actor ranks
+                # intentionally skip a physical GPU.  A temporary Gloo group keeps
+                # checkpoint planning on CPU; tensor shards are still restored to
+                # the FSDP parameters by DCP.
+                dcp_process_group = torch.distributed.new_group(backend="gloo")
+                try:
+                    dcp.load(
+                        {"fsdp_checkpoint": training_state},
+                        checkpoint_id=dcp_load_path,
+                        process_group=dcp_process_group,
+                    )
+                finally:
+                    torch.distributed.destroy_process_group(dcp_process_group)
         except BaseException as e:
             import traceback
 
