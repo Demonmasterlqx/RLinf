@@ -40,11 +40,15 @@ class _OpenPiTactileDataLoader:
 
         for batch in self._data_loader:
             observation = _model.Observation.from_dict(batch)
+            payload = {
+                "observation": observation,
+                "actions": batch["actions"],
+            }
             if "tactile_prefix" in batch:
-                object.__setattr__(
-                    observation, "tactile_prefix", batch["tactile_prefix"]
-                )
-            yield observation, batch["actions"]
+                # Keep tactile as an explicit payload field. Extra attributes on
+                # OpenPI's Observation do not survive every FSDP argument path.
+                payload["tactile_prefix"] = batch["tactile_prefix"]
+            yield payload
 
 
 class FSDPVlaSftWorker(FSDPSftWorker):

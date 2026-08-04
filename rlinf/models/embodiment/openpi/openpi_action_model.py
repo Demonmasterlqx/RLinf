@@ -576,12 +576,25 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
 
         if isinstance(data, tuple):
             observation, actions = data
+            payload_tactile_prefix = None
         else:
             observation = data["observation"]
             actions = data["actions"]
+            payload_tactile_prefix = data.get("tactile_prefix")
+
+        if payload_tactile_prefix is not None:
+            object.__setattr__(observation, "tactile_prefix", payload_tactile_prefix)
 
         device = next(self.parameters()).device
         tactile_prefix = getattr(observation, "tactile_prefix", None)
+        if (
+            getattr(self, "tactile_prefix_encoder", None) is not None
+            and tactile_prefix is None
+        ):
+            raise RuntimeError(
+                "Tabero SFT requires tactile_prefix when tactile_prefix_encoder "
+                "is configured."
+            )
         register_pytree_dataclasses(observation)
         observation = tree_map(
             lambda x: (
@@ -617,7 +630,10 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         actions = actions.to(dtype=torch.float32)
 
         # PI0Pytorch.forward returns per-element MSE (reduction="none").
-        if self.config.use_rlt:
+        use_prefix_aware_forward = self.config.use_rlt or (
+            self.tactile_prefix_encoder is not None and tactile_prefix is not None
+        )
+        if use_prefix_aware_forward:
             loss, prefix_output, prefix_mask = self._sft_forward_with_rlt_prefix(
                 observation, actions
             )
@@ -1606,6 +1622,26 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             return self.tactile_prefix_encoder(tactile)
 
         tactile_emb = self._apply_checkpoint(tactile_embed_func, tactile_prefix)
+        tcn_is_trainable = self.training and any(
+            parameter.requires_grad
+            for parameter in self.tactile_prefix_encoder.parameters()
+        )
+        if tcn_is_trainable and not tactile_emb.requires_grad:
+            raise RuntimeError(
+                "Trainable tactile_prefix_encoder produced a detached tactile token."
+            )
+        if tcn_is_trainable and not getattr(
+            self, "_tactile_gradient_audit_registered", False
+        ):
+            tactile_emb.register_hook(
+                lambda grad: get_logger().info(
+                    "Tabero tactile token gradient audit: norm=%s max_abs=%s finite=%s",
+                    float(grad.float().norm()),
+                    float(grad.float().abs().max()),
+                    bool(torch.isfinite(grad).all()),
+                )
+            )
+            self._tactile_gradient_audit_registered = True
         tactile_emb = tactile_emb.to(dtype=prefix_embs.dtype)[:, None, :]
         tactile_pad_mask = torch.ones(
             tactile_emb.shape[:2],

@@ -17,6 +17,10 @@ import pytest
 import torch
 from openpi.models import model as _model
 
+from rlinf.models.embodiment.openpi import (
+    _apply_explicit_model_dtype,
+    _validate_checkpoint_load_result,
+)
 from rlinf.models.embodiment.openpi.dataconfig import get_openpi_config
 from rlinf.models.embodiment.openpi.openpi_action_model import (
     OpenPi0Config,
@@ -91,7 +95,9 @@ def test_tabero_tacfield_inputs_require_marker_motion_and_build_prefix():
         out["tactile_prefix"], data["tactile_marker_motion"].reshape(9, 396)
     )
 
-    data_without_marker = {k: v for k, v in data.items() if k != "tactile_marker_motion"}
+    data_without_marker = {
+        k: v for k, v in data.items() if k != "tactile_marker_motion"
+    }
     with pytest.raises(KeyError, match="tactile_marker_motion"):
         transform(data_without_marker)
 
@@ -117,6 +123,41 @@ def test_tabero_openpi_configs_are_registered_with_extended_config():
     assert tacfield.model.tactile_prefix_encoder_type == "tcn"
     assert tacfield.model.tactile_streams == ("tactile_prefix",)
     assert tacfield.data.repo_id == "NathanWu7/tabero_object_25"
+
+
+def test_explicit_fp32_keeps_entire_openpi_model_fp32_and_disables_tf32():
+    model = torch.nn.Sequential(torch.nn.Linear(3, 4).to(torch.bfloat16))
+    old_matmul = torch.backends.cuda.matmul.allow_tf32
+    old_cudnn = torch.backends.cudnn.allow_tf32
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        _apply_explicit_model_dtype(model, torch.float32)
+        assert {parameter.dtype for parameter in model.parameters()} == {torch.float32}
+        assert torch.backends.cuda.matmul.allow_tf32 is False
+        assert torch.backends.cudnn.allow_tf32 is False
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = old_matmul
+        torch.backends.cudnn.allow_tf32 = old_cudnn
+
+
+def test_base_checkpoint_only_allows_missing_tactile_encoder_keys():
+    result = torch.nn.modules.module._IncompatibleKeys(
+        [
+            "paligemma_with_expert.paligemma.model.language_model.embed_tokens.weight",
+            "tactile_prefix_encoder.out_proj.weight",
+        ],
+        [],
+    )
+    _validate_checkpoint_load_result(result, ["tactile_prefix_encoder."])
+
+    invalid = torch.nn.modules.module._IncompatibleKeys(["action_out_proj.weight"], [])
+    with pytest.raises(RuntimeError, match="action_out_proj.weight"):
+        _validate_checkpoint_load_result(invalid, ["tactile_prefix_encoder."])
+
+    unexpected = torch.nn.modules.module._IncompatibleKeys([], ["unknown.weight"])
+    with pytest.raises(RuntimeError, match="unknown.weight"):
+        _validate_checkpoint_load_result(unexpected, ["tactile_prefix_encoder."])
 
 
 def test_tactile_prefix_encoder_has_own_fsdp_wrap_name():
@@ -172,12 +213,8 @@ def test_tactile_tcn_encoder_outputs_single_prefix_token():
 def test_converter_folds_lora_weights_into_base_einsum():
     state_dict = {
         "llm/layers/attn/q_einsum/w": np.ones((2, 3, 4), dtype=np.float32),
-        "llm/layers/attn/q_einsum/lora_a": np.full(
-            (2, 3, 2), 2.0, dtype=np.float32
-        ),
-        "llm/layers/attn/q_einsum/lora_b": np.full(
-            (2, 2, 4), 3.0, dtype=np.float32
-        ),
+        "llm/layers/attn/q_einsum/lora_a": np.full((2, 3, 2), 2.0, dtype=np.float32),
+        "llm/layers/attn/q_einsum/lora_b": np.full((2, 2, 4), 3.0, dtype=np.float32),
         "llm/layers/mlp/linear": np.ones((5, 6), dtype=np.float32),
         "llm/layers/mlp/linear_lora_a": np.full((5, 2), 4.0, dtype=np.float32),
         "llm/layers/mlp/linear_lora_b": np.full((2, 6), 5.0, dtype=np.float32),
@@ -234,7 +271,9 @@ def test_converter_maps_tactile_prefix_encoder_params():
         3,
         2,
     )
-    assert torch_params["tactile_prefix_encoder.blocks.0.residual_proj.weight"].shape == (
+    assert torch_params[
+        "tactile_prefix_encoder.blocks.0.residual_proj.weight"
+    ].shape == (
         3,
         2,
     )

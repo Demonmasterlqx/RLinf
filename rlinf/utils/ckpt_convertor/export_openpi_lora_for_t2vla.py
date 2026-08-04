@@ -187,6 +187,25 @@ def _normalize_state_dict_keys(
     return normalized
 
 
+def _validate_trainable_checkpoint_keys(
+    model: torch.nn.Module, state_dict: Mapping[str, torch.Tensor]
+) -> None:
+    """Reject incomplete sidecars and accidental frozen-base tensors."""
+    expected_trainable = {
+        name for name, parameter in model.named_parameters() if parameter.requires_grad
+    }
+    checkpoint_keys = set(state_dict)
+    missing_trainable = sorted(expected_trainable - checkpoint_keys)
+    unexpected_trainable = sorted(checkpoint_keys - expected_trainable)
+    if missing_trainable or unexpected_trainable:
+        raise RuntimeError(
+            "Trainable checkpoint must contain exactly the model's trainable "
+            "parameters; "
+            f"missing={missing_trainable[:20]}, "
+            f"unexpected={unexpected_trainable[:20]}"
+        )
+
+
 def _copy_assets(model_path: str, output_dir: str) -> None:
     source_root = Path(model_path)
     output_root = Path(output_dir)
@@ -210,6 +229,25 @@ def _copy_assets(model_path: str, output_dir: str) -> None:
         if dest.exists():
             shutil.rmtree(dest)
         shutil.copytree(child, dest, symlinks=True)
+
+
+def _copy_norm_stats(
+    norm_stats_path: str | Path, output_dir: str | Path, asset_id: str
+) -> None:
+    """Install explicit dataset statistics into a deployable OpenPI export."""
+    source = Path(norm_stats_path).expanduser().resolve()
+    if source.is_dir():
+        source = source / "norm_stats.json"
+    if not source.is_file():
+        raise FileNotFoundError(f"Normalization stats not found: {source}")
+    output_root = Path(output_dir)
+    destinations = (
+        output_root / "assets" / asset_id / "norm_stats.json",
+        output_root / asset_id / "norm_stats.json",
+    )
+    for destination in destinations:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
 
 
 def _json_safe(value):
@@ -260,6 +298,8 @@ def _save_filtered_safetensors(
     output_path: str,
     *,
     base_model_path: str,
+    allowed_extra_prefixes: tuple[str, ...] = (),
+    output_dtype: torch.dtype | None = None,
 ) -> None:
     state_dict = {}
     for key, value in model.state_dict().items():
@@ -274,24 +314,32 @@ def _save_filtered_safetensors(
     with safe_open(base_checkpoint, framework="pt", device="cpu") as base:
         base_keys = set(base.keys())
         missing = sorted(base_keys - set(state_dict))
-        unexpected = sorted(set(state_dict) - base_keys)
+        unexpected = sorted(
+            key
+            for key in set(state_dict) - base_keys
+            if not key.startswith(allowed_extra_prefixes)
+        )
         if missing or unexpected:
             raise ValueError(
-                "Merged piRL state keys do not match the fixed base architecture; "
+                "Merged OpenPI state keys do not match the allowed architecture; "
                 f"missing={missing[:10]}, unexpected={unexpected[:10]}"
             )
         for key in sorted(state_dict):
-            dtype_name = str(base.get_slice(key).get_dtype())
-            if dtype_name not in _SAFETENSORS_DTYPES:
-                raise ValueError(
-                    f"Unsupported fixed-base safetensors dtype {dtype_name!r} for {key}"
-                )
+            if output_dtype is not None and state_dict[key].is_floating_point():
+                target_dtype = output_dtype
+            elif key in base_keys:
+                dtype_name = str(base.get_slice(key).get_dtype())
+                if dtype_name not in _SAFETENSORS_DTYPES:
+                    raise ValueError(
+                        "Unsupported fixed-base safetensors dtype "
+                        f"{dtype_name!r} for {key}"
+                    )
+                target_dtype = _SAFETENSORS_DTYPES[dtype_name]
+            else:
+                target_dtype = state_dict[key].dtype
             # Clone to avoid shared-storage errors from tied weights.
             state_dict[key] = (
-                state_dict[key]
-                .to(dtype=_SAFETENSORS_DTYPES[dtype_name])
-                .contiguous()
-                .clone()
+                state_dict[key].to(dtype=target_dtype).contiguous().clone()
             )
     safetensors.torch.save_file(state_dict, output_path)
 
@@ -299,6 +347,37 @@ def _save_filtered_safetensors(
 def _safetensor_count(path: str | Path) -> int:
     with safe_open(_checkpoint_path(path), framework="pt", device="cpu") as handle:
         return len(handle.keys())
+
+
+def _validate_reference_schema(
+    model_path: str | Path, reference_path: str | Path
+) -> None:
+    """Require an export to match an audited deployment checkpoint key-for-key."""
+    with (
+        safe_open(_checkpoint_path(model_path), framework="pt", device="cpu") as model,
+        safe_open(
+            _checkpoint_path(reference_path), framework="pt", device="cpu"
+        ) as reference,
+    ):
+        model_keys = set(model.keys())
+        reference_keys = set(reference.keys())
+        missing = sorted(reference_keys - model_keys)
+        unexpected = sorted(model_keys - reference_keys)
+        shape_mismatches = sorted(
+            (
+                key,
+                tuple(model.get_slice(key).get_shape()),
+                tuple(reference.get_slice(key).get_shape()),
+            )
+            for key in model_keys & reference_keys
+            if model.get_slice(key).get_shape() != reference.get_slice(key).get_shape()
+        )
+    if missing or unexpected or shape_mismatches:
+        raise ValueError(
+            "Tabero SFT export/reference schema mismatch: "
+            f"missing={missing[:10]}, unexpected={unexpected[:10]}, "
+            f"shape_mismatches={shape_mismatches[:10]}"
+        )
 
 
 def _build_export_metadata(
@@ -316,30 +395,47 @@ def _build_export_metadata(
     base_checkpoint = _checkpoint_path(source_model_path)
     output_model = _checkpoint_path(model_path)
     expected_training_config = train_config.stem
+    method = checkpoint_meta.get("method")
     required = {
         "format": "trainable_weights",
-        "method": "pirl",
+        "method": method,
         "training_config": expected_training_config,
         "is_final": True,
     }
+    if method not in {"pirl", "sft_full_lora_tacfield"}:
+        raise ValueError(
+            "OpenPI checkpoint provenance method must be 'pirl' or "
+            f"'sft_full_lora_tacfield', got {method!r}"
+        )
     for field, expected in required.items():
         actual = checkpoint_meta.get(field)
         if type(actual) is not type(expected) or actual != expected:
             raise ValueError(
-                f"piRL checkpoint provenance {field} must be {expected!r}, got {actual!r}"
+                "OpenPI checkpoint provenance "
+                f"{field} must be {expected!r}, got {actual!r}"
             )
     task_id = checkpoint_meta.get("task_id")
-    if type(task_id) is not int or task_id not in {0, 5}:
+    if method == "pirl" and (type(task_id) is not int or task_id not in {0, 5}):
         raise ValueError("piRL checkpoint provenance task_id must be 0 or 5")
+    if method == "sft_full_lora_tacfield":
+        if checkpoint_meta.get("dataset") != "datas/tabero_firm":
+            raise ValueError(
+                "Tabero SFT checkpoint provenance dataset must be 'datas/tabero_firm'."
+            )
+        if checkpoint_meta.get("training_precision") != "fp32":
+            raise ValueError(
+                "Tabero SFT checkpoint provenance training_precision must be 'fp32'."
+            )
     global_step = checkpoint_meta.get("global_step")
     if type(global_step) is not int or global_step <= 0:
-        raise ValueError("piRL checkpoint provenance global_step must be positive")
+        raise ValueError("OpenPI checkpoint provenance global_step must be positive")
     for field in ("step", "target_global_step"):
         if checkpoint_meta.get(field) != global_step:
             raise ValueError(
-                f"piRL checkpoint provenance {field} must equal global_step {global_step}"
+                "OpenPI checkpoint provenance "
+                f"{field} must equal global_step {global_step}"
             )
-    if lora_target == "action_expert":
+    if method == "pirl" and lora_target == "action_expert":
         validate_pirl_action_expert_delta(output_model, base_checkpoint)
     safe_metadata = _json_safe(dict(checkpoint_meta))
     return {
@@ -350,6 +446,7 @@ def _build_export_metadata(
         "base_model_sha256": _sha256(base_checkpoint),
         "source_ckpt_metadata": safe_metadata,
         "format": "t2vla_openpi_pytorch_merged_lora",
+        "method": method,
         "lora_target": lora_target,
         "task_id": task_id,
         "global_step": global_step,
@@ -361,6 +458,10 @@ def _build_export_metadata(
             else (adapter_dirs if adapter_dirs else None)
         ),
         "adapter_dirs": adapter_dirs,
+        "dataset": checkpoint_meta.get("dataset"),
+        "training_precision": checkpoint_meta.get("training_precision"),
+        "export_precision": "bf16" if method == "sft_full_lora_tacfield" else None,
+        "tactile_tcn_initialization": checkpoint_meta.get("tactile_tcn_initialization"),
     }
 
 
@@ -411,6 +512,8 @@ def export_checkpoint(
     checkpoint_meta = _checkpoint_metadata(checkpoint)
     is_trainable_checkpoint = checkpoint_meta.get("format") == "trainable_weights"
     state_dict = _normalize_state_dict_keys(_extract_state_dict(checkpoint))
+    if is_trainable_checkpoint:
+        _validate_trainable_checkpoint_keys(model, state_dict)
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
     print(
         "Loaded RLinf checkpoint with "
@@ -446,14 +549,43 @@ def export_checkpoint(
 
     for lora_spec in lora_specs:
         lora_spec.assign_module(lora_spec.module.merge_and_unload())
-    model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
+    is_tabero_sft = checkpoint_meta.get("method") == "sft_full_lora_tacfield"
+    if not is_tabero_sft:
+        model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
     model_path = output_path / "model.safetensors"
     _save_filtered_safetensors(
         model,
         str(model_path),
         base_model_path=str(model_cfg.model_path),
+        allowed_extra_prefixes=("tactile_prefix_encoder.",) if is_tabero_sft else (),
+        output_dtype=torch.bfloat16 if is_tabero_sft else None,
     )
+    if is_tabero_sft:
+        with safe_open(model_path, framework="pt", device="cpu") as exported:
+            tensor_count = len(exported.keys())
+            dtypes = {
+                str(exported.get_slice(key).get_dtype()) for key in exported.keys()
+            }
+        if tensor_count != 793 or dtypes != {"BF16"}:
+            raise ValueError(
+                "Tabero SFT export must contain exactly 793 BF16 tensors; "
+                f"got count={tensor_count}, dtypes={sorted(dtypes)}"
+            )
+        reference_model_path = model_cfg.get("export_reference_model_path")
+        if reference_model_path is None:
+            raise ValueError(
+                "Tabero SFT export requires actor.model.export_reference_model_path."
+            )
+        _validate_reference_schema(model_path, reference_model_path)
     _copy_assets(str(model_cfg.model_path), str(output_path))
+    if is_tabero_sft:
+        norm_stats_path = model_cfg.get("openpi_data", {}).get("norm_stats_path")
+        if norm_stats_path is None:
+            raise ValueError("Tabero SFT export requires openpi_data.norm_stats_path.")
+        norm_asset_id = model_cfg.get(
+            "export_norm_asset_id", "NathanWu7/tabero_object_25"
+        )
+        _copy_norm_stats(norm_stats_path, output_path, str(norm_asset_id))
 
     model_config = getattr(model, "config", None)
     if dataclasses.is_dataclass(model_config):

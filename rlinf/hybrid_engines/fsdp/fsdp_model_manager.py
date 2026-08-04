@@ -287,6 +287,36 @@ class FSDPModelManager:
         # persist buffers' names are also recorded, which will be used for weight syncing.
         self.trainable_param_names = self._collect_trainable_param_names(module)
         self.param_names_need_sync = collect_param_names_need_sync(module)
+        trainable_numel = sum(
+            parameter.numel()
+            for parameter in module.parameters()
+            if parameter.requires_grad
+        )
+        frozen_numel = sum(
+            parameter.numel()
+            for parameter in module.parameters()
+            if not parameter.requires_grad
+        )
+        parameter_dtypes = {}
+        for parameter in module.parameters():
+            dtype = str(parameter.dtype)
+            parameter_dtypes[dtype] = parameter_dtypes.get(dtype, 0) + 1
+        mixed_precision = self._cfg.fsdp_config.mixed_precision
+        self._logger.info(
+            "[FSDP] precision audit: model=%s param=%s reduce=%s buffer=%s "
+            "amp_enabled=%s grad_scaler_enabled=%s trainable_tensors=%d "
+            "trainable_numel=%d frozen_numel=%d parameter_tensor_dtypes=%s",
+            self._cfg.model.precision,
+            mixed_precision.param_dtype,
+            mixed_precision.reduce_dtype,
+            mixed_precision.buffer_dtype,
+            self._cfg.fsdp_config.amp_autocast.enabled,
+            self._cfg.fsdp_config.grad_scaler.enabled,
+            len(self.trainable_param_names),
+            trainable_numel,
+            frozen_numel,
+            parameter_dtypes,
+        )
 
         # build model, optimizer, lr_scheduler, grad_scaler
         self.model = self._strategy.wrap_model(

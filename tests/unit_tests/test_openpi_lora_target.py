@@ -136,6 +136,40 @@ def test_apply_openpi_both_lora_wraps_vlm_and_action_expert_only():
     )
 
 
+def test_apply_openpi_both_lora_can_train_tcn_without_unfreezing_base():
+    model = DummyOpenPI()
+    cfg = _cfg("both")
+    cfg.extra_trainable_modules = ["tactile_prefix_encoder"]
+
+    _apply_openpi_lora(model, cfg)
+
+    trainable = {
+        name for name, parameter in model.named_parameters() if parameter.requires_grad
+    }
+    assert any(
+        name.startswith("paligemma_with_expert.paligemma") and "lora_" in name
+        for name in trainable
+    )
+    assert any(
+        name.startswith("paligemma_with_expert.gemma_expert.model") and "lora_" in name
+        for name in trainable
+    )
+    assert {
+        "tactile_prefix_encoder.weight",
+        "tactile_prefix_encoder.bias",
+    } <= trainable
+    assert not any(name.startswith("action_in_proj.") for name in trainable)
+
+
+def test_apply_openpi_lora_rejects_unknown_extra_trainable_module():
+    model = DummyOpenPI()
+    cfg = _cfg("both")
+    cfg.extra_trainable_modules = ["missing_tcn"]
+
+    with pytest.raises(ValueError, match="missing_tcn.*not found"):
+        _apply_openpi_lora(model, cfg)
+
+
 def test_tabero_peft_config_uses_action_expert_lora_only():
     path = CONFIG_DIR / "isaaclab_pi0_peft_lora_tacfield_tabero.yaml"
     cfg = OmegaConf.load(path)

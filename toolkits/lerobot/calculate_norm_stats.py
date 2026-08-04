@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from pathlib import Path
+
 import numpy as np
 import openpi.models.model as _model
 import openpi.shared.normalize as normalize
@@ -106,6 +108,7 @@ def create_rlds_dataloader(
 def main(
     config_name: str,
     repo_id: str,
+    output_dir: str | None = None,
 ):
     dataset_root = resolve_lerobot_dataset_root(repo_id)
     if not (dataset_root / "meta" / "info.json").is_file():
@@ -143,7 +146,11 @@ def main(
 
     norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
 
-    output_path = config.assets_dirs / data_config.repo_id
+    output_path = (
+        Path(output_dir).expanduser().resolve()
+        if output_dir is not None
+        else config.assets_dirs / data_config.repo_id
+    )
     print(f"Writing stats to: {output_path}")
     normalize.save(output_path, norm_stats)
 

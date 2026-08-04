@@ -106,7 +106,9 @@ def test_rlt_only_sft_skips_vla_path_and_backpropagates_only_rlt():
     assert output["loss"] is output["rlt_loss"]
     torch.testing.assert_close(model.rlt_module.last_mask, mask)
     assert model.rlt_module.scale.grad is not None
-    assert all(parameter.grad is None for parameter in model.frozen_backbone.parameters())
+    assert all(
+        parameter.grad is None for parameter in model.frozen_backbone.parameters()
+    )
 
 
 def test_rlt_only_sft_preserves_tactile_field_during_device_move():
@@ -131,9 +133,7 @@ def test_rlt_only_sft_preserves_tactile_field_during_device_move():
 
     def extract_prefix(self, moved_observation, *, train):
         assert train is True
-        captured["tactile_prefix"] = getattr(
-            moved_observation, "tactile_prefix", None
-        )
+        captured["tactile_prefix"] = getattr(moved_observation, "tactile_prefix", None)
         return torch.zeros(2, 3, 4), torch.ones(2, 3, dtype=torch.bool)
 
     model._extract_rlt_prefix_embeddings = MethodType(extract_prefix, model)
@@ -142,6 +142,40 @@ def test_rlt_only_sft_preserves_tactile_field_during_device_move():
     model.sft_forward(data=(observation, torch.zeros(2, 1)))
 
     torch.testing.assert_close(captured["tactile_prefix"], tactile)
+
+
+def test_non_rlt_sft_routes_tactile_prefix_through_trainable_encoder():
+    config = SimpleNamespace(
+        use_rlt=False,
+        rlt_train_module_only=False,
+        action_chunk=50,
+        action_env_dim=13,
+    )
+    model = _bare_model(config)
+    model.anchor = nn.Parameter(torch.zeros(()))
+    model.tactile_prefix_encoder = nn.Linear(1, 1, bias=False)
+    tactile = torch.ones(2, 1, 1)
+    observation = openpi_model.Observation(
+        images={},
+        image_masks={},
+        state=torch.zeros(2, 32),
+        tokenized_prompt=torch.ones(2, 4, dtype=torch.long),
+        tokenized_prompt_mask=torch.ones(2, 4, dtype=torch.bool),
+    )
+    object.__setattr__(observation, "tactile_prefix", tactile)
+
+    def prefix_forward(self, moved_observation, actions):
+        encoded = self.tactile_prefix_encoder(moved_observation.tactile_prefix)
+        return encoded.square(), torch.empty(0), torch.empty(0)
+
+    model._sft_forward_with_rlt_prefix = MethodType(prefix_forward, model)
+    model.gradient_checkpointing_disable = MethodType(lambda self: None, model)
+
+    loss = model.sft_forward(data=(observation, torch.zeros(2, 1, 1)))
+    loss.backward()
+
+    assert model.tactile_prefix_encoder.weight.grad is not None
+    assert model.tactile_prefix_encoder.weight.grad.abs().max().item() > 0
 
 
 def test_rlt_prefix_cache_passes_tactile_prefix_to_backbone():
@@ -286,9 +320,11 @@ def test_openpi_sft_dataloader_preserves_tactile_prefix():
             return "data-config"
 
     loader = fsdp_vla_sft_worker._OpenPiTactileDataLoader(_Delegate())
-    observation, loaded_actions = next(iter(loader))
+    payload = next(iter(loader))
 
     assert loader.data_config() == "data-config"
     assert loader._data_loader is _Delegate._data_loader
-    torch.testing.assert_close(observation.tactile_prefix, tactile)
-    torch.testing.assert_close(loaded_actions, actions)
+    assert set(payload) == {"observation", "actions", "tactile_prefix"}
+    assert not hasattr(payload["observation"], "tactile_prefix")
+    torch.testing.assert_close(payload["tactile_prefix"], tactile)
+    torch.testing.assert_close(payload["actions"], actions)

@@ -13,11 +13,49 @@
 # limitations under the License.
 # openpi model configs
 
+import logging
 import os
 import pathlib
 
 import torch
 from omegaconf import DictConfig
+
+_TIED_STATE_DICT_MISSING_KEYS = {
+    # This is a PyTorch tied-weight alias. The canonical 777/793 tensor OpenPI
+    # safetensors schemas intentionally store only the owning embedding tensor.
+    "paligemma_with_expert.paligemma.model.language_model.embed_tokens.weight",
+}
+
+
+def _validate_checkpoint_load_result(load_result, allowed_missing_prefixes) -> None:
+    """Validate an intentionally non-strict OpenPI checkpoint load."""
+    allowed_prefixes = tuple(allowed_missing_prefixes or ())
+    disallowed_missing = [
+        key
+        for key in load_result.missing_keys
+        if key not in _TIED_STATE_DICT_MISSING_KEYS
+        and not any(key.startswith(prefix) for prefix in allowed_prefixes)
+    ]
+    if disallowed_missing or load_result.unexpected_keys:
+        raise RuntimeError(
+            "OpenPI checkpoint schema mismatch: "
+            f"missing={disallowed_missing[:20]}, "
+            f"unexpected={load_result.unexpected_keys[:20]}"
+        )
+
+
+def _apply_explicit_model_dtype(model, torch_dtype) -> None:
+    """Honor an explicit actor precision without changing legacy null behavior."""
+    if torch_dtype is None:
+        model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
+        return
+    if torch_dtype not in {torch.float32, torch.bfloat16, torch.float16}:
+        raise ValueError(f"Unsupported OpenPI model dtype: {torch_dtype}.")
+    model.to(dtype=torch_dtype)
+    if torch_dtype == torch.float32:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.set_float32_matmul_precision("highest")
 
 
 def _prepare_stage2_feature_model(model, actor_model_config) -> None:
@@ -79,11 +117,11 @@ def get_model(cfg: DictConfig, torch_dtype=None):
     if os.path.exists(full_weights_path):
         # Direct checkpoint directory
         model_state_dict = torch.load(full_weights_path, map_location="cpu")
-        model.load_state_dict(model_state_dict, strict=False)
+        load_result = model.load_state_dict(model_state_dict, strict=False)
     elif os.path.exists(actor_full_weights_path):
         # Checkpoint directory from runner
         model_state_dict = torch.load(actor_full_weights_path, map_location="cpu")
-        model.load_state_dict(model_state_dict, strict=False)
+        load_result = model.load_state_dict(model_state_dict, strict=False)
     else:
         # Original model directory with safetensors files
         weight_paths = sorted(glob.glob(os.path.join(checkpoint_dir, "*.safetensors")))
@@ -93,14 +131,31 @@ def get_model(cfg: DictConfig, torch_dtype=None):
         for weight_path in weight_paths:
             state_dict = safetensors.torch.load_file(weight_path, device="cpu")
             all_state_dict.update(state_dict)
-        model.load_state_dict(all_state_dict, strict=False)
+        load_result = model.load_state_dict(all_state_dict, strict=False)
+
+    allowed_missing_prefixes = cfg.get("checkpoint_load_allowed_missing_prefixes", None)
+    if allowed_missing_prefixes is not None:
+        _validate_checkpoint_load_result(load_result, allowed_missing_prefixes)
 
     _prepare_stage2_feature_model(model, actor_model_config)
 
     if actor_model_config.rlt_train_module_only:
         model.freeze_non_rlt_parameters()
 
-    model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
+    _apply_explicit_model_dtype(model, torch_dtype)
+    dtype_counts = {}
+    for parameter in model.parameters():
+        dtype_counts[str(parameter.dtype)] = (
+            dtype_counts.get(str(parameter.dtype), 0) + 1
+        )
+    logging.info(
+        "OpenPI dtype audit: requested=%s parameter_tensor_counts=%s "
+        "tf32_matmul=%s tf32_cudnn=%s",
+        torch_dtype,
+        dtype_counts,
+        torch.backends.cuda.matmul.allow_tf32,
+        torch.backends.cudnn.allow_tf32,
+    )
     # fsdp replace
     # model.paligemma_with_expert.replace_gemma_decoder_layers()
     # load data stats

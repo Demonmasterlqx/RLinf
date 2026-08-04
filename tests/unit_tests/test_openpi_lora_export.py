@@ -147,6 +147,69 @@ def test_filtered_export_preserves_fixed_base_schema_dtypes(tmp_path):
         }
 
 
+def test_tabero_sft_filtered_export_keeps_tcn_and_casts_all_bf16(tmp_path):
+    model = nn.Module()
+    model.base = nn.Linear(2, 2)
+    model.tactile_prefix_encoder = nn.Linear(2, 3)
+    base = tmp_path / "base"
+    base.mkdir()
+    save_file(
+        {
+            key: value.detach().to(torch.float32)
+            for key, value in model.base.state_dict(prefix="base.").items()
+        },
+        base / "model.safetensors",
+    )
+    output = tmp_path / "model.safetensors"
+    exporter._save_filtered_safetensors(
+        model,
+        str(output),
+        base_model_path=str(base),
+        allowed_extra_prefixes=("tactile_prefix_encoder.",),
+        output_dtype=torch.bfloat16,
+    )
+    reference = tmp_path / "reference"
+    reference.mkdir()
+    save_file(
+        {
+            key: value.detach().to(torch.bfloat16)
+            for key, value in model.state_dict().items()
+        },
+        reference / "model.safetensors",
+    )
+
+    exporter._validate_reference_schema(output, reference)
+    with safe_open(output, framework="pt", device="cpu") as handle:
+        assert set(handle.keys()) == set(model.state_dict())
+        assert {str(handle.get_slice(key).get_dtype()) for key in handle.keys()} == {
+            "BF16"
+        }
+
+
+def test_trainable_sidecar_rejects_frozen_base_or_missing_tcn():
+    model = nn.Module()
+    model.base = nn.Linear(2, 2)
+    model.tactile_prefix_encoder = nn.Linear(2, 2)
+    for parameter in model.base.parameters():
+        parameter.requires_grad = False
+    valid = {
+        name: parameter.detach().clone()
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    }
+    exporter._validate_trainable_checkpoint_keys(model, valid)
+
+    missing = dict(valid)
+    missing.pop("tactile_prefix_encoder.bias")
+    with pytest.raises(RuntimeError, match="missing=.*tactile_prefix_encoder.bias"):
+        exporter._validate_trainable_checkpoint_keys(model, missing)
+
+    unexpected = dict(valid)
+    unexpected["base.weight"] = model.base.weight.detach().clone()
+    with pytest.raises(RuntimeError, match="unexpected=.*base.weight"):
+        exporter._validate_trainable_checkpoint_keys(model, unexpected)
+
+
 def test_export_metadata_carries_verified_fsdp_provenance_and_hashes(tmp_path):
     inputs = _export_metadata_fixture(tmp_path)
 

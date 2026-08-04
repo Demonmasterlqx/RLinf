@@ -339,6 +339,23 @@ def _enable_value_head_if_present(model) -> None:
             param.requires_grad = True
 
 
+def _enable_extra_trainable_modules(model, module_names) -> None:
+    """Enable explicitly requested non-LoRA modules after base freezing."""
+    for module_name in module_names or ():
+        if not isinstance(module_name, str) or not module_name:
+            raise ValueError(
+                "extra_trainable_modules entries must be non-empty module names."
+            )
+        try:
+            module = model.get_submodule(module_name)
+        except AttributeError as error:
+            raise ValueError(
+                f"OpenPI extra trainable module {module_name!r} was not found."
+            ) from error
+        for param in module.parameters():
+            param.requires_grad = True
+
+
 def _apply_openpi_lora(model, cfg):
     from peft import PeftModel, get_peft_model
 
@@ -371,6 +388,7 @@ def _apply_openpi_lora(model, cfg):
         tag_vlm_subtree(target_module, True)
 
     _enable_value_head_if_present(model)
+    _enable_extra_trainable_modules(model, cfg.get("extra_trainable_modules", ()))
     return model
 
 

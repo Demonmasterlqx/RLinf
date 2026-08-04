@@ -1,0 +1,114 @@
+defaults:
+  - model/pi0@actor.model
+  - hybrid_engines/fsdp@actor.fsdp_config
+  - override hydra/job_logging: stdout
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor: all
+
+runner:
+  task_type: sft
+  logger:
+    log_path: ${oc.env:TABERO_FIRM_SMOKE_RUN_DIR,/data/home/sim6g/code/tabero/results/tabero_firm_pi0_base_full_lora_fp32_smoke}
+    project_name: tabero-rlinf
+    experiment_name: ${oc.env:TABERO_FIRM_SMOKE_RUN_NAME,tabero_firm_pi0_base_full_lora_fp32_smoke}
+    logger_backends: [tensorboard, wandb]
+  max_epochs: -1
+  max_steps: 2
+  val_check_interval: -1
+  save_interval: 1
+
+data:
+  train_data_paths:
+    - dataset_path: /data/home/sim6g/code/tabero/datas/tabero_firm
+      weight: 1.0
+
+actor:
+  group_name: ActorGroup
+  training_backend: fsdp
+  micro_batch_size: 1
+  global_batch_size: 8
+  seed: 0
+
+  model:
+    model_type: openpi
+    model_path: /data/home/sim6g/code/tabero/models/pi0_base
+    precision: fp32
+    is_lora: true
+    lora_rank: 32
+    lora_path: null
+    lora_target: both
+    freeze_non_lora: true
+    extra_trainable_modules: [tactile_prefix_encoder]
+    checkpoint_load_allowed_missing_prefixes: [tactile_prefix_encoder.]
+    export_reference_model_path: /data/home/sim6g/code/tabero/models/pi0_lora_tacfield_tabero_safetensors
+    export_norm_asset_id: NathanWu7/tabero_object_25
+    num_action_chunks: 50
+    action_dim: 13
+    add_value_head: false
+    num_steps: 10
+
+    openpi_data:
+      norm_stats_path: ${oc.env:TABERO_FIRM_NORM_STATS}
+
+    openpi:
+      config_name: pi0_lora_tacfield_tabero
+      num_images_in_input: 2
+      train_expert_only: false
+      action_chunk: 50
+      action_env_dim: 13
+      num_steps: 10
+      tactile_loss_weight: 0.1
+
+  optim:
+    lr: 2.5e-5
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-8
+    weight_decay: 1.0e-10
+    clip_grad: 1.0
+    total_training_steps: 2
+    lr_warmup_steps: 0
+    lr_scheduler: constant
+
+  fsdp_config:
+    strategy: fsdp
+    sharding_strategy: full_shard
+    use_orig_params: false
+    cpu_offload: false
+    gradient_checkpointing: false
+    save_full_model_weights: false
+    save_trainable_model_weights: true
+    checkpoint_format: none
+    trainable_checkpoint_metadata:
+      method: sft_full_lora_tacfield
+      dataset: datas/tabero_firm
+      training_precision: fp32
+      tactile_tcn_initialization: random
+      training_config: tabero_firm_sft_full_lora_tacfield_fp32_smoke
+      target_global_step: 2
+    mixed_precision:
+      param_dtype: fp32
+      reduce_dtype: fp32
+      buffer_dtype: fp32
+    amp_autocast:
+      enabled: false
+      precision: bf16
+    grad_scaler:
+      enabled: false
+
+reward:
+  use_reward_model: false
+
+critic:
+  use_critic_model: false
