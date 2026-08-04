@@ -22,7 +22,7 @@ from rlinf.workers.env.env_worker import (
 )
 
 
-def _matching_step_metrics(*, success: bool = True):
+def _matching_step_metrics(*, success: bool = True, failure_termination: bool = False):
     rewards = torch.zeros(2, 10)
     terminations = torch.zeros(2, 10, dtype=torch.bool)
     truncations = torch.zeros(2, 10, dtype=torch.bool)
@@ -31,12 +31,17 @@ def _matching_step_metrics(*, success: bool = True):
         terminations[0, 3] = True
     else:
         truncations[0, 9] = True
-    truncations[1, 9] = True
+    if failure_termination:
+        terminations[1, 5] = True
+    else:
+        truncations[1, 9] = True
 
     audit = summarize_dsrl_chunk_rewards(rewards, terminations, truncations)
     episode_success = torch.tensor([float(success), 0.0])
     episode_returns = episode_success.clone()
-    episode_lengths = torch.tensor([4.0 if success else 10.0, 10.0])
+    episode_lengths = torch.tensor(
+        [4.0 if success else 10.0, 6.0 if failure_termination else 10.0]
+    )
     env_metrics = {
         "success_once": [episode_success],
         "return": [episode_returns],
@@ -44,8 +49,8 @@ def _matching_step_metrics(*, success: bool = True):
         "reward": [episode_returns / episode_lengths],
         "reward_sum": [episode_returns],
         "terminal_step_reward": [episode_returns],
-        "termination": [torch.tensor([success, False])],
-        "truncation": [torch.tensor([not success, True])],
+        "termination": [torch.tensor([success, failure_termination])],
+        "truncation": [torch.tensor([not success, not failure_termination])],
         "condition_id": [torch.zeros(2, dtype=torch.int64)],
         "firm_success_once": [episode_success],
         "firm_return": [episode_returns],
@@ -151,6 +156,22 @@ def test_exact_env_aggregation_uses_episode_records_and_reward_sufficient_stats(
     assert mismatches == ()
 
 
+def test_reward_comparison_accepts_matching_failure_termination():
+    env_metrics, replay_metrics = _matching_step_metrics(failure_termination=True)
+    exact = aggregate_tabero_dsrl_env_metrics([env_metrics])
+
+    audit_metrics, mismatches = compare_tabero_dsrl_reward_audits(exact, replay_metrics)
+
+    assert exact["firm_success_count"] == 1
+    assert exact["termination_count"] == 2
+    assert exact["reward_audit/termination_without_positive_reward_count"] == 1
+    assert audit_metrics == {
+        "audit/dsrl_reward_match": 1.0,
+        "audit/dsrl_reward_mismatch_count": 0.0,
+    }
+    assert mismatches == ()
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
@@ -158,6 +179,11 @@ def test_exact_env_aggregation_uses_episode_records_and_reward_sufficient_stats(
         ("nonzero_primitive_reward_count", 2.0, "count"),
         ("post_done_nonzero_reward_count", 1.0, "must be zero"),
         ("nonfinite_reward_count", 1.0, "must be zero"),
+        (
+            "termination_without_positive_reward_count",
+            1.0,
+            "failure termination count",
+        ),
     ],
 )
 def test_reward_comparison_rejects_lost_duplicate_or_invalid_replay_rewards(
@@ -196,6 +222,19 @@ def _audit_runner(*, min_buffer_size: int) -> EmbodiedRunner:
 
 def test_runner_reward_gate_passes_matching_positive_firm_step():
     env_metrics, replay_metrics = _matching_step_metrics()
+    runner = _audit_runner(min_buffer_size=1)
+
+    audit = runner._validate_tabero_dsrl_reward_step(
+        step=1,
+        env_results=[env_metrics],
+        actor_training_metrics=[replay_metrics],
+    )
+
+    assert audit["audit/dsrl_reward_match"] == 1
+
+
+def test_runner_reward_gate_passes_matching_failure_termination():
+    env_metrics, replay_metrics = _matching_step_metrics(failure_termination=True)
     runner = _audit_runner(min_buffer_size=1)
 
     audit = runner._validate_tabero_dsrl_reward_step(

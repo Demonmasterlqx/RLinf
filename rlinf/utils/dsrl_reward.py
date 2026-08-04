@@ -240,15 +240,20 @@ def compare_tabero_dsrl_reward_audits(
     episode_truncation_count = read(env_metrics, "truncation_count")
 
     equal(
-        "Firm success/reward/termination count",
+        "Firm success/reward count",
         (
             firm_success_count,
-            env_audit["termination_count"],
             env_audit["nonzero_primitive_reward_count"],
             env_audit["nonzero_macro_reward_count"],
-            replay_audit["termination_count"],
             replay_audit["nonzero_primitive_reward_count"],
             replay_audit["nonzero_macro_reward_count"],
+        ),
+    )
+    equal(
+        "env/replay failure termination count",
+        (
+            env_audit["termination_without_positive_reward_count"],
+            replay_audit["termination_without_positive_reward_count"],
         ),
     )
     equal(
@@ -315,11 +320,37 @@ def compare_tabero_dsrl_reward_audits(
         (env_audit["reward_max"], replay_audit["reward_max"]),
     )
 
+    # IsaacLab terminations include both task success and legitimate failure
+    # boundaries such as ``object_1_dropped``.  A failure termination carries
+    # no positive reward, but it must still be preserved as a replay ``done``.
+    # Keep this distinction explicit instead of treating every termination as
+    # a success reward.
+    for source_name, audit in (("env", env_audit), ("replay", replay_audit)):
+        termination_count = audit["termination_count"]
+        positive_reward_count = audit["nonzero_primitive_reward_count"]
+        failure_termination_count = audit["termination_without_positive_reward_count"]
+        if (
+            termination_count is not None
+            and positive_reward_count is not None
+            and failure_termination_count is not None
+            and not math.isclose(
+                termination_count,
+                positive_reward_count + failure_termination_count,
+                rel_tol=0.0,
+                abs_tol=absolute_tolerance,
+            )
+        ):
+            mismatches.append(
+                f"{source_name} termination count does not equal positive-reward "
+                "plus failure termination count: "
+                f"{termination_count} != {positive_reward_count} + "
+                f"{failure_termination_count}"
+            )
+
     zero_fields = (
         "nonfinite_reward_count",
         "post_done_nonzero_reward_count",
         "reward_without_termination_count",
-        "termination_without_positive_reward_count",
         "termination_truncation_overlap_count",
     )
     for source_name, audit in (("env", env_audit), ("replay", replay_audit)):
