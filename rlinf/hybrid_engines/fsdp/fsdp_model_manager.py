@@ -309,14 +309,23 @@ class FSDPModelManager:
             if not parameter.requires_grad
         )
         parameter_dtypes = {}
+        trainable_parameter_dtypes = {}
+        frozen_parameter_dtypes = {}
         for parameter in module.parameters():
             dtype = str(parameter.dtype)
             parameter_dtypes[dtype] = parameter_dtypes.get(dtype, 0) + 1
+            target = (
+                trainable_parameter_dtypes
+                if parameter.requires_grad
+                else frozen_parameter_dtypes
+            )
+            target[dtype] = target.get(dtype, 0) + 1
         mixed_precision = self._cfg.fsdp_config.mixed_precision
         self._logger.info(
             "[FSDP] precision audit: model=%s param=%s reduce=%s buffer=%s "
             "amp_enabled=%s grad_scaler_enabled=%s trainable_tensors=%d "
-            "trainable_numel=%d frozen_numel=%d parameter_tensor_dtypes=%s",
+            "trainable_numel=%d frozen_numel=%d parameter_tensor_dtypes=%s "
+            "trainable_parameter_dtypes=%s frozen_parameter_dtypes=%s",
             self._cfg.model.precision,
             mixed_precision.param_dtype,
             mixed_precision.reduce_dtype,
@@ -327,6 +336,8 @@ class FSDPModelManager:
             trainable_numel,
             frozen_numel,
             parameter_dtypes,
+            trainable_parameter_dtypes,
+            frozen_parameter_dtypes,
         )
 
         # build model, optimizer, lr_scheduler, grad_scaler

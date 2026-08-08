@@ -15,12 +15,14 @@
 from pathlib import Path
 
 import pytest
+import torch
 from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 from torch import nn
 
 from rlinf.models import (
     _apply_openpi_lora,
+    _apply_trainability_aware_precision,
     _get_openpi_lora_target_module,
 )
 
@@ -43,6 +45,9 @@ class DummyPaligemma(nn.Module):
     def __init__(self):
         super().__init__()
         self.q_proj = nn.Linear(4, 4)
+        self.model = nn.Module()
+        self.model.vision_tower = nn.Module()
+        self.model.vision_tower.q_proj = nn.Linear(4, 4)
 
 
 class DummyOpenPI(nn.Module):
@@ -136,6 +141,91 @@ def test_apply_openpi_both_lora_wraps_vlm_and_action_expert_only():
     )
 
 
+def test_apply_openpi_both_lora_supports_target_specific_ranks():
+    model = DummyOpenPI()
+    cfg = _cfg("both")
+    cfg.paligemma_lora_rank = 16
+    cfg.action_expert_lora_rank = 32
+
+    _apply_openpi_lora(model, cfg)
+
+    paligemma_config = model.paligemma_with_expert.paligemma.peft_config["default"]
+    expert_config = model.paligemma_with_expert.gemma_expert.model.peft_config[
+        "default"
+    ]
+    assert paligemma_config.r == 16
+    assert paligemma_config.lora_alpha == 16
+    assert expert_config.r == 32
+    assert expert_config.lora_alpha == 32
+
+
+def test_apply_openpi_both_lora_excludes_and_fully_trains_vision_tower():
+    model = DummyOpenPI()
+    cfg = _cfg("both")
+    cfg.paligemma_lora_exclude_modules = ".*vision_tower.*"
+    cfg.extra_trainable_modules = [
+        "paligemma_with_expert.paligemma.base_model.model.model.vision_tower"
+    ]
+
+    _apply_openpi_lora(model, cfg)
+
+    trainable = {
+        name for name, parameter in model.named_parameters() if parameter.requires_grad
+    }
+    vision_parameters = {
+        name for name, _ in model.named_parameters() if ".vision_tower." in name
+    }
+    assert vision_parameters
+    assert vision_parameters <= trainable
+    assert not any("lora_" in name for name in vision_parameters)
+    assert any(
+        name.startswith("paligemma_with_expert.paligemma")
+        and ".vision_tower." not in name
+        and "lora_" in name
+        for name in trainable
+    )
+    assert any(
+        name.startswith("paligemma_with_expert.gemma_expert.model") and "lora_" in name
+        for name in trainable
+    )
+
+
+def test_apply_openpi_both_lora_keeps_scalar_rank_fallback():
+    model = DummyOpenPI()
+
+    _apply_openpi_lora(model, _cfg("both"))
+
+    assert model.paligemma_with_expert.paligemma.peft_config["default"].r == 2
+    assert model.paligemma_with_expert.gemma_expert.model.peft_config["default"].r == 2
+
+
+def test_apply_openpi_both_lora_without_global_freeze_trains_outer_modules():
+    model = DummyOpenPI()
+    cfg = _cfg("both")
+    cfg.freeze_non_lora = False
+    cfg.extra_trainable_modules = ["tactile_prefix_encoder"]
+
+    _apply_openpi_lora(model, cfg)
+
+    trainable = {
+        name for name, parameter in model.named_parameters() if parameter.requires_grad
+    }
+    assert {
+        "action_in_proj.weight",
+        "action_in_proj.bias",
+        "tactile_prefix_encoder.weight",
+        "tactile_prefix_encoder.bias",
+    } <= trainable
+    assert any(
+        name.startswith("paligemma_with_expert.paligemma") and "lora_" in name
+        for name in trainable
+    )
+    assert any(
+        name.startswith("paligemma_with_expert.gemma_expert.model") and "lora_" in name
+        for name in trainable
+    )
+
+
 def test_apply_openpi_both_lora_can_train_tcn_without_unfreezing_base():
     model = DummyOpenPI()
     cfg = _cfg("both")
@@ -159,6 +249,37 @@ def test_apply_openpi_both_lora_can_train_tcn_without_unfreezing_base():
         "tactile_prefix_encoder.bias",
     } <= trainable
     assert not any(name.startswith("action_in_proj.") for name in trainable)
+
+
+def test_trainability_aware_precision_keeps_trainables_fp32_and_freezes_bf16():
+    model = DummyOpenPI()
+    cfg = _cfg("both")
+    cfg.extra_trainable_modules = ["tactile_prefix_encoder"]
+    cfg.frozen_parameter_precision = "bf16"
+    cfg.trainable_parameter_precision = "fp32"
+
+    _apply_openpi_lora(model, cfg)
+    _apply_trainability_aware_precision(model, cfg)
+
+    trainable_dtypes = {
+        parameter.dtype for parameter in model.parameters() if parameter.requires_grad
+    }
+    frozen_dtypes = {
+        parameter.dtype
+        for parameter in model.parameters()
+        if not parameter.requires_grad
+    }
+    assert trainable_dtypes == {torch.float32}
+    assert frozen_dtypes == {torch.bfloat16}
+
+
+def test_trainability_aware_precision_requires_both_precision_fields():
+    model = DummyOpenPI()
+    cfg = _cfg("both")
+    cfg.frozen_parameter_precision = "bf16"
+
+    with pytest.raises(ValueError, match="must be configured together"):
+        _apply_trainability_aware_precision(model, cfg)
 
 
 def test_apply_openpi_lora_rejects_unknown_extra_trainable_module():

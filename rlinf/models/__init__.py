@@ -271,12 +271,31 @@ def _register_builtin_models():
 _register_builtin_models()
 
 
-def _build_default_lora_config(cfg):
+def _get_openpi_lora_rank(cfg, lora_target: str | None = None) -> int:
+    """Resolve a target-specific OpenPI LoRA rank with scalar fallback."""
+    rank_key = {
+        "paligemma": "paligemma_lora_rank",
+        "action_expert": "action_expert_lora_rank",
+    }.get(lora_target)
+    rank = cfg.get(rank_key) if rank_key is not None else None
+    if rank is None:
+        rank = cfg.lora_rank
+    if isinstance(rank, bool) or not isinstance(rank, int) or rank <= 0:
+        target = lora_target or "default"
+        raise ValueError(f"OpenPI {target} LoRA rank must be a positive integer.")
+    return rank
+
+
+def _build_default_lora_config(cfg, lora_target: str | None = None):
     from peft import LoraConfig
 
+    lora_rank = _get_openpi_lora_rank(cfg, lora_target)
+    exclude_modules = None
+    if lora_target is not None:
+        exclude_modules = cfg.get(f"{lora_target}_lora_exclude_modules")
     return LoraConfig(
-        r=cfg.lora_rank,
-        lora_alpha=cfg.lora_rank,
+        r=lora_rank,
+        lora_alpha=lora_rank,
         lora_dropout=0.0,
         target_modules=[
             "proj",
@@ -296,6 +315,7 @@ def _build_default_lora_config(cfg):
             "down_proj",
             "lm_head",  # llm
         ],
+        exclude_modules=exclude_modules,
         init_lora_weights="gaussian",
     )
 
@@ -356,6 +376,29 @@ def _enable_extra_trainable_modules(model, module_names) -> None:
             param.requires_grad = True
 
 
+def _apply_trainability_aware_precision(model, cfg) -> None:
+    """Store frozen and trainable OpenPI parameters at configured dtypes."""
+    frozen_precision = cfg.get("frozen_parameter_precision")
+    trainable_precision = cfg.get("trainable_parameter_precision")
+    if frozen_precision is None and trainable_precision is None:
+        return
+    if frozen_precision is None or trainable_precision is None:
+        raise ValueError(
+            "frozen_parameter_precision and trainable_parameter_precision "
+            "must be configured together."
+        )
+
+    frozen_dtype = torch_dtype_from_precision(frozen_precision)
+    trainable_dtype = torch_dtype_from_precision(trainable_precision)
+    if frozen_dtype is None or trainable_dtype is None:
+        raise ValueError("OpenPI parameter precision cannot be null.")
+
+    for parameter in model.parameters():
+        target_dtype = trainable_dtype if parameter.requires_grad else frozen_dtype
+        if parameter.is_floating_point() and parameter.dtype != target_dtype:
+            parameter.data = parameter.data.to(dtype=target_dtype)
+
+
 def _apply_openpi_lora(model, cfg):
     from peft import PeftModel, get_peft_model
 
@@ -363,16 +406,21 @@ def _apply_openpi_lora(model, cfg):
     freeze_non_lora = cfg.get(
         "freeze_non_lora", lora_target in ("action_expert", "both")
     )
-    target_modules = _get_openpi_lora_target_modules(model, lora_target)
+    target_names = (
+        ("paligemma", "action_expert") if lora_target == "both" else (lora_target,)
+    )
 
     if freeze_non_lora:
         _freeze_all_parameters(model)
 
     tag_vlm_subtree(model, False)
-    for target_module, assign_target_module in target_modules:
+    for target_name in target_names:
+        target_module, assign_target_module = _get_openpi_lora_target_module(
+            model, target_name
+        )
         if not hasattr(cfg, "lora_path") or cfg.lora_path is None:
             target_module = get_peft_model(
-                target_module, _build_default_lora_config(cfg)
+                target_module, _build_default_lora_config(cfg, target_name)
             )
         else:
             if lora_target == "both":
@@ -435,6 +483,12 @@ def get_model(cfg: DictConfig):
                 )
 
         _enable_value_head_if_present(model)
+
+        if SupportedModel(model_type) in (
+            SupportedModel.OPENPI,
+            SupportedModel.CFG_MODEL,
+        ):
+            _apply_trainability_aware_precision(model, cfg)
 
     if use_dsrl:
         model.freeze_non_dsrl_parameters()

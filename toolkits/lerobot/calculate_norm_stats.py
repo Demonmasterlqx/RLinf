@@ -137,14 +137,22 @@ def main(
             config.num_workers,
         )
 
-    keys = ["state", "actions"]
+    # Keep this aligned with T2-VLA: TacField/TacForce inputs are normalized
+    # when the selected data config actually produces the corresponding key.
+    keys = ["state", "actions", "tactile_prefix", "tactile_suffix"]
     stats = {key: normalize.RunningStats() for key in keys}
 
     for batch in tqdm.tqdm(data_loader, total=num_batches, desc="Computing stats"):
         for key in keys:
+            if key not in batch:
+                continue
             stats[key].update(np.asarray(batch[key]))
 
-    norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
+    norm_stats = {
+        key: running_stats.get_statistics()
+        for key, running_stats in stats.items()
+        if getattr(running_stats, "_count", 0) >= 2
+    }
 
     output_path = (
         Path(output_dir).expanduser().resolve()

@@ -270,3 +270,37 @@ def test_preflight_sidecar_audit_accepts_resume_step_pair(tmp_path):
     assert result["groups"]["vlm_lora"]["changed_tensor_count"] == 1
     assert result["groups"]["action_expert_lora"]["changed_tensor_count"] == 1
     assert result["groups"]["tcn"]["changed_tensor_count"] == 1
+
+
+def test_preflight_sidecar_audit_accepts_explicit_outer_trainables(tmp_path):
+    paths = [tmp_path / "step2.pt", tmp_path / "step4.pt"]
+    names = (
+        "paligemma_with_expert.paligemma.layer.lora_A.weight",
+        "paligemma_with_expert.gemma_expert.model.layer.lora_A.weight",
+        "tactile_prefix_encoder.weight",
+        "action_in_proj.weight",
+    )
+    for index, (path, step) in enumerate(zip(paths, (2, 4), strict=True)):
+        torch.save(
+            {
+                "model": {
+                    name: torch.full((1,), float(index), dtype=torch.float32)
+                    for name in names
+                },
+                "metadata": {
+                    "global_step": step,
+                    "is_final": step == 4,
+                    "parameter_count": len(names),
+                },
+            },
+            path,
+        )
+
+    result = audit(
+        paths[0],
+        paths[1],
+        expected_steps=(2, 4),
+        expect_outer_trainable=True,
+    )
+
+    assert result["groups"]["outer_trainable"]["changed_tensor_count"] == 1

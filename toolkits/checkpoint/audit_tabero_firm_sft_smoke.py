@@ -18,13 +18,14 @@ def _group(name: str) -> str:
         return "vlm_lora"
     if name.startswith("paligemma_with_expert.gemma_expert.model") and "lora_" in name:
         return "action_expert_lora"
-    return "unexpected"
+    return "outer_trainable"
 
 
 def audit(
     step1_path: Path,
     step2_path: Path,
     expected_steps: tuple[int, int] = (1, 2),
+    expect_outer_trainable: bool = False,
 ) -> dict:
     checkpoints = [
         torch.load(path, map_location="cpu", weights_only=False)
@@ -55,8 +56,10 @@ def audit(
             entry["changed_tensor_count"] += 1
         entry["max_abs_change"] = max(entry["max_abs_change"], max_change)
 
-    required = ("vlm_lora", "action_expert_lora", "tcn")
-    if "unexpected" in groups:
+    required = ["vlm_lora", "action_expert_lora", "tcn"]
+    if expect_outer_trainable:
+        required.append("outer_trainable")
+    elif "outer_trainable" in groups:
         raise ValueError(f"Frozen/non-trainable keys leaked into sidecar: {groups}")
     for group in required:
         if groups.get(group, {}).get("changed_tensor_count", 0) <= 0:
@@ -91,12 +94,14 @@ def main() -> None:
     parser.add_argument("--step1", type=Path, required=True)
     parser.add_argument("--step2", type=Path, required=True)
     parser.add_argument("--expected-steps", type=int, nargs=2, default=(1, 2))
+    parser.add_argument("--expect-outer-trainable", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     result = audit(
         args.step1.resolve(),
         args.step2.resolve(),
         expected_steps=tuple(args.expected_steps),
+        expect_outer_trainable=args.expect_outer_trainable,
     )
     args.output.write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result, indent=2))

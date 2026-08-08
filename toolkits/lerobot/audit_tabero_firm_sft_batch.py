@@ -47,6 +47,14 @@ def audit_batch(dataset_path: Path, norm_stats_path: Path) -> dict:
         data_kwargs={"norm_stats_path": str(norm_stats_path)},
     )
     data_config = config.data.create(config.assets_dirs, config.model)
+    norm_stats_keys = sorted(data_config.norm_stats or ())
+    required_norm_stats_keys = {"state", "actions", "tactile_prefix"}
+    missing_norm_stats_keys = sorted(required_norm_stats_keys - set(norm_stats_keys))
+    if missing_norm_stats_keys:
+        raise ValueError(
+            "Firm norm stats are missing required fields: "
+            f"{missing_norm_stats_keys}; available={norm_stats_keys}"
+        )
     dataset = openpi_data_loader.create_torch_dataset(
         data_config, config.model.action_horizon, config.model
     )
@@ -106,6 +114,7 @@ def audit_batch(dataset_path: Path, norm_stats_path: Path) -> dict:
         "action_padding_13_32_all_zero": True,
         "action_horizon": config.model.action_horizon,
         "num_images_in_input": 2,
+        "norm_stats_keys": norm_stats_keys,
     }
 
 
