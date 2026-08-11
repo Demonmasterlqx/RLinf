@@ -111,6 +111,10 @@ class EmbodiedRunner:
         # the step here is GRPO step
         self.global_step = 0
         self._dsrl_consecutive_zero_success_steps = 0
+        actor_model_cfg = self.cfg.get("actor", {}).get("model", {})
+        self._tabero_dsrl_reward_audit_enabled = bool(
+            actor_model_cfg.get("openpi", {}).get("use_dsrl", False)
+        )
 
         # compute `max_steps`
         self.set_max_steps()
@@ -346,6 +350,9 @@ class EmbodiedRunner:
         actor_training_metrics: list[dict],
     ) -> dict[str, float]:
         """Validate env-to-replay reward flow before advancing global step."""
+
+        if not getattr(self, "_tabero_dsrl_reward_audit_enabled", True):
+            return {}
 
         env_results_list = [result for result in env_results if result is not None]
         exact_env_metrics = aggregate_tabero_dsrl_env_metrics(env_results_list)

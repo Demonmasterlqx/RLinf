@@ -209,15 +209,36 @@ class _MetricSink:
         self.records.append((step, dict(metrics)))
 
 
-def _audit_runner(*, min_buffer_size: int) -> EmbodiedRunner:
+def _audit_runner(
+    *, min_buffer_size: int, dsrl_reward_audit_enabled: bool = True
+) -> EmbodiedRunner:
     runner = EmbodiedRunner.__new__(EmbodiedRunner)
     runner.cfg = OmegaConf.create(
         {"algorithm": {"replay_buffer": {"min_buffer_size": min_buffer_size}}}
     )
     runner._dsrl_consecutive_zero_success_steps = 0
+    runner._tabero_dsrl_reward_audit_enabled = dsrl_reward_audit_enabled
     runner.metric_logger = _MetricSink()
     runner.logger = SimpleNamespace(error=lambda _message: None)
     return runner
+
+
+def test_runner_reward_gate_is_disabled_for_non_dsrl_training():
+    env_metrics, _ = _matching_step_metrics()
+    env_metrics["condition_id"] = [torch.full((2,), -1, dtype=torch.int64)]
+    runner = _audit_runner(
+        min_buffer_size=1,
+        dsrl_reward_audit_enabled=False,
+    )
+
+    assert (
+        runner._validate_tabero_dsrl_reward_step(
+            step=0,
+            env_results=[env_metrics],
+            actor_training_metrics=[{}],
+        )
+        == {}
+    )
 
 
 def test_runner_reward_gate_passes_matching_positive_firm_step():
