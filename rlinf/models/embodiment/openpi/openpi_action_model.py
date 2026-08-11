@@ -43,6 +43,44 @@ def _to_numpy(x):
     return np.asarray(x.detach().cpu()) if torch.is_tensor(x) else x
 
 
+def _reduce_openpi_entropy(
+    entropy: torch.Tensor,
+    primitive_loss_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Reduce OpenPI entropy without attributing terminal padding actions."""
+
+    if entropy.ndim != 4:
+        raise ValueError(
+            "OpenPI entropy expected [B, denoise, action_chunk, action_dim]; "
+            f"got {tuple(entropy.shape)}."
+        )
+    if primitive_loss_mask is None:
+        return entropy.mean(dim=(1, 2, 3))[:, None]
+
+    mask = primitive_loss_mask.to(device=entropy.device, dtype=torch.bool)
+    if mask.ndim == 3 and mask.shape[-1] == 1:
+        mask = mask.squeeze(-1)
+    expected_shape = (entropy.shape[0], entropy.shape[2])
+    if tuple(mask.shape) != expected_shape:
+        raise ValueError(
+            "OpenPI primitive entropy mask expected shape "
+            f"{expected_shape}, got {tuple(mask.shape)}."
+        )
+    if mask.all():
+        return entropy.mean(dim=(1, 2, 3))[:, None]
+
+    expanded_mask = mask[:, None, :, None].expand_as(entropy)
+    masked_entropy = torch.where(expanded_mask, entropy, torch.zeros_like(entropy)).sum(
+        dim=(1, 2, 3)
+    )
+    valid_count = expanded_mask.sum(dim=(1, 2, 3))
+    return torch.where(
+        valid_count > 0,
+        masked_entropy / valid_count.clamp(min=1),
+        masked_entropy * 0.0,
+    )[:, None]
+
+
 def _uses_expert_future_tactile(config: Any) -> bool:
     """Return whether actions contain control followed by future force slots."""
     tactile_type = str(getattr(config, "tactile_type", "no")).lower()
@@ -1182,9 +1220,10 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         ]
         # post process
         log_probs = log_probs.mean(dim=1)
-        entropy = entropy.mean(dim=[1, 2, 3], keepdim=False)[
-            :, None
-        ]  # [:,None] to align with loss-mask shape
+        entropy = _reduce_openpi_entropy(
+            entropy,
+            primitive_loss_mask=kwargs.get("primitive_loss_mask"),
+        )
         value_t = value_t.mean(dim=-1, keepdim=False)
         return {
             "logprobs": log_probs,

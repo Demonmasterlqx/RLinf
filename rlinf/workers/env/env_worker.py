@@ -711,23 +711,38 @@ class EnvWorker(Worker):
             infos = infos_list[-1] if infos_list else None
         chunk_dones = torch.logical_or(chunk_terminations, chunk_truncations)
         final_obs = self._build_chunk_final_obs(obs_list, infos_list)
-
-        current_dones = chunk_dones.any(dim=1)  # [num_envs] bool
-        if self.cfg.env.eval.auto_reset:
-            newly_done = current_dones
+        tabero_episode_records = (
+            infos.pop(_TABERO_CHUNK_EPISODE_RECORDS_KEY, None)
+            if isinstance(infos, dict)
+            else None
+        )
+        if tabero_episode_records is not None:
+            env_info.update(
+                tabero_chunk_episode_records_to_env_info(tabero_episode_records)
+            )
         else:
-            prev = self.eval_prev_done[stage_id].to(current_dones.device)
-            newly_done = current_dones & ~prev
-            self.eval_prev_done[stage_id] = prev | current_dones
+            current_dones = chunk_dones.any(dim=1)  # [num_envs] bool
+            if self.cfg.env.eval.auto_reset:
+                newly_done = current_dones
+            else:
+                prev = self.eval_prev_done[stage_id].to(current_dones.device)
+                newly_done = current_dones & ~prev
+                self.eval_prev_done[stage_id] = prev | current_dones
 
-        if newly_done.any():
-            if "final_info" in infos:
-                final_info = infos["final_info"]
-                for key in final_info["episode"]:
-                    env_info[key] = final_info["episode"][key][newly_done].cpu()
-            elif "episode" in infos:
-                for key in infos["episode"]:
-                    env_info[key] = infos["episode"][key][newly_done].cpu()
+            if newly_done.any():
+                if "final_info" in infos:
+                    final_info = infos["final_info"]
+                    for key in final_info["episode"]:
+                        env_info[key] = final_info["episode"][key][newly_done].cpu()
+                elif "episode" in infos:
+                    for key in infos["episode"]:
+                        env_info[key] = infos["episode"][key][newly_done].cpu()
+
+        if isinstance(infos, dict) and "chunk_boundary_metrics" in infos:
+            for key, value in infos["chunk_boundary_metrics"].items():
+                env_info[f"chunk_boundary/{key}"] = (
+                    torch.as_tensor(value).reshape(-1).cpu()
+                )
 
         rlt_switch_flags = (
             infos["rlt_switch_flags"] if "rlt_switch_flags" in infos else None
@@ -1592,6 +1607,9 @@ class EnvWorker(Worker):
             group_size=self.cfg.algorithm.group_size,
             rewards_lower_bound=self.cfg.algorithm.get("rewards_lower_bound", None),
             rewards_upper_bound=self.cfg.algorithm.get("rewards_upper_bound", None),
+            transition_boundary_semantics=self.cfg.algorithm.get(
+                "tabero_ppo_transition_boundary_semantics", None
+            ),
         )
         return self.compute_advantages_and_returns(batch)
 

@@ -277,6 +277,91 @@ def postprocess_reasoning_advantages_outputs(
     return advantages, returns
 
 
+def _reshape_and_mask_primitive_logprobs(
+    values: torch.Tensor,
+    *,
+    batch_size: int,
+    single_action_dim: int,
+    primitive_loss_mask: torch.Tensor | None,
+    name: str,
+) -> torch.Tensor:
+    reshaped = values.reshape(batch_size, -1, single_action_dim)
+    if primitive_loss_mask is None:
+        return reshaped
+
+    mask = primitive_loss_mask.to(device=reshaped.device, dtype=torch.bool)
+    if mask.ndim == 3 and mask.shape[-1] == 1:
+        mask = mask.squeeze(-1)
+    expected_shape = reshaped.shape[:2]
+    if tuple(mask.shape) != tuple(expected_shape):
+        raise ValueError(
+            f"{name} primitive_loss_mask expected shape {tuple(expected_shape)}, "
+            f"got {tuple(mask.shape)}."
+        )
+    return torch.where(mask.unsqueeze(-1), reshaped, torch.zeros_like(reshaped))
+
+
+def reduce_embodied_entropy_with_primitive_mask(
+    entropy: torch.Tensor,
+    *,
+    primitive_loss_mask: torch.Tensor,
+    entropy_type: str,
+    single_action_dim: int,
+) -> torch.Tensor:
+    """Reduce entropy while excluding every post-terminal primitive action."""
+
+    mask = primitive_loss_mask.to(device=entropy.device, dtype=torch.bool)
+    if mask.ndim == 3 and mask.shape[-1] == 1:
+        mask = mask.squeeze(-1)
+    if mask.ndim != 2 or entropy.shape[0] != mask.shape[0]:
+        raise ValueError(
+            "primitive entropy mask must have shape [B, action_chunk] aligned with "
+            f"entropy batch; got entropy={tuple(entropy.shape)}, mask={tuple(mask.shape)}."
+        )
+
+    batch_size, action_chunk = mask.shape
+    if entropy.ndim >= 2 and entropy.shape[1] == action_chunk:
+        primitive_entropy = entropy
+    else:
+        per_batch_elements = entropy.numel() // batch_size
+        if entropy.numel() % batch_size != 0 or per_batch_elements % action_chunk != 0:
+            raise ValueError(
+                "Cannot align entropy with primitive action mask: "
+                f"entropy={tuple(entropy.shape)}, mask={tuple(mask.shape)}."
+            )
+        primitive_entropy = entropy.reshape(batch_size, action_chunk, -1)
+
+    if entropy_type == "action_level":
+        if primitive_entropy.ndim > 2:
+            primitive_entropy = primitive_entropy.reshape(
+                batch_size, action_chunk, -1
+            ).sum(dim=-1)
+        expanded_mask = mask
+    elif entropy_type == "chunk_level":
+        expanded_mask = mask
+        while expanded_mask.ndim < primitive_entropy.ndim:
+            expanded_mask = expanded_mask.unsqueeze(-1)
+        masked_entropy = torch.where(
+            expanded_mask, primitive_entropy, torch.zeros_like(primitive_entropy)
+        )
+        chunk_entropy = masked_entropy.reshape(batch_size, -1).sum(dim=-1)
+        valid_chunks = mask.any(dim=-1)
+        if not valid_chunks.any():
+            return chunk_entropy.sum() * 0.0
+        return chunk_entropy[valid_chunks].mean()
+    elif entropy_type == "token_level":
+        expanded_mask = mask
+        while expanded_mask.ndim < primitive_entropy.ndim:
+            expanded_mask = expanded_mask.unsqueeze(-1)
+        expanded_mask = expanded_mask.expand_as(primitive_entropy)
+    else:
+        raise ValueError(f"Unsupported entropy_type {entropy_type!r}.")
+
+    if not expanded_mask.any():
+        return primitive_entropy.sum() * 0.0
+    return primitive_entropy[expanded_mask].mean()
+
+
 def preprocess_loss_inputs(
     logprobs: torch.Tensor,
     old_logprobs: torch.Tensor,
@@ -290,6 +375,7 @@ def preprocess_loss_inputs(
     returns: Optional[torch.Tensor] = None,
     reward_type: Optional[str] = None,
     versions: Optional[torch.Tensor] = None,
+    primitive_loss_mask: Optional[torch.Tensor] = None,
     **kwargs,
 ) -> dict:
     if reward_type == "chunk_level":
@@ -309,10 +395,28 @@ def preprocess_loss_inputs(
     proximal_logprobs = kwargs.get("proximal_logprobs", None)
     if logprob_type == "token_level":
         # logprobs, old_logprobs: [bsz, num_action_chunks, action_dim] -> [bsz, num_action_chunks, action_dim]
-        logprobs = logprobs.reshape(bsz, -1, single_action_dim)
-        old_logprobs = old_logprobs.reshape(bsz, -1, single_action_dim)
+        logprobs = _reshape_and_mask_primitive_logprobs(
+            logprobs,
+            batch_size=bsz,
+            single_action_dim=single_action_dim,
+            primitive_loss_mask=primitive_loss_mask,
+            name="logprobs",
+        )
+        old_logprobs = _reshape_and_mask_primitive_logprobs(
+            old_logprobs,
+            batch_size=bsz,
+            single_action_dim=single_action_dim,
+            primitive_loss_mask=primitive_loss_mask,
+            name="old_logprobs",
+        )
         if proximal_logprobs is not None:
-            proximal_logprobs = proximal_logprobs.reshape(bsz, -1, single_action_dim)
+            proximal_logprobs = _reshape_and_mask_primitive_logprobs(
+                proximal_logprobs,
+                batch_size=bsz,
+                single_action_dim=single_action_dim,
+                primitive_loss_mask=primitive_loss_mask,
+                name="proximal_logprobs",
+            )
         if versions is not None:
             versions = versions.reshape(bsz, -1, single_action_dim)
         if kwargs.get("loss_type") == "opd":
@@ -329,22 +433,54 @@ def preprocess_loss_inputs(
 
     elif logprob_type == "action_level":
         # logprobs, old_logprobs: [bsz, num_action_chunks, action_dim] -> [bsz, num_action_chunks]
-        logprobs = logprobs.reshape(bsz, -1, single_action_dim).sum(dim=-1)
-        old_logprobs = old_logprobs.reshape(bsz, -1, single_action_dim).sum(dim=-1)
+        logprobs = _reshape_and_mask_primitive_logprobs(
+            logprobs,
+            batch_size=bsz,
+            single_action_dim=single_action_dim,
+            primitive_loss_mask=primitive_loss_mask,
+            name="logprobs",
+        ).sum(dim=-1)
+        old_logprobs = _reshape_and_mask_primitive_logprobs(
+            old_logprobs,
+            batch_size=bsz,
+            single_action_dim=single_action_dim,
+            primitive_loss_mask=primitive_loss_mask,
+            name="old_logprobs",
+        ).sum(dim=-1)
         if proximal_logprobs is not None:
-            proximal_logprobs = proximal_logprobs.reshape(
-                bsz, -1, single_action_dim
+            proximal_logprobs = _reshape_and_mask_primitive_logprobs(
+                proximal_logprobs,
+                batch_size=bsz,
+                single_action_dim=single_action_dim,
+                primitive_loss_mask=primitive_loss_mask,
+                name="proximal_logprobs",
             ).sum(dim=-1)
         if versions is not None:
             versions = versions.reshape(bsz, -1, single_action_dim)[..., 0]
 
     elif logprob_type == "chunk_level":
         # logprobs, old_logprobs: [bsz, num_action_chunks, action_dim] -> [bsz]
-        logprobs = logprobs.reshape(bsz, -1, single_action_dim).sum(dim=[1, 2])
-        old_logprobs = old_logprobs.reshape(bsz, -1, single_action_dim).sum(dim=[1, 2])
+        logprobs = _reshape_and_mask_primitive_logprobs(
+            logprobs,
+            batch_size=bsz,
+            single_action_dim=single_action_dim,
+            primitive_loss_mask=primitive_loss_mask,
+            name="logprobs",
+        ).sum(dim=[1, 2])
+        old_logprobs = _reshape_and_mask_primitive_logprobs(
+            old_logprobs,
+            batch_size=bsz,
+            single_action_dim=single_action_dim,
+            primitive_loss_mask=primitive_loss_mask,
+            name="old_logprobs",
+        ).sum(dim=[1, 2])
         if proximal_logprobs is not None:
-            proximal_logprobs = proximal_logprobs.reshape(
-                bsz, -1, single_action_dim
+            proximal_logprobs = _reshape_and_mask_primitive_logprobs(
+                proximal_logprobs,
+                batch_size=bsz,
+                single_action_dim=single_action_dim,
+                primitive_loss_mask=primitive_loss_mask,
+                name="proximal_logprobs",
             ).sum(dim=[1, 2])
         if versions is not None:
             versions = versions.reshape(bsz, -1, single_action_dim)[:, 0, 0]

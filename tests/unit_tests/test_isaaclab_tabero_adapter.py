@@ -32,6 +32,7 @@ from rlinf.envs.isaaclab.tasks.tabero_tacfield import (
     ensure_tabero_root_task_description,
     resolve_tabero_tasks,
     stack_tabero_initial_states,
+    validate_tabero_chunk_boundary_mode,
     validate_tabero_firm_prompts,
     validate_tabero_task_assignment,
 )
@@ -128,7 +129,11 @@ class _TerminalSafeFakeEnv:
         )
 
 
-def _terminal_safe_adapter(schedule: list[dict[int, str]], num_envs: int = 1):
+def _terminal_safe_adapter(
+    schedule: list[dict[int, str]],
+    num_envs: int = 1,
+    prompt_condition: str = "firm",
+):
     env = object.__new__(IsaaclabTaberoTacFieldEnv)
     env.num_envs = num_envs
     env.device = torch.device("cpu")
@@ -140,19 +145,29 @@ def _terminal_safe_adapter(schedule: list[dict[int, str]], num_envs: int = 1):
     env._marker_motion_key = "gripper_marker_motion"
     env._force_key = None
     env._marker_history = TacManipMarkerMotionHistory(num_envs=num_envs, history_len=8)
+    prompt_enabled = prompt_condition != "none"
     env._prompt_cfg = OmegaConf.create(
         {
-            "enabled": True,
+            "enabled": prompt_enabled,
             "assignment": "cyclic",
-            "condition_cycle": ["firm"],
+            "condition_cycle": [prompt_condition] if prompt_enabled else [],
             "firm_adverbs": ["firmly", "tightly"],
             "gentle_adverbs": ["gently", "softly"],
             "prompt_seed": 0,
         }
     )
     env._prompt_rollout_round = 0
-    env._prompt_condition_ids = (0,) * num_envs
-    env._conditioned_prompts = ["pick soup firmly"] * num_envs
+    if prompt_condition == "firm":
+        env._prompt_condition_ids = (0,) * num_envs
+        env._conditioned_prompts = ["pick soup firmly"] * num_envs
+    elif prompt_condition == "gentle":
+        env._prompt_condition_ids = (1,) * num_envs
+        env._conditioned_prompts = ["pick soup gently"] * num_envs
+    elif prompt_condition == "none":
+        env._prompt_condition_ids = ()
+        env._conditioned_prompts = ["pick soup"] * num_envs
+    else:
+        raise AssertionError(prompt_condition)
     env._condition_squeeze_sum = torch.zeros(num_envs)
     env._condition_squeeze_count = torch.zeros(num_envs, dtype=torch.long)
     env.task_description = "pick soup"
@@ -190,6 +205,16 @@ def test_terminal_safe_firm_prompt_validator_rejects_condition_pollution():
         validate_tabero_firm_prompts(["pick soup gently"], [1])
     with pytest.raises(ValueError, match="must contain 'firmly' or 'tightly'"):
         validate_tabero_firm_prompts(["pick soup"], [0])
+
+
+def test_chunk_boundary_mode_rejects_unknown_values_without_legacy_fallback():
+    assert validate_tabero_chunk_boundary_mode("legacy") == "legacy"
+    assert (
+        validate_tabero_chunk_boundary_mode("terminal_safe_hdf5_v1")
+        == "terminal_safe_hdf5_v1"
+    )
+    with pytest.raises(ValueError, match="Unsupported Tabero chunk_boundary_mode"):
+        validate_tabero_chunk_boundary_mode("terminal_safe_typo")
 
 
 def test_marker_motion_history_builds_tabero_prefix_with_front_padding():
@@ -438,6 +463,46 @@ def test_terminal_safe_chunk_resets_simultaneous_done_environments_together():
     assert records["termination"].tolist() == [True, False]
     assert records["truncation"].tolist() == [False, True]
     assert records["success_once"].tolist() == [1.0, 0.0]
+
+
+def test_terminal_safe_chunk_handles_asynchronous_vector_done_and_partial_reset():
+    env = _terminal_safe_adapter(
+        [{0: "termination"}, {}, {1: "truncation"}, {}], num_envs=2
+    )
+
+    _, rewards, terminations, truncations, infos_list = env.chunk_step(
+        torch.ones((2, 4, 13))
+    )
+
+    assert terminations[0].tolist() == [True, False, False, False]
+    assert truncations[1].tolist() == [False, False, True, False]
+    assert rewards[0].tolist() == [1.0, 0.0, 0.0, 0.0]
+    assert env.env.reset_calls[0].tolist() == [0, 1]
+    metrics = infos_list[-1]["chunk_boundary_metrics"]
+    assert metrics["post_done_policy_actions"].item() == 0
+    assert metrics["post_done_hold_steps"].item() == 4
+    records = infos_list[-1]["_tabero_chunk_episode_records"]
+    assert records["env_index"].tolist() == [0, 1]
+    assert records["primitive_step_index"].tolist() == [0, 2]
+
+
+@pytest.mark.parametrize(
+    ("prompt_condition", "expected_condition_id", "expect_nan_squeeze"),
+    [("none", -1, True), ("firm", 0, False), ("gentle", 1, False)],
+)
+def test_terminal_safe_chunk_is_independent_of_prompt_condition(
+    prompt_condition, expected_condition_id, expect_nan_squeeze
+):
+    env = _terminal_safe_adapter(
+        [{0: "termination"}, {}], prompt_condition=prompt_condition
+    )
+
+    _, _, _, _, infos_list = env.chunk_step(torch.ones((1, 2, 13)))
+
+    records = infos_list[-1]["_tabero_chunk_episode_records"]
+    assert records["condition_id"].tolist() == [expected_condition_id]
+    squeeze = records["squeeze_pred_mean"]
+    assert bool(torch.isnan(squeeze).all()) is expect_nan_squeeze
 
 
 def test_terminal_safe_chunk_preserves_ignore_terminations_output_semantics():

@@ -28,6 +28,7 @@ from rlinf.algorithms.expert import build_expert_model_config
 from rlinf.algorithms.registry import calculate_adv_and_returns, policy_loss
 from rlinf.algorithms.utils import (
     kl_penalty,
+    reduce_embodied_entropy_with_primitive_mask,
 )
 from rlinf.config import SupportedModel, torch_dtype_from_precision
 from rlinf.data.embodied_io_struct import Trajectory, convert_trajectories_to_batch
@@ -63,7 +64,7 @@ from rlinf.utils.metric_utils import (
     CRITIC_EXPLAINED_VARIANCE_KEY,
     append_to_dict,
     compute_critic_explained_variance_from_stats,
-    compute_loss_mask,
+    compute_embodied_loss_masks,
     compute_rollout_metrics,
     compute_split_num,
     pop_critic_explained_variance_stats,
@@ -75,6 +76,10 @@ from rlinf.utils.nested_dict_process import (
 from rlinf.utils.placement import (
     HybridComponentPlacement,
     ModelParallelComponentPlacement,
+)
+from rlinf.utils.tabero_ppo_boundary import (
+    TABERO_PPO_TRANSITION_BOUNDARY_SEMANTICS,
+    validate_tabero_ppo_checkpoint_boundary_metadata,
 )
 from rlinf.utils.utils import (
     clear_memory,
@@ -1087,6 +1092,9 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         self.enable_sft_co_train = cfg.actor.get("enable_sft_co_train", False)
         self.version = 0
+        self._tabero_ppo_transition_boundary_semantics = self.cfg.algorithm.get(
+            "tabero_ppo_transition_boundary_semantics", None
+        )
         if self.enable_sft_co_train:
             self._build_sft_data_loader()
 
@@ -1125,6 +1133,15 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         if self.enable_offload:
             self.offload_param_and_grad()
             self.offload_optimizer()
+
+    def load_checkpoint(self, load_base_path: str) -> None:
+        expected_semantics = self._tabero_ppo_transition_boundary_semantics
+        if expected_semantics is not None:
+            validate_tabero_ppo_checkpoint_boundary_metadata(
+                load_base_path,
+                expected_semantics=expected_semantics,
+            )
+        return super().load_checkpoint(load_base_path)
 
     def model_provider_func(self) -> nn.Module:
         model = get_model(self.cfg.actor.model)
@@ -1232,17 +1249,16 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             not self.cfg.env.train.auto_reset
             and not self.cfg.env.train.ignore_terminations
         ):
-            dones = rollout_batch[
-                "dones"
-            ]  # [n_chunk_step, rollout_epoch x bsz, num_action_chunks]
-            loss_mask, loss_mask_sum = compute_loss_mask(dones)
-
-            if self.cfg.algorithm.reward_type == "chunk_level":
-                loss_mask = loss_mask.any(dim=-1, keepdim=True)
-                loss_mask_sum = loss_mask_sum[..., -1:]
-
-            rollout_batch["loss_mask"] = loss_mask
-            rollout_batch["loss_mask_sum"] = loss_mask_sum
+            rollout_batch.update(
+                compute_embodied_loss_masks(
+                    rollout_batch["dones"],
+                    reward_type=self.cfg.algorithm.reward_type,
+                    use_primitive_prefix_logprobs=(
+                        self._tabero_ppo_transition_boundary_semantics
+                        == TABERO_PPO_TRANSITION_BOUNDARY_SEMANTICS
+                    ),
+                )
+            )
 
         # filter data by rewards
         if self.cfg.algorithm.get("filter_rewards", False):
@@ -1614,7 +1630,22 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         prev_values = micro_batch.get("prev_values", None)
         loss_mask = micro_batch.get("loss_mask", None)
         loss_mask_sum = micro_batch.get("loss_mask_sum", None)
+        primitive_loss_mask = micro_batch.get("primitive_loss_mask", None)
         forward_inputs = micro_batch.get("forward_inputs", None)
+
+        loss_normalization_steps = self.cfg.env.train.max_episode_steps
+        if (
+            self._tabero_ppo_transition_boundary_semantics
+            == TABERO_PPO_TRANSITION_BOUNDARY_SEMANTICS
+        ):
+            action_chunk = int(self.cfg.actor.model.num_action_chunks)
+            if loss_normalization_steps % action_chunk != 0:
+                raise ValueError(
+                    "Boundary-safe chunk PPO requires max_episode_steps divisible by "
+                    f"num_action_chunks; got {loss_normalization_steps} and "
+                    f"{action_chunk}."
+                )
+            loss_normalization_steps //= action_chunk
 
         kwargs = {}
         if SupportedModel(self.cfg.actor.model.model_type) in [
@@ -1630,6 +1661,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             SupportedModel.ABOT_M0,
         ]:
             kwargs["prev_logprobs"] = prev_logprobs
+        if primitive_loss_mask is not None:
+            kwargs["primitive_loss_mask"] = primitive_loss_mask
 
         compute_values = self.cfg.algorithm.adv_type == "gae"
         with self.amp_context:
@@ -1667,7 +1700,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             "huber_delta": self.cfg.algorithm.get("huber_delta", None),
             "loss_mask": loss_mask,
             "loss_mask_sum": loss_mask_sum,
-            "max_episode_steps": self.cfg.env.train.max_episode_steps,
+            "primitive_loss_mask": primitive_loss_mask,
+            "max_episode_steps": loss_normalization_steps,
             "task_type": self.cfg.runner.task_type,
             "critic_warmup": self.optimizer_steps < self.critic_warmup_steps,
         }
@@ -1690,13 +1724,29 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         entropy_loss = torch.tensor(0.0, device=Worker.torch_platform.current_device())
         if self.cfg.algorithm.entropy_bonus > 0 and not loss_kwargs["critic_warmup"]:
             entropy = output_dict["entropy"]
-            entropy = reshape_entropy(
-                entropy,
-                entropy_type=self.cfg.algorithm.entropy_type,
-                action_dim=self.cfg.actor.model.get("action_dim", 7),
-                batch_size=output_dict["logprobs"].shape[0],
-            )
-            entropy_loss = masked_mean(entropy, mask=loss_mask)
+            if (
+                primitive_loss_mask is not None
+                and entropy.ndim == 2
+                and entropy.shape[-1] == 1
+            ):
+                # OpenPI applies the primitive mask before reducing entropy to
+                # one scalar per macro chunk.
+                entropy_loss = masked_mean(entropy, mask=loss_mask)
+            elif primitive_loss_mask is not None:
+                entropy_loss = reduce_embodied_entropy_with_primitive_mask(
+                    entropy,
+                    primitive_loss_mask=primitive_loss_mask,
+                    entropy_type=self.cfg.algorithm.entropy_type,
+                    single_action_dim=self.cfg.actor.model.get("action_dim", 7),
+                )
+            else:
+                entropy = reshape_entropy(
+                    entropy,
+                    entropy_type=self.cfg.algorithm.entropy_type,
+                    action_dim=self.cfg.actor.model.get("action_dim", 7),
+                    batch_size=output_dict["logprobs"].shape[0],
+                )
+                entropy_loss = masked_mean(entropy, mask=loss_mask)
             loss -= self.cfg.algorithm.entropy_bonus * entropy_loss
         metrics_data["actor/entropy_loss"] = entropy_loss.detach().item()
 

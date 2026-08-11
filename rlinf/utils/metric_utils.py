@@ -545,6 +545,41 @@ def compute_rollout_metrics(data_buffer: dict) -> dict:
         }
         rollout_metrics.update(returns_metrics)
 
+    primitive_loss_mask = data_buffer.get("primitive_loss_mask")
+    if primitive_loss_mask is not None:
+        from rlinf.scheduler.worker.worker import Worker
+
+        primitive_loss_mask = primitive_loss_mask.to(dtype=torch.bool)
+        if primitive_loss_mask.ndim != 3:
+            raise ValueError(
+                "primitive_loss_mask must have shape [T, B, action_chunk]; "
+                f"got {tuple(primitive_loss_mask.shape)}."
+            )
+        boundary_counts = summarize_primitive_loss_mask(primitive_loss_mask)
+        local_boundary_counts = torch.tensor(
+            [
+                boundary_counts["valid_primitive_actions"],
+                boundary_counts["masked_post_done_actions"],
+                boundary_counts["partial_chunk_count"],
+            ],
+            device=Worker.torch_platform.current_device(),
+            dtype=torch.float64,
+        )
+        torch.distributed.all_reduce(
+            local_boundary_counts, op=torch.distributed.ReduceOp.SUM
+        )
+        rollout_metrics.update(
+            {
+                "boundary/valid_primitive_actions": float(
+                    local_boundary_counts[0].item()
+                ),
+                "boundary/masked_post_done_actions": float(
+                    local_boundary_counts[1].item()
+                ),
+                "boundary/partial_chunk_count": float(local_boundary_counts[2].item()),
+            }
+        )
+
     return rollout_metrics
 
 
@@ -577,6 +612,68 @@ def compute_loss_mask(dones):
     loss_mask_sum = loss_mask_sum.expand_as(loss_mask)
 
     return loss_mask, loss_mask_sum
+
+
+def compute_embodied_loss_masks(
+    dones: torch.Tensor,
+    *,
+    reward_type: str,
+    use_primitive_prefix_logprobs: bool,
+) -> dict[str, torch.Tensor]:
+    """Build aligned primitive and macro masks for embodied policy updates.
+
+    ``compute_loss_mask`` accounts for RLinf's leading bootstrap done row. Its
+    primitive mask includes the first done action and excludes every later
+    action. Boundary-safe chunk-level PPO keeps this prefix for log-probability
+    reduction while using one macro loss sample for every non-empty chunk.
+    """
+
+    primitive_loss_mask, primitive_loss_mask_sum = compute_loss_mask(dones)
+    if reward_type != "chunk_level":
+        result = {
+            "loss_mask": primitive_loss_mask,
+            "loss_mask_sum": primitive_loss_mask_sum,
+        }
+        if use_primitive_prefix_logprobs:
+            result["primitive_loss_mask"] = primitive_loss_mask
+        return result
+
+    chunk_loss_mask = primitive_loss_mask.any(dim=-1, keepdim=True)
+    if use_primitive_prefix_logprobs:
+        chunk_loss_count = chunk_loss_mask.sum(dim=(0, 2), keepdim=True)
+        chunk_loss_mask_sum = chunk_loss_count.expand_as(chunk_loss_mask)
+        return {
+            "primitive_loss_mask": primitive_loss_mask,
+            "chunk_loss_mask": chunk_loss_mask,
+            "loss_mask": chunk_loss_mask,
+            "loss_mask_sum": chunk_loss_mask_sum,
+        }
+
+    return {
+        "loss_mask": chunk_loss_mask,
+        "loss_mask_sum": primitive_loss_mask_sum[..., -1:],
+    }
+
+
+def summarize_primitive_loss_mask(
+    primitive_loss_mask: torch.Tensor,
+) -> dict[str, int]:
+    primitive_loss_mask = primitive_loss_mask.to(dtype=torch.bool)
+    if primitive_loss_mask.ndim != 3:
+        raise ValueError(
+            "primitive_loss_mask must have shape [T, B, action_chunk]; "
+            f"got {tuple(primitive_loss_mask.shape)}."
+        )
+    valid_per_chunk = primitive_loss_mask.sum(dim=-1)
+    return {
+        "valid_primitive_actions": int(primitive_loss_mask.sum().item()),
+        "masked_post_done_actions": int((~primitive_loss_mask).sum().item()),
+        "partial_chunk_count": int(
+            ((valid_per_chunk > 0) & (valid_per_chunk < primitive_loss_mask.shape[-1]))
+            .sum()
+            .item()
+        ),
+    }
 
 
 def print_metrics_table(

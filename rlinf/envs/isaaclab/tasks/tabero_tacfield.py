@@ -36,7 +36,11 @@ logger = logging.getLogger(__name__)
 
 _TERMINAL_RAW_OBSERVATION_KEY = "tabero_terminal_raw_observation"
 _TERMINAL_OBSERVATION_MASK_KEY = "tabero_terminal_observation_mask"
+_LEGACY_CHUNK_BOUNDARY_MODE = "legacy"
 _TERMINAL_SAFE_HDF5_MODE = "terminal_safe_hdf5_v1"
+_VALID_CHUNK_BOUNDARY_MODES = frozenset(
+    {_LEGACY_CHUNK_BOUNDARY_MODE, _TERMINAL_SAFE_HDF5_MODE}
+)
 _CHUNK_EPISODE_RECORDS_KEY = "_tabero_chunk_episode_records"
 _EPISODE_CONDITION_ID_KEY = "_tabero_condition_id"
 _EPISODE_SQUEEZE_PRED_MEAN_KEY = "_tabero_squeeze_pred_mean"
@@ -75,6 +79,18 @@ def validate_tabero_firm_prompts(
             "Tabero terminal-safe DSRL prompts must contain 'firmly' or 'tightly'; "
             f"invalid prompt rows={invalid_prompts}."
         )
+
+
+def validate_tabero_chunk_boundary_mode(mode: Any) -> str:
+    """Validate the adapter boundary mode without silently selecting legacy."""
+
+    normalized = str(mode)
+    if normalized not in _VALID_CHUNK_BOUNDARY_MODES:
+        raise ValueError(
+            f"Unsupported Tabero chunk_boundary_mode {normalized!r}; expected one of "
+            f"{sorted(_VALID_CHUNK_BOUNDARY_MODES)}."
+        )
+    return normalized
 
 
 def _clone_nested_tensors(value: Any) -> Any:
@@ -998,8 +1014,8 @@ class IsaaclabTaberoTacFieldEnv(IsaaclabBaseEnv):
         self._hdf5_reset_assignment = str(
             _cfg_get(init_params, "hdf5_reset_assignment", "cyclic")
         )
-        self._chunk_boundary_mode = str(
-            _cfg_get(init_params, "chunk_boundary_mode", "legacy")
+        self._chunk_boundary_mode = validate_tabero_chunk_boundary_mode(
+            _cfg_get(init_params, "chunk_boundary_mode", _LEGACY_CHUNK_BOUNDARY_MODE)
         )
         if self._hdf5_initial_states_path is not None:
             hdf5_path = Path(str(self._hdf5_initial_states_path)).expanduser()
@@ -1047,10 +1063,6 @@ class IsaaclabTaberoTacFieldEnv(IsaaclabBaseEnv):
             rollout_round=0,
         )
         self._prompt_condition_ids = tuple(condition_ids)
-        if self._chunk_boundary_mode == _TERMINAL_SAFE_HDF5_MODE:
-            validate_tabero_firm_prompts(
-                self._conditioned_prompts, self._prompt_condition_ids
-            )
         logger.info(
             "Assigned Tabero task shard=%d/%d suite=%s task_id=%d num_envs=%d",
             self._tabero_task_shard_id,
@@ -1223,10 +1235,6 @@ class IsaaclabTaberoTacFieldEnv(IsaaclabBaseEnv):
                     current_condition_ids[env_id] = condition_ids[env_id]
                 self._conditioned_prompts = current_prompts
                 self._prompt_condition_ids = tuple(current_condition_ids)
-            if self._chunk_boundary_mode == _TERMINAL_SAFE_HDF5_MODE:
-                validate_tabero_firm_prompts(
-                    self._conditioned_prompts, self._prompt_condition_ids
-                )
             logger.info(
                 "Tabero prompts shard=%d round=%d prompts=%s",
                 self._tabero_task_shard_id,

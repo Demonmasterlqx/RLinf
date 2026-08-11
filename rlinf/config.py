@@ -50,6 +50,11 @@ from rlinf.utils.placement import (
     ModelParallelComponentPlacement,
     PlacementMode,
 )
+from rlinf.utils.tabero_ppo_boundary import (
+    TABERO_PPO_CHECKPOINT_METADATA_KEY,
+    TABERO_PPO_CHUNK_BOUNDARY_MODE,
+    TABERO_PPO_TRANSITION_BOUNDARY_SEMANTICS,
+)
 
 if TYPE_CHECKING:
     from megatron.core.model_parallel_config import ModelParallelConfig
@@ -854,6 +859,124 @@ def validate_embodied_cfg(cfg):
         f"Supported embodied models: {sorted([x.value for x in EMBODIED_MODEL])}."
     )
     use_dsrl = model_cfg.get("openpi", {}).get("use_dsrl", False)
+    ppo_boundary_semantics = algorithm_cfg.get(
+        "tabero_ppo_transition_boundary_semantics"
+    )
+    if ppo_boundary_semantics is not None:
+        if ppo_boundary_semantics != TABERO_PPO_TRANSITION_BOUNDARY_SEMANTICS:
+            raise ValueError(
+                "Unsupported algorithm.tabero_ppo_transition_boundary_semantics "
+                f"{ppo_boundary_semantics!r}; expected "
+                f"{TABERO_PPO_TRANSITION_BOUNDARY_SEMANTICS!r}."
+            )
+        if only_eval:
+            raise ValueError(
+                "Tabero PPO transition boundary semantics is a training contract and "
+                "cannot be declared by an embodied-eval-only config."
+            )
+        openpi_cfg = model_cfg.get("openpi", {})
+        if (
+            model_type != SupportedModel.OPENPI
+            or openpi_cfg.get("config_name") != "pi0_lora_tacfield_tabero"
+        ):
+            raise ValueError(
+                "Tabero PPO transition boundary semantics requires the Tabero tactile "
+                "OpenPI model configuration."
+            )
+        required_ppo_values = {
+            "adv_type": "gae",
+            "loss_type": "actor_critic",
+            "reward_type": "chunk_level",
+            "logprob_type": "chunk_level",
+        }
+        for key, expected in required_ppo_values.items():
+            actual = algorithm_cfg.get(key)
+            if actual != expected:
+                raise ValueError(
+                    "Tabero PPO transition boundary semantics requires "
+                    f"algorithm.{key}={expected!r}; got {actual!r}."
+                )
+
+        action_chunk = model_cfg.get("num_action_chunks")
+        if (
+            isinstance(action_chunk, bool)
+            or not isinstance(action_chunk, int)
+            or action_chunk <= 0
+        ):
+            raise ValueError(
+                "Tabero PPO transition boundary semantics requires a positive integer "
+                "actor.model.num_action_chunks."
+            )
+
+        for split_name in ("train", "eval"):
+            split_cfg = cfg.env.get(split_name)
+            if split_cfg is None:
+                raise ValueError(
+                    "Tabero PPO transition boundary semantics requires both env.train "
+                    "and env.eval configurations."
+                )
+            if split_cfg.get("auto_reset") is not False:
+                raise ValueError(
+                    f"Tabero PPO transition boundary semantics requires env.{split_name}."
+                    "auto_reset=false."
+                )
+            if split_cfg.get("ignore_terminations") is not False:
+                raise ValueError(
+                    f"Tabero PPO transition boundary semantics requires env.{split_name}."
+                    "ignore_terminations=false."
+                )
+            init_params = split_cfg.get("init_params", {})
+            boundary_mode = init_params.get("chunk_boundary_mode")
+            if boundary_mode != TABERO_PPO_CHUNK_BOUNDARY_MODE:
+                raise ValueError(
+                    f"Tabero PPO transition boundary semantics requires env.{split_name}."
+                    "init_params.chunk_boundary_mode="
+                    f"{TABERO_PPO_CHUNK_BOUNDARY_MODE!r}; got {boundary_mode!r}."
+                )
+            hdf5_path = init_params.get("hdf5_initial_states_path")
+            if not isinstance(hdf5_path, str) or not hdf5_path.strip():
+                raise ValueError(
+                    f"Tabero PPO transition boundary semantics requires env.{split_name}."
+                    "init_params.hdf5_initial_states_path."
+                )
+            if init_params.get("hdf5_reset_assignment") != "cyclic":
+                raise ValueError(
+                    f"Tabero PPO transition boundary semantics requires env.{split_name}."
+                    "init_params.hdf5_reset_assignment='cyclic'."
+                )
+            max_episode_steps = split_cfg.get("max_episode_steps")
+            if (
+                isinstance(max_episode_steps, bool)
+                or not isinstance(max_episode_steps, int)
+                or max_episode_steps <= 0
+                or max_episode_steps % action_chunk != 0
+            ):
+                raise ValueError(
+                    f"Tabero PPO transition boundary semantics requires env.{split_name}."
+                    "max_episode_steps to be a positive multiple of "
+                    f"actor.model.num_action_chunks={action_chunk}; got "
+                    f"{max_episode_steps!r}."
+                )
+
+        fsdp_cfg = cfg.actor.get("fsdp_config", {})
+        if fsdp_cfg.get("save_trainable_model_weights") is not True:
+            raise ValueError(
+                "Tabero PPO transition boundary semantics requires "
+                "actor.fsdp_config.save_trainable_model_weights=true for resume audit."
+            )
+        checkpoint_metadata = fsdp_cfg.get("trainable_checkpoint_metadata")
+        actual_checkpoint_semantics = (
+            checkpoint_metadata.get(TABERO_PPO_CHECKPOINT_METADATA_KEY)
+            if checkpoint_metadata is not None
+            else None
+        )
+        if actual_checkpoint_semantics != ppo_boundary_semantics:
+            raise ValueError(
+                "Tabero PPO transition boundary semantics requires matching "
+                "actor.fsdp_config.trainable_checkpoint_metadata."
+                f"{TABERO_PPO_CHECKPOINT_METADATA_KEY}; got "
+                f"{actual_checkpoint_semantics!r}."
+            )
     if use_dsrl and model_cfg.get("is_lora", False):
         raise ValueError("OpenPI DSRL requires actor.model.is_lora=false.")
     if use_dsrl and not only_eval:

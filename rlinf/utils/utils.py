@@ -29,7 +29,10 @@ from torch.distributed.tensor import DTensor
 from torch.optim import Optimizer
 
 from rlinf.scheduler import Worker
-from rlinf.utils.metric_utils import compute_loss_mask
+from rlinf.utils.metric_utils import compute_embodied_loss_masks
+from rlinf.utils.tabero_ppo_boundary import (
+    TABERO_PPO_TRANSITION_BOUNDARY_SEMANTICS,
+)
 
 
 def clear_memory(sync=True):
@@ -772,19 +775,30 @@ def preprocess_embodied_batch(
     group_size: int,
     rewards_lower_bound: float | None = None,
     rewards_upper_bound: float | None = None,
+    transition_boundary_semantics: str | None = None,
 ) -> dict[str, torch.Tensor]:
     batch = merge_rollout_epochs(batch, rollout_epoch)
 
+    if transition_boundary_semantics not in {
+        None,
+        TABERO_PPO_TRANSITION_BOUNDARY_SEMANTICS,
+    }:
+        raise ValueError(
+            "Unsupported embodied PPO transition boundary semantics "
+            f"{transition_boundary_semantics!r}."
+        )
+
     if not auto_reset and not ignore_terminations:
-        dones = batch["dones"]
-        loss_mask, loss_mask_sum = compute_loss_mask(dones)
-
-        if reward_type == "chunk_level":
-            loss_mask = loss_mask.any(dim=-1, keepdim=True)
-            loss_mask_sum = loss_mask_sum[..., -1:]
-
-        batch["loss_mask"] = loss_mask
-        batch["loss_mask_sum"] = loss_mask_sum
+        batch.update(
+            compute_embodied_loss_masks(
+                batch["dones"],
+                reward_type=reward_type,
+                use_primitive_prefix_logprobs=(
+                    transition_boundary_semantics
+                    == TABERO_PPO_TRANSITION_BOUNDARY_SEMANTICS
+                ),
+            )
+        )
 
     if filter_rewards:
         rewards = batch["rewards"]
