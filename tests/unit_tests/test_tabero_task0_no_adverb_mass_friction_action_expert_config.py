@@ -149,6 +149,10 @@ def test_config_trains_only_action_expert_lora_and_value_head(monkeypatch):
     assert cfg.actor.fsdp_config.save_trainable_model_weights is True
     assert cfg.actor.fsdp_config.save_full_model_weights is False
     metadata = cfg.actor.fsdp_config.trainable_checkpoint_metadata
+    assert metadata.method == "pirl"
+    assert metadata.task_id == 0
+    assert metadata.prompt_condition == "no_adverb"
+    assert metadata.training_config == CONFIG_PATH.stem
     assert metadata.target_global_step == 100
     assert (
         metadata.tabero_ppo_transition_boundary_semantics

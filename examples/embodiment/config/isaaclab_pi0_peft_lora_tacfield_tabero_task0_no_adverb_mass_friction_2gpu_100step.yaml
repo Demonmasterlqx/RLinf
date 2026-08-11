@@ -268,7 +268,7 @@ actor:
     save_full_model_weights: False
     save_trainable_model_weights: True
     trainable_checkpoint_metadata:
-      method: ppo_action_expert_lora
+      method: pirl
       task_id: 0
       prompt_condition: no_adverb
       training_config: isaaclab_pi0_peft_lora_tacfield_tabero_task0_no_adverb_mass_friction_2gpu_100step
