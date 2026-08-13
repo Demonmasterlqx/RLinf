@@ -217,6 +217,8 @@ def test_export_metadata_carries_verified_fsdp_provenance_and_hashes(tmp_path):
 
     assert metadata["task_id"] == 5
     assert metadata["global_step"] == 50
+    assert metadata["target_global_step"] == 50
+    assert metadata["is_final"] is True
     assert metadata["base_model_sha256"] == _sha256(
         Path(inputs["source_model_path"]) / "model.safetensors"
     )
@@ -272,3 +274,56 @@ def test_export_metadata_rejects_checkpoint_without_formal_provenance(tmp_path):
             lora_target="action_expert",
             adapter_dirs=[],
         )
+
+
+def test_export_metadata_allows_explicit_task1_intermediate_checkpoint(tmp_path):
+    inputs = _export_metadata_fixture(tmp_path)
+    config = Path(inputs["train_config_path"])
+    task1_config = config.with_name("task1_uniform_physics.yaml")
+    task1_config.write_text(config.read_text())
+    inputs["train_config_path"] = str(task1_config)
+    inputs["checkpoint_meta"].update(
+        task_id=1,
+        training_config=task1_config.stem,
+        step=30,
+        global_step=30,
+        target_global_step=100,
+        is_final=False,
+    )
+
+    metadata = exporter._build_export_metadata(
+        **inputs,
+        allow_non_final=True,
+    )
+
+    assert metadata["task_id"] == 1
+    assert metadata["global_step"] == 30
+    assert metadata["target_global_step"] == 100
+    assert metadata["is_final"] is False
+    assert metadata["source_ckpt_metadata"]["is_final"] is False
+
+
+def test_export_metadata_rejects_non_final_checkpoint_without_opt_in(tmp_path):
+    inputs = _export_metadata_fixture(tmp_path)
+    inputs["checkpoint_meta"].update(
+        step=30,
+        global_step=30,
+        target_global_step=100,
+        is_final=False,
+    )
+
+    with pytest.raises(ValueError, match="--allow_non_final"):
+        exporter._build_export_metadata(**inputs)
+
+
+def test_export_metadata_rejects_non_final_checkpoint_at_target(tmp_path):
+    inputs = _export_metadata_fixture(tmp_path)
+    inputs["checkpoint_meta"].update(
+        step=50,
+        global_step=50,
+        target_global_step=50,
+        is_final=False,
+    )
+
+    with pytest.raises(ValueError, match="less than target_global_step"):
+        exporter._build_export_metadata(**inputs, allow_non_final=True)

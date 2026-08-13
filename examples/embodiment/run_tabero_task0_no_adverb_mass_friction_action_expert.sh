@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly CONFIG_NAME="isaaclab_pi0_peft_lora_tacfield_tabero_task0_no_adverb_mass_friction_2gpu_100step"
+readonly CONFIG_NAME="${TABERO_PIRL_CONFIG_NAME:-isaaclab_pi0_peft_lora_tacfield_tabero_task0_no_adverb_mass_friction_2gpu_100step}"
 readonly MODEL_PATH="/data/home/sim6g/code/tabero/models/pi0_lora_tacfield_tabero_all_firm_safetensors"
-readonly PROFILE_DIR="/data/home/sim6g/code/tabero/Tabero/benchmarks/datasets/libero/config_profiles/firm_damage_fixed_friction_05_from_rlinf_sft_20k"
-readonly HDF5_PATH="/data/home/sim6g/code/tabero/Tabero/benchmarks/datasets/libero/assembled_hdf5/libero_object_task0_pick_up_the_alphabet_soup_and_place_it_in_the_basket_demo.hdf5"
+readonly PROFILE_DIR="${TABERO_PIRL_PROFILE_DIR:-/data/home/sim6g/code/tabero/Tabero/benchmarks/datasets/libero/config_profiles/firm_damage_fixed_friction_05_from_rlinf_sft_20k}"
+readonly HDF5_PATH="${TABERO_PIRL_HDF5_PATH:-/data/home/sim6g/code/tabero/Tabero/benchmarks/datasets/libero/assembled_hdf5/libero_object_task0_pick_up_the_alphabet_soup_and_place_it_in_the_basket_demo.hdf5}"
 readonly PPO_BOUNDARY_SEMANTICS="terminal_observation_first_done_prefix_logprob_hdf5_reset_v1"
 
 usage() {
@@ -221,9 +221,9 @@ else
     die "TABERO_TASK0_NO_ADVERB_RUN_ID must match YYYYMMDD_HHMMSS_${MODE}"
 
   if [[ "${MODE}" == "smoke" ]]; then
-    output_prefix="tabero_task0_no_adverb_mass_friction_action_expert_lora_2gpu_capacity_smoke"
+    output_prefix="${TABERO_PIRL_SMOKE_OUTPUT_PREFIX:-tabero_task0_no_adverb_mass_friction_action_expert_lora_2gpu_capacity_smoke}"
   else
-    output_prefix="tabero_task0_no_adverb_mass_friction_action_expert_lora_2gpu_100step"
+    output_prefix="${TABERO_PIRL_FORMAL_OUTPUT_PREFIX:-tabero_task0_no_adverb_mass_friction_action_expert_lora_2gpu_100step}"
   fi
   OUTPUT_DIR="${RESULTS_ROOT}/${output_prefix}_${TABERO_TASK0_NO_ADVERB_RUN_ID}"
   mkdir -p "${RESULTS_ROOT}"

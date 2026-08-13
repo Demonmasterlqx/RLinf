@@ -389,6 +389,7 @@ def _build_export_metadata(
     model_path: str | Path,
     lora_target: str,
     adapter_dirs: list[str],
+    allow_non_final: bool = False,
 ) -> dict:
     train_config = Path(train_config_path).expanduser().resolve()
     source_checkpoint = _checkpoint_path(ckpt_path)
@@ -400,7 +401,6 @@ def _build_export_metadata(
         "format": "trainable_weights",
         "method": method,
         "training_config": expected_training_config,
-        "is_final": True,
     }
     if method not in {"pirl", "sft_full_lora_tacfield"}:
         raise ValueError(
@@ -414,9 +414,21 @@ def _build_export_metadata(
                 "OpenPI checkpoint provenance "
                 f"{field} must be {expected!r}, got {actual!r}"
             )
+    is_final = checkpoint_meta.get("is_final")
+    if type(is_final) is not bool:
+        raise ValueError(
+            "OpenPI checkpoint provenance is_final must be a boolean, "
+            f"got {is_final!r}"
+        )
+    if not is_final and not allow_non_final:
+        raise ValueError(
+            "OpenPI checkpoint provenance is_final must be True; pass "
+            "--allow_non_final only when intentionally exporting an "
+            "intermediate checkpoint for evaluation"
+        )
     task_id = checkpoint_meta.get("task_id")
-    if method == "pirl" and (type(task_id) is not int or task_id not in {0, 5}):
-        raise ValueError("piRL checkpoint provenance task_id must be 0 or 5")
+    if method == "pirl" and (type(task_id) is not int or task_id not in range(10)):
+        raise ValueError("piRL checkpoint provenance task_id must be in [0, 9]")
     if method == "sft_full_lora_tacfield":
         if checkpoint_meta.get("dataset") != "datas/tabero_firm":
             raise ValueError(
@@ -429,12 +441,26 @@ def _build_export_metadata(
     global_step = checkpoint_meta.get("global_step")
     if type(global_step) is not int or global_step <= 0:
         raise ValueError("OpenPI checkpoint provenance global_step must be positive")
-    for field in ("step", "target_global_step"):
-        if checkpoint_meta.get(field) != global_step:
-            raise ValueError(
-                "OpenPI checkpoint provenance "
-                f"{field} must equal global_step {global_step}"
-            )
+    if checkpoint_meta.get("step") != global_step:
+        raise ValueError(
+            "OpenPI checkpoint provenance "
+            f"step must equal global_step {global_step}"
+        )
+    target_global_step = checkpoint_meta.get("target_global_step")
+    if type(target_global_step) is not int or target_global_step <= 0:
+        raise ValueError(
+            "OpenPI checkpoint provenance target_global_step must be positive"
+        )
+    if is_final and target_global_step != global_step:
+        raise ValueError(
+            "OpenPI final checkpoint provenance target_global_step must equal "
+            f"global_step {global_step}"
+        )
+    if not is_final and global_step >= target_global_step:
+        raise ValueError(
+            "OpenPI non-final checkpoint provenance global_step must be less than "
+            f"target_global_step {target_global_step}, got {global_step}"
+        )
     if method == "pirl" and lora_target == "action_expert":
         validate_pirl_action_expert_delta(output_model, base_checkpoint)
     safe_metadata = _json_safe(dict(checkpoint_meta))
@@ -450,6 +476,8 @@ def _build_export_metadata(
         "lora_target": lora_target,
         "task_id": task_id,
         "global_step": global_step,
+        "target_global_step": target_global_step,
+        "is_final": is_final,
         "model_sha256": _sha256(output_model),
         "model_tensor_count": _safetensor_count(output_model),
         "adapter_dir": (
@@ -500,6 +528,7 @@ def export_checkpoint(
     ckpt_path: str,
     output_dir: str,
     save_adapter: bool,
+    allow_non_final: bool = False,
 ) -> None:
     model_cfg = _load_model_cfg(train_config_path)
     if not model_cfg.get("is_lora", False):
@@ -602,6 +631,7 @@ def export_checkpoint(
                 model_path=model_path,
                 lora_target=lora_target,
                 adapter_dirs=adapter_dir_names if save_adapter else [],
+                allow_non_final=allow_non_final,
             ),
             f,
             indent=2,
@@ -616,6 +646,14 @@ def main() -> None:
     parser.add_argument("--ckpt_path", required=True)
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--no_save_adapter", action="store_true")
+    parser.add_argument(
+        "--allow_non_final",
+        action="store_true",
+        help=(
+            "Allow an explicitly non-final checkpoint to be exported for "
+            "intermediate evaluation while preserving is_final=false provenance."
+        ),
+    )
     args = parser.parse_args()
 
     export_checkpoint(
@@ -623,6 +661,7 @@ def main() -> None:
         ckpt_path=args.ckpt_path,
         output_dir=args.output_dir,
         save_adapter=not args.no_save_adapter,
+        allow_non_final=args.allow_non_final,
     )
 
 
