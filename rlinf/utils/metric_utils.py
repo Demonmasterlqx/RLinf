@@ -419,6 +419,22 @@ def aggregate_tabero_dsrl_env_metrics(
     gentle_success = concatenate("gentle_success_once")
     gentle_returns = concatenate("gentle_return")
     gentle_squeeze = concatenate("gentle_squeeze_pred_mean")
+    trajectory_mean_measured_squeeze = concatenate("trajectory_mean_measured_squeeze")
+    force_valid_sample_count = concatenate("force_valid_sample_count")
+
+    has_trajectory_force_metrics = bool(
+        trajectory_mean_measured_squeeze.numel() or force_valid_sample_count.numel()
+    )
+    if has_trajectory_force_metrics and (
+        trajectory_mean_measured_squeeze.numel() != success.numel()
+        or force_valid_sample_count.numel() != success.numel()
+    ):
+        raise ValueError(
+            "Tabero trajectory force metrics must align with exact episode rows; "
+            f"success={success.numel()}, "
+            f"mean_force={trajectory_mean_measured_squeeze.numel()}, "
+            f"sample_count={force_valid_sample_count.numel()}."
+        )
 
     completed_episode_count = int(success.numel())
     firm_episode_count = int(firm_success.numel())
@@ -458,6 +474,46 @@ def aggregate_tabero_dsrl_env_metrics(
             "truncation_count": float(truncations.sum().item()),
         }
     )
+    if has_trajectory_force_metrics:
+        force_valid_sample_count = force_valid_sample_count.to(torch.float32)
+        invalid_force_rows = (force_valid_sample_count < 0) | (
+            (force_valid_sample_count > 0)
+            & ~torch.isfinite(trajectory_mean_measured_squeeze)
+        )
+        if invalid_force_rows.any():
+            raise ValueError("Tabero trajectory force metric rows are invalid.")
+
+        successful_rows = success.to(torch.bool)
+        successful_force_rows = (
+            successful_rows
+            & (force_valid_sample_count > 0)
+            & torch.isfinite(trajectory_mean_measured_squeeze)
+        )
+        successful_force_means = trajectory_mean_measured_squeeze[
+            successful_force_rows
+        ].to(torch.float32)
+        successful_sample_counts = force_valid_sample_count[successful_rows]
+        metrics.update(
+            {
+                "success_trajectory_mean_measured_squeeze": mean_or_nan(
+                    successful_force_means
+                ),
+                "success_trajectory_mean_measured_squeeze_median": (
+                    float(torch.quantile(successful_force_means, 0.5).item())
+                    if successful_force_means.numel()
+                    else float("nan")
+                ),
+                "success_force_valid_sample_count": mean_or_nan(
+                    successful_sample_counts
+                ),
+                "success_force_trajectory_count": int(
+                    successful_force_rows.sum().item()
+                ),
+                "success_force_missing_trajectory_count": int(
+                    successful_rows.sum().item() - successful_force_rows.sum().item()
+                ),
+            }
+        )
     return metrics
 
 

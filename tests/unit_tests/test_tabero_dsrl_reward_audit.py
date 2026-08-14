@@ -55,6 +55,10 @@ def _matching_step_metrics(*, success: bool = True, failure_termination: bool = 
         "firm_success_once": [episode_success],
         "firm_return": [episode_returns],
         "firm_squeeze_pred_mean": [torch.tensor([2.0, 3.0])],
+        "trajectory_mean_measured_squeeze": [
+            torch.tensor([10.0 if success else float("nan"), 999.0])
+        ],
+        "force_valid_sample_count": [torch.tensor([5 if success else 0, 2])],
     }
     env_metrics.update(
         {
@@ -122,6 +126,8 @@ def test_episode_record_projection_preserves_early_firm_and_gentle_terminals():
         "reward_sum": torch.tensor([1.0, 0.0]),
         "terminal_step_reward": torch.tensor([1.0, 0.0]),
         "squeeze_pred_mean": torch.tensor([2.0, 0.5]),
+        "trajectory_mean_measured_squeeze": torch.tensor([12.0, 25.0]),
+        "force_valid_sample_count": torch.tensor([8, 3]),
         "task_id": torch.tensor([0.0, 0.0]),
         "task_shard_id": torch.tensor([1.0, 1.0]),
     }
@@ -133,6 +139,8 @@ def test_episode_record_projection_preserves_early_firm_and_gentle_terminals():
     assert projected["gentle_success_once"].tolist() == [0.0]
     assert projected["firm_return"].tolist() == [1.0]
     assert projected["gentle_return"].tolist() == [0.0]
+    assert projected["trajectory_mean_measured_squeeze"].tolist() == [12.0, 25.0]
+    assert projected["force_valid_sample_count"].tolist() == [8, 3]
 
 
 def test_exact_env_aggregation_uses_episode_records_and_reward_sufficient_stats():
@@ -149,11 +157,41 @@ def test_exact_env_aggregation_uses_episode_records_and_reward_sufficient_stats(
     assert exact["reward_sum"] == 1
     assert exact["termination_count"] == 1
     assert exact["truncation_count"] == 1
+    assert exact["success_trajectory_mean_measured_squeeze"] == pytest.approx(10.0)
+    assert exact["success_trajectory_mean_measured_squeeze_median"] == pytest.approx(
+        10.0
+    )
+    assert exact["success_force_valid_sample_count"] == pytest.approx(5.0)
+    assert exact["success_force_trajectory_count"] == 1
+    assert exact["success_force_missing_trajectory_count"] == 0
     assert audit_metrics == {
         "audit/dsrl_reward_match": 1.0,
         "audit/dsrl_reward_mismatch_count": 0.0,
     }
     assert mismatches == ()
+
+
+def test_exact_force_metrics_are_success_only_and_use_global_episode_median():
+    first, _ = _matching_step_metrics()
+    second, _ = _matching_step_metrics()
+    first["success_once"] = [torch.tensor([1.0, 0.0])]
+    first["trajectory_mean_measured_squeeze"] = [torch.tensor([10.0, 999.0])]
+    first["force_valid_sample_count"] = [torch.tensor([5, 2])]
+    second["success_once"] = [torch.tensor([1.0, 1.0])]
+    second["trajectory_mean_measured_squeeze"] = [torch.tensor([20.0, 40.0])]
+    second["force_valid_sample_count"] = [torch.tensor([7, 9])]
+
+    exact = aggregate_tabero_dsrl_env_metrics([first, second])
+
+    assert exact["success_trajectory_mean_measured_squeeze"] == pytest.approx(
+        70.0 / 3.0
+    )
+    assert exact["success_trajectory_mean_measured_squeeze_median"] == pytest.approx(
+        20.0
+    )
+    assert exact["success_force_valid_sample_count"] == pytest.approx(7.0)
+    assert exact["success_force_trajectory_count"] == 3
+    assert exact["success_force_missing_trajectory_count"] == 0
 
 
 def test_reward_comparison_accepts_matching_failure_termination():

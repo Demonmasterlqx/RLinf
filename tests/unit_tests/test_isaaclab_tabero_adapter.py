@@ -309,6 +309,75 @@ def test_hdf5_wrapper_captures_terminal_observation_before_internal_reset():
     assert terminal["policy"]["eef_pose"][0, 0].item() == 100.0
 
 
+def test_hdf5_wrapper_captures_trajectory_force_metrics_before_internal_reset():
+    class FakeObservationManager:
+        def compute(self, update_history=False):
+            assert update_history is False
+            return _raw_tabero_obs([100.0, 101.0], marker_offset=100.0)
+
+    class FakeForceRewardTerm:
+        def __init__(self):
+            self.trajectory_mean_force = torch.tensor([3.0, 5.0])
+            self.valid_sample_count = torch.tensor([2, 4])
+
+    class FakeRewardManager:
+        active_terms = ["success"]
+
+        def __init__(self, reward_term):
+            self._reward_term = reward_term
+
+        def get_term_cfg(self, term_name):
+            assert term_name == "success"
+            return SimpleNamespace(func=self._reward_term)
+
+    class FakeEnv:
+        num_envs = 2
+        device = torch.device("cpu")
+
+        def __init__(self):
+            self.observation_manager = FakeObservationManager()
+            self.force_reward_term = FakeForceRewardTerm()
+            self.reward_manager = FakeRewardManager(self.force_reward_term)
+
+        def _reset_idx(self, env_ids):
+            self.force_reward_term.trajectory_mean_force[env_ids] = 0.0
+            self.force_reward_term.valid_sample_count[env_ids] = 0
+
+        def step(self, action):
+            del action
+            self._reset_idx(torch.tensor([0]))
+            return (
+                _raw_tabero_obs([10.0, 11.0], marker_offset=10.0),
+                torch.tensor([1.0, 0.0]),
+                torch.tensor([True, False]),
+                torch.tensor([False, False]),
+                {},
+            )
+
+    wrapped = TaberoHdf5ResetWrapper(
+        FakeEnv(),
+        dataset_handler=SimpleNamespace(),
+        episode_names=["demo_0"],
+        shard_id=0,
+        total_shards=1,
+        capture_terminal_observation=True,
+    )
+
+    _, _, _, _, extras = wrapped.step(torch.zeros((2, 13)))
+
+    mean_force = extras[
+        getattr(
+            tabero_tacfield,
+            "_TERMINAL_TRAJECTORY_MEAN_MEASURED_SQUEEZE_KEY",
+        )
+    ]
+    sample_count = extras[
+        getattr(tabero_tacfield, "_TERMINAL_FORCE_VALID_SAMPLE_COUNT_KEY")
+    ]
+    torch.testing.assert_close(mean_force, torch.tensor([3.0, 5.0]))
+    assert sample_count.tolist() == [2, 4]
+
+
 def test_hdf5_wrapper_accumulates_terminal_rows_across_multiple_internal_resets():
     class FakeObservationManager:
         def __init__(self):
@@ -442,6 +511,33 @@ def test_terminal_safe_chunk_without_done_executes_policy_and_skips_reset():
     assert metrics["done_envs"].item() == 0
     assert metrics["post_done_hold_steps"].item() == 0
     assert infos_list[-1]["_tabero_chunk_episode_records"] == {}
+
+
+def test_terminal_safe_chunk_records_measured_force_metrics_at_first_done():
+    env = _terminal_safe_adapter([{0: "termination"}, {}])
+    original_step = env.env.step
+
+    def step_with_force_metrics(actions):
+        obs, rewards, terminations, truncations, extras = original_step(actions)
+        extras = dict(extras)
+        extras[
+            getattr(
+                tabero_tacfield,
+                "_TERMINAL_TRAJECTORY_MEAN_MEASURED_SQUEEZE_KEY",
+            )
+        ] = torch.tensor([3.5])
+        extras[getattr(tabero_tacfield, "_TERMINAL_FORCE_VALID_SAMPLE_COUNT_KEY")] = (
+            torch.tensor([6])
+        )
+        return obs, rewards, terminations, truncations, extras
+
+    env.env.step = step_with_force_metrics
+
+    _, _, _, _, infos_list = env.chunk_step(torch.ones((1, 2, 13)))
+
+    records = infos_list[-1]["_tabero_chunk_episode_records"]
+    assert records["trajectory_mean_measured_squeeze"].tolist() == [3.5]
+    assert records["force_valid_sample_count"].tolist() == [6]
 
 
 def test_terminal_safe_chunk_resets_simultaneous_done_environments_together():
@@ -1150,6 +1246,193 @@ def test_stable_success_reward_applies_per_env_condition_multipliers():
     torch.testing.assert_close(reward, torch.tensor([20.0, 60.0, 0.0, 0.0]))
 
 
+class _FakeForceBonusObservationManager:
+    def __init__(self, grasp_schedule: list[torch.Tensor]):
+        self._grasp_schedule = list(grasp_schedule)
+        self._step = 0
+
+    def compute_group(self, group_name, update_history=False):
+        assert group_name == "subtask_terms"
+        assert update_history is False
+        return {"grasp_1": self._grasp_schedule[self._step].clone()}
+
+
+def _make_force_bonus_term(
+    *,
+    grasp_schedule: list[list[bool]],
+    squeeze_schedule: list[list[float]],
+    success_schedule: list[list[bool]],
+    failure_schedule: list[list[bool]] | None = None,
+    timeout_schedule: list[list[bool]] | None = None,
+    coefficient: float = 0.3,
+    epsilon: float = 0.1,
+    max_bonus: float = 0.5,
+    min_valid_samples: int = 1,
+    multipliers: tuple[float, ...] | None = None,
+):
+    num_envs = len(grasp_schedule[0])
+    steps = len(grasp_schedule)
+    assert len(squeeze_schedule) == len(success_schedule) == steps
+    failure_schedule = failure_schedule or [[False] * num_envs for _ in range(steps)]
+    timeout_schedule = timeout_schedule or [[False] * num_envs for _ in range(steps)]
+
+    class FakeManagerTermBase:
+        def __init__(self, cfg, env):
+            self.cfg = cfg
+            self._env = env
+
+    observation_manager = _FakeForceBonusObservationManager(
+        [torch.tensor(values) for values in grasp_schedule]
+    )
+    termination_manager = _FakeTerminationManager(
+        terms={
+            "success": torch.tensor(success_schedule[0]),
+            "object_dropped": torch.tensor(failure_schedule[0]),
+        },
+        time_outs=torch.tensor(timeout_schedule[0]),
+    )
+    env = SimpleNamespace(
+        num_envs=num_envs,
+        device=torch.device("cpu"),
+        step_dt=0.05,
+        observation_manager=observation_manager,
+        termination_manager=termination_manager,
+    )
+    force_step = {"value": 0}
+
+    def force_reader(_env, contact_sensor_name):
+        assert _env is env
+        assert contact_sensor_name == "contact_gripper"
+        step = force_step["value"]
+        squeeze = torch.tensor(squeeze_schedule[step], dtype=torch.float32)
+        # The production definition is 2 * min(|left_z|, |right_z|).
+        force = torch.zeros((num_envs, 2, 3), dtype=torch.float32)
+        force[:, :, 2] = squeeze[:, None] / 2.0
+        force_step["value"] += 1
+        return force
+
+    params = {
+        "success_term_name": "success",
+        "failure_term_names": ("object_dropped",),
+        "force_sources": (("grasp_1", "contact_gripper"),),
+        "force_reader": force_reader,
+        "terminal_reward": 1.0,
+        "coefficient": coefficient,
+        "epsilon": epsilon,
+        "max_bonus": max_bonus,
+        "min_valid_samples": min_valid_samples,
+        "contact_epsilon": 1.0e-4,
+    }
+    if multipliers is not None:
+        params["env_reward_multipliers"] = multipliers
+    cfg = SimpleNamespace(params=params)
+    reward_cls = tabero_tacfield._make_trajectory_force_success_reward_term(
+        FakeManagerTermBase
+    )
+    reward_term = reward_cls(cfg, env)
+
+    def run_step(step: int) -> torch.Tensor:
+        observation_manager._step = step
+        termination_manager._terms["success"] = torch.tensor(success_schedule[step])
+        termination_manager._terms["object_dropped"] = torch.tensor(
+            failure_schedule[step]
+        )
+        termination_manager.time_outs = torch.tensor(timeout_schedule[step])
+        return reward_term(env, **params)
+
+    return reward_term, run_step
+
+
+def test_force_bonus_starts_at_grasp_and_ignores_zero_force_release_steps():
+    reward_term, run_step = _make_force_bonus_term(
+        grasp_schedule=[[False], [True], [False], [False]],
+        squeeze_schedule=[[10.0], [4.0], [2.0], [0.0]],
+        success_schedule=[[False], [False], [False], [True]],
+    )
+
+    rewards = [run_step(step) for step in range(4)]
+
+    assert [reward.item() for reward in rewards[:3]] == [0.0, 0.0, 0.0]
+    assert reward_term.valid_sample_count.tolist() == [2]
+    torch.testing.assert_close(reward_term.trajectory_mean_force, torch.tensor([3.0]))
+    # Raw term is divided by step_dt; RewardManager later multiplies by dt.
+    assert rewards[-1].item() == pytest.approx((1.0 + 0.3 / 3.0) / 0.05)
+
+
+def test_force_bonus_is_success_only_bounded_and_condition_scaled():
+    reward_term, run_step = _make_force_bonus_term(
+        grasp_schedule=[[True, True, True]],
+        squeeze_schedule=[[0.2, 2.0, 2.0]],
+        success_schedule=[[True, True, True]],
+        failure_schedule=[[False, True, False]],
+        timeout_schedule=[[False, False, True]],
+        coefficient=1.0,
+        epsilon=0.1,
+        max_bonus=0.2,
+        multipliers=(2.0, 2.0, 2.0),
+    )
+
+    reward = run_step(0)
+
+    assert reward_term.valid_sample_count.tolist() == [1, 1, 1]
+    torch.testing.assert_close(reward, torch.tensor([48.0, 0.0, 0.0]))
+
+
+def test_force_bonus_requires_minimum_samples_and_resets_selected_envs_only():
+    reward_term, run_step = _make_force_bonus_term(
+        grasp_schedule=[[True, True], [False, False]],
+        squeeze_schedule=[[2.0, 4.0], [2.0, 4.0]],
+        success_schedule=[[False, False], [True, True]],
+        min_valid_samples=2,
+    )
+
+    run_step(0)
+    reward_term.reset(torch.tensor([0]))
+    reward = run_step(1)
+
+    assert reward_term.valid_sample_count.tolist() == [0, 2]
+    assert reward[0].item() == pytest.approx(1.0 / 0.05)
+    assert reward[1].item() == pytest.approx((1.0 + 0.3 / 4.0) / 0.05)
+
+
+def test_force_bonus_rejects_non_finite_measured_force():
+    _, run_step = _make_force_bonus_term(
+        grasp_schedule=[[True]],
+        squeeze_schedule=[[float("nan")]],
+        success_schedule=[[False]],
+    )
+
+    with pytest.raises(RuntimeError, match="non-finite measured contact force"):
+        run_step(0)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("coefficient", -0.1, "coefficient"),
+        ("epsilon", 0.0, "epsilon"),
+        ("max_bonus", 1.0, "max_bonus"),
+        ("min_valid_samples", 0, "min_valid_samples"),
+        ("contact_epsilon", -1.0, "contact_epsilon"),
+    ],
+)
+def test_force_bonus_config_rejects_unsafe_values(field, value, message):
+    config = {
+        "enabled": True,
+        "coefficient": 0.1,
+        "epsilon": 0.1,
+        "max_bonus": 0.2,
+        "min_valid_samples": 1,
+        "contact_epsilon": 1.0e-4,
+    }
+    config[field] = value
+
+    with pytest.raises(ValueError, match=message):
+        tabero_tacfield._validate_force_bonus_cfg(
+            OmegaConf.create(config), terminal_reward=1.0
+        )
+
+
 def test_install_success_reward_wraps_raw_success_and_lists_failure_terms():
     install_fn = getattr(tabero_tacfield, "_install_success_reward")
 
@@ -1238,6 +1521,131 @@ def test_install_success_reward_forwards_condition_multipliers():
         1.0,
         3.0,
     )
+
+
+def test_install_success_reward_installs_force_tracking_term_and_params():
+    install_fn = getattr(tabero_tacfield, "_install_success_reward")
+
+    class FakeManagerTermBase:
+        def __init__(self, cfg, env):
+            self.cfg = cfg
+            self.env = env
+
+    class FakeTerm:
+        def __init__(self, func, params=None, time_out=False):
+            self.func = func
+            self.params = params or {}
+            self.time_out = time_out
+
+    class FakeRewardTerm:
+        def __init__(self, func, weight, params):
+            self.func = func
+            self.weight = weight
+            self.params = params
+
+    def raw_success(env):
+        return env.raw
+
+    force_reader = object()
+    grasp_term = FakeTerm(
+        lambda env: env.grasped,
+        {"object_cfg": SimpleNamespace(name="target_object")},
+    )
+    observations = SimpleNamespace(subtask_terms=SimpleNamespace(grasp_1=grasp_term))
+    terminations = SimpleNamespace(success=FakeTerm(raw_success))
+    env_cfg = SimpleNamespace(
+        observations=observations,
+        terminations=terminations,
+        rewards=None,
+    )
+    force_bonus_cfg = OmegaConf.create(
+        {
+            "enabled": True,
+            "coefficient": 0.1,
+            "epsilon": 0.2,
+            "max_bonus": 0.25,
+            "min_valid_samples": 3,
+            "contact_epsilon": 0.01,
+        }
+    )
+
+    install_fn(
+        env_cfg,
+        FakeRewardTerm,
+        reward_coef=2.0,
+        manager_term_base_cls=FakeManagerTermBase,
+        required_steps=8,
+        terminal_reward=1.5,
+        force_bonus_cfg=force_bonus_cfg,
+        force_reader=force_reader,
+    )
+
+    reward_cfg = env_cfg.rewards["success"]
+    assert issubclass(reward_cfg.func, FakeManagerTermBase)
+    assert reward_cfg.func.__name__ == "TrajectoryForceSuccessRewardTerm"
+    assert reward_cfg.weight == 2.0
+    assert reward_cfg.params == {
+        "success_term_name": "success",
+        "failure_term_names": (),
+        "force_sources": (("grasp_1", "contact_gripper"),),
+        "force_reader": force_reader,
+        "terminal_reward": 1.5,
+        "coefficient": 0.1,
+        "epsilon": 0.2,
+        "max_bonus": 0.25,
+        "min_valid_samples": 3,
+        "contact_epsilon": 0.01,
+    }
+
+
+@pytest.mark.parametrize("missing", ["force_reader", "grasp_source"])
+def test_install_success_reward_rejects_missing_force_bonus_source(missing):
+    class FakeManagerTermBase:
+        pass
+
+    class FakeTerm:
+        def __init__(self, func, params=None):
+            self.func = func
+            self.params = params or {}
+
+    def raw_success(env):
+        return env.raw
+
+    observations = SimpleNamespace(
+        subtask_terms=SimpleNamespace(
+            grasp_1=FakeTerm(
+                lambda env: env.grasped,
+                {"object_cfg": SimpleNamespace(name="target_object")},
+            )
+        )
+    )
+    if missing == "grasp_source":
+        observations.subtask_terms = SimpleNamespace()
+    env_cfg = SimpleNamespace(
+        observations=observations,
+        terminations=SimpleNamespace(success=FakeTerm(raw_success)),
+        rewards=None,
+    )
+
+    with pytest.raises(ValueError, match="reader|grasp observations"):
+        tabero_tacfield._install_success_reward(
+            env_cfg,
+            lambda **kwargs: SimpleNamespace(**kwargs),
+            reward_coef=1.0,
+            manager_term_base_cls=FakeManagerTermBase,
+            force_bonus_cfg=OmegaConf.create(
+                {
+                    "enabled": True,
+                    "coefficient": 0.1,
+                    "epsilon": 0.1,
+                    "max_bonus": 0.2,
+                }
+            ),
+            force_reader=None if missing == "force_reader" else object(),
+        )
+
+    # Validation is atomic: a rejected install must not wrap the success term.
+    assert env_cfg.terminations.success.func is raw_success
 
 
 def test_dynamic_consecutive_success_term_resets_through_manager_contract():

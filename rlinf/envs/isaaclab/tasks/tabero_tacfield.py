@@ -44,6 +44,12 @@ _VALID_CHUNK_BOUNDARY_MODES = frozenset(
 _CHUNK_EPISODE_RECORDS_KEY = "_tabero_chunk_episode_records"
 _EPISODE_CONDITION_ID_KEY = "_tabero_condition_id"
 _EPISODE_SQUEEZE_PRED_MEAN_KEY = "_tabero_squeeze_pred_mean"
+_EPISODE_TRAJECTORY_MEAN_MEASURED_SQUEEZE_KEY = "trajectory_mean_measured_squeeze"
+_EPISODE_FORCE_VALID_SAMPLE_COUNT_KEY = "force_valid_sample_count"
+_TERMINAL_TRAJECTORY_MEAN_MEASURED_SQUEEZE_KEY = (
+    "tabero_terminal_trajectory_mean_measured_squeeze"
+)
+_TERMINAL_FORCE_VALID_SAMPLE_COUNT_KEY = "tabero_terminal_force_valid_sample_count"
 
 
 def validate_tabero_firm_prompts(
@@ -334,6 +340,26 @@ def stack_tabero_initial_states(states: list[Any]) -> Any:
     raise TypeError(f"Unsupported Tabero initial-state value: {type(first)!r}.")
 
 
+def _resolve_trajectory_force_reward_term(env: Any) -> Any | None:
+    """Return the installed measured-force reward term when it is active."""
+
+    reward_manager = getattr(env, "reward_manager", None)
+    if reward_manager is None or "success" not in getattr(
+        reward_manager, "active_terms", ()
+    ):
+        return None
+    try:
+        reward_term = reward_manager.get_term_cfg("success").func
+    except (AttributeError, KeyError, ValueError):
+        return None
+    if not all(
+        hasattr(reward_term, field)
+        for field in ("trajectory_mean_force", "valid_sample_count")
+    ):
+        return None
+    return reward_term
+
+
 class TaberoHdf5ResetWrapper:
     """Apply HDF5 demo initial states after the simulator bootstrap reset."""
 
@@ -356,12 +382,60 @@ class TaberoHdf5ResetWrapper:
         self._rollout_round = 0
         self._capture_terminal_observation = bool(capture_terminal_observation)
         self._capture_terminal_on_reset = False
+        self._trajectory_force_reward_term = _resolve_trajectory_force_reward_term(
+            self._env
+        )
         self._step_terminal_observation: Any | None = None
         self._step_terminal_mask = torch.zeros(
             int(self._env.num_envs), dtype=torch.bool, device=self._env.device
         )
+        self._step_terminal_force_mean = torch.full(
+            (int(self._env.num_envs),),
+            float("nan"),
+            dtype=torch.float32,
+            device=self._env.device,
+        )
+        self._step_terminal_force_count = torch.zeros(
+            int(self._env.num_envs), dtype=torch.int64, device=self._env.device
+        )
         if self._capture_terminal_observation:
             self._install_terminal_observation_capture()
+
+    def _read_trajectory_force_metrics(self) -> tuple[torch.Tensor, torch.Tensor]:
+        reward_term = self._trajectory_force_reward_term
+        if reward_term is None:
+            raise RuntimeError("Tabero measured-force reward term is not active.")
+        mean_force = torch.as_tensor(
+            reward_term.trajectory_mean_force,
+            dtype=torch.float32,
+            device=self._env.device,
+        ).reshape(-1)
+        valid_sample_count = torch.as_tensor(
+            reward_term.valid_sample_count,
+            dtype=torch.int64,
+            device=self._env.device,
+        ).reshape(-1)
+        expected_shape = (int(self._env.num_envs),)
+        if (
+            mean_force.shape != expected_shape
+            or valid_sample_count.shape != expected_shape
+        ):
+            raise RuntimeError(
+                "Tabero trajectory force metrics must match the environment batch; "
+                f"mean={tuple(mean_force.shape)}, "
+                f"count={tuple(valid_sample_count.shape)}, "
+                f"expected={expected_shape}."
+            )
+        if (valid_sample_count < 0).any() or not torch.isfinite(
+            mean_force[valid_sample_count > 0]
+        ).all():
+            raise RuntimeError("Tabero trajectory force metrics are invalid.")
+        mean_force = torch.where(
+            valid_sample_count > 0,
+            mean_force,
+            torch.full_like(mean_force, float("nan")),
+        )
+        return mean_force, valid_sample_count
 
     def _install_terminal_observation_capture(self) -> None:
         if not hasattr(self._env, "_reset_idx") or not hasattr(
@@ -395,6 +469,16 @@ class TaberoHdf5ResetWrapper:
                         capture_mask,
                     )
                 self._step_terminal_mask[env_ids_tensor] = True
+                if self._trajectory_force_reward_term is not None:
+                    mean_force, valid_sample_count = (
+                        self._read_trajectory_force_metrics()
+                    )
+                    self._step_terminal_force_mean[env_ids_tensor] = mean_force[
+                        env_ids_tensor
+                    ]
+                    self._step_terminal_force_count[env_ids_tensor] = (
+                        valid_sample_count[env_ids_tensor]
+                    )
             original_reset_idx(env_ids)
 
         self._env._reset_idx = reset_idx_with_terminal_capture
@@ -455,11 +539,36 @@ class TaberoHdf5ResetWrapper:
 
         self._step_terminal_observation = None
         self._step_terminal_mask.zero_()
+        self._step_terminal_force_mean.fill_(float("nan"))
+        self._step_terminal_force_count.zero_()
         self._capture_terminal_on_reset = True
         try:
             obs, reward, terminations, truncations, extras = self._env.step(action)
         finally:
             self._capture_terminal_on_reset = False
+
+        if self._trajectory_force_reward_term is not None:
+            current_force_mean, current_force_count = (
+                self._read_trajectory_force_metrics()
+            )
+            captured = self._step_terminal_mask
+            trajectory_force_mean = torch.where(
+                captured,
+                self._step_terminal_force_mean,
+                current_force_mean,
+            )
+            trajectory_force_count = torch.where(
+                captured,
+                self._step_terminal_force_count,
+                current_force_count,
+            )
+            extras = dict(extras or {})
+            extras[_TERMINAL_TRAJECTORY_MEAN_MEASURED_SQUEEZE_KEY] = (
+                trajectory_force_mean.clone()
+            )
+            extras[_TERMINAL_FORCE_VALID_SAMPLE_COUNT_KEY] = (
+                trajectory_force_count.clone()
+            )
 
         dones = torch.logical_or(terminations, truncations).to(dtype=torch.bool)
         if dones.any():
@@ -612,6 +721,293 @@ def _stable_success_terminal_reward(
     return reward
 
 
+def _validate_force_bonus_cfg(
+    force_bonus_cfg: Any, terminal_reward: float
+) -> dict[str, Any]:
+    """Validate and normalize the optional success-only measured-force bonus."""
+
+    enabled = bool(_cfg_get(force_bonus_cfg, "enabled", False))
+    normalized = {
+        "enabled": enabled,
+        "coefficient": float(_cfg_get(force_bonus_cfg, "coefficient", 0.0)),
+        "epsilon": float(_cfg_get(force_bonus_cfg, "epsilon", 0.1)),
+        "max_bonus": float(_cfg_get(force_bonus_cfg, "max_bonus", 0.0)),
+        "min_valid_samples": int(_cfg_get(force_bonus_cfg, "min_valid_samples", 1)),
+        "contact_epsilon": float(_cfg_get(force_bonus_cfg, "contact_epsilon", 1.0e-4)),
+    }
+    if not enabled:
+        return normalized
+    numeric_values = {
+        "terminal_reward": float(terminal_reward),
+        "coefficient": normalized["coefficient"],
+        "epsilon": normalized["epsilon"],
+        "max_bonus": normalized["max_bonus"],
+        "contact_epsilon": normalized["contact_epsilon"],
+    }
+    non_finite = [
+        name
+        for name, value in numeric_values.items()
+        if not torch.isfinite(torch.tensor(value)).item()
+    ]
+    if non_finite:
+        raise ValueError(
+            "Tabero success.force_bonus values must be finite; invalid fields: "
+            f"{non_finite}."
+        )
+    if terminal_reward <= 0:
+        raise ValueError(
+            "Tabero success.force_bonus requires terminal_reward to be finite and positive."
+        )
+    if normalized["coefficient"] < 0:
+        raise ValueError("Tabero success.force_bonus.coefficient must be non-negative.")
+    if normalized["epsilon"] <= 0:
+        raise ValueError("Tabero success.force_bonus.epsilon must be positive.")
+    if not 0 < normalized["max_bonus"] < float(terminal_reward):
+        raise ValueError(
+            "Tabero success.force_bonus.max_bonus must be positive and smaller "
+            "than terminal_reward so task success remains the primary objective."
+        )
+    if normalized["min_valid_samples"] < 1:
+        raise ValueError(
+            "Tabero success.force_bonus.min_valid_samples must be at least one."
+        )
+    if normalized["contact_epsilon"] < 0:
+        raise ValueError(
+            "Tabero success.force_bonus.contact_epsilon must be non-negative."
+        )
+    return normalized
+
+
+def _resolve_force_bonus_sources(isaac_env_cfg: Any) -> tuple[tuple[str, str], ...]:
+    """Map TacManip grasp observations to the measured gripper-force sensor.
+
+    The grasp observation supplies the target-object gate (object proximity,
+    two-finger contact, and closed gripper).  Force magnitude comes from the
+    same ``contact_gripper`` signal exposed to the policy and direct evaluator.
+    IsaacLab filtered contact matrices cannot represent this environment's
+    two-finger-to-one-object query reliably because they only support
+    one-to-many filtering.
+    """
+
+    observations_cfg = getattr(isaac_env_cfg, "observations", None)
+    subtask_cfg = getattr(observations_cfg, "subtask_terms", None)
+    sources: list[tuple[str, str]] = []
+    term_names = dir(subtask_cfg) if subtask_cfg is not None else ()
+    for term_name in term_names:
+        if term_name.startswith("_"):
+            continue
+        term_cfg = getattr(subtask_cfg, term_name, None)
+        if not term_name.startswith("grasp_") or not hasattr(term_cfg, "func"):
+            continue
+        params = dict(getattr(term_cfg, "params", {}) or {})
+        object_cfg = params.get("object_cfg")
+        object_name = getattr(object_cfg, "name", None)
+        if object_name:
+            sources.append((str(term_name), "contact_gripper"))
+    return tuple(sources)
+
+
+def _read_current_gripper_force_local(env, contact_sensor_name: str) -> torch.Tensor:
+    """Read the current measured two-finger force in the gripper-local frames."""
+
+    from tac_manip.tasks.manipulation.libero.mdp.observations import (
+        contact_force_in_gripper_frame,
+    )
+
+    force_history = contact_force_in_gripper_frame(
+        env,
+        contact_sensor_name=contact_sensor_name,
+        history_length=1,
+    )
+    if force_history.shape != (env.num_envs, 1, 2, 3):
+        raise RuntimeError(
+            "Tabero force bonus expected current gripper-force history shape "
+            f"({env.num_envs}, 1, 2, 3), got {tuple(force_history.shape)}."
+        )
+    return force_history[:, 0]
+
+
+def _make_trajectory_force_success_reward_term(manager_term_base_cls: type) -> type:
+    """Build an IsaacLab reward term that tracks measured force within episodes."""
+
+    class TrajectoryForceSuccessRewardTerm(manager_term_base_cls):
+        def __init__(self, cfg, env) -> None:
+            super().__init__(cfg, env)
+            params = cfg.params
+            self._force_sources = tuple(params["force_sources"])
+            if not self._force_sources:
+                raise ValueError(
+                    "Tabero force bonus requires at least one grasp observation source."
+                )
+            self._force_reader = params["force_reader"]
+            self._terminal_reward = float(params["terminal_reward"])
+            self._coefficient = float(params["coefficient"])
+            self._epsilon = float(params["epsilon"])
+            self._max_bonus = float(params["max_bonus"])
+            self._min_valid_samples = int(params["min_valid_samples"])
+            self._contact_epsilon = float(params["contact_epsilon"])
+            source_count = len(self._force_sources)
+            self._grasp_started = torch.zeros(
+                (env.num_envs, source_count), dtype=torch.bool, device=env.device
+            )
+            self._force_sum = torch.zeros(
+                env.num_envs, dtype=torch.float32, device=env.device
+            )
+            self._force_count = torch.zeros(
+                env.num_envs, dtype=torch.int64, device=env.device
+            )
+
+        @property
+        def trajectory_mean_force(self) -> torch.Tensor:
+            return self._force_sum / self._force_count.clamp(min=1)
+
+        @property
+        def valid_sample_count(self) -> torch.Tensor:
+            return self._force_count
+
+        def reset(self, env_ids=None) -> None:
+            if env_ids is None:
+                env_ids = slice(None)
+            elif not isinstance(env_ids, slice):
+                env_ids = torch.as_tensor(
+                    env_ids, device=self._force_sum.device, dtype=torch.long
+                )
+            self._grasp_started[env_ids] = False
+            self._force_sum[env_ids] = 0.0
+            self._force_count[env_ids] = 0
+
+        def _update_force_history(self, env) -> None:
+            grasp_observations = env.observation_manager.compute_group(
+                "subtask_terms", update_history=False
+            )
+            if not isinstance(grasp_observations, dict):
+                raise RuntimeError(
+                    "Tabero force bonus requires non-concatenated subtask observations."
+                )
+
+            per_source_squeeze = []
+            per_source_valid = []
+            for source_index, (grasp_term_name, contact_sensor_name) in enumerate(
+                self._force_sources
+            ):
+                if grasp_term_name not in grasp_observations:
+                    raise RuntimeError(
+                        "Tabero force bonus could not find grasp observation "
+                        f"{grasp_term_name!r}."
+                    )
+                grasped = torch.as_tensor(
+                    grasp_observations[grasp_term_name],
+                    device=self._force_sum.device,
+                    dtype=torch.bool,
+                ).reshape(env.num_envs)
+                self._grasp_started[:, source_index] |= grasped
+
+                force_lr = self._force_reader(
+                    env, contact_sensor_name=contact_sensor_name
+                ).to(device=self._force_sum.device, dtype=torch.float32)
+                if force_lr.shape != (env.num_envs, 2, 3):
+                    raise RuntimeError(
+                        "Tabero force bonus expected object-filtered force shape "
+                        f"({env.num_envs}, 2, 3), got {tuple(force_lr.shape)}."
+                    )
+                if not torch.isfinite(force_lr).all():
+                    raise RuntimeError(
+                        "Tabero force bonus received non-finite measured contact force."
+                    )
+                finger_norms = torch.linalg.vector_norm(force_lr, dim=-1)
+                both_fingers_contact = torch.all(
+                    finger_norms > self._contact_epsilon, dim=1
+                )
+                squeeze = 2.0 * torch.minimum(
+                    force_lr[:, 0, 2].abs(), force_lr[:, 1, 2].abs()
+                )
+                per_source_squeeze.append(squeeze)
+                per_source_valid.append(
+                    self._grasp_started[:, source_index]
+                    & both_fingers_contact
+                    & (squeeze > self._contact_epsilon)
+                )
+
+            squeeze_by_source = torch.stack(per_source_squeeze, dim=1)
+            valid_by_source = torch.stack(per_source_valid, dim=1)
+            # A parallel gripper normally holds one object. If multiple filtered
+            # sensors are active, count the step once and use the strongest valid
+            # squeeze rather than double-counting the same pair of fingers.
+            valid_step = valid_by_source.any(dim=1)
+            measured_squeeze = torch.where(
+                valid_by_source,
+                squeeze_by_source,
+                torch.zeros_like(squeeze_by_source),
+            ).amax(dim=1)
+            self._force_sum[valid_step] += measured_squeeze[valid_step]
+            self._force_count[valid_step] += 1
+
+        def __call__(
+            self,
+            env,
+            success_term_name: str,
+            failure_term_names: tuple[str, ...],
+            force_sources: tuple[tuple[str, str], ...],
+            force_reader: Any,
+            terminal_reward: float,
+            coefficient: float,
+            epsilon: float,
+            max_bonus: float,
+            min_valid_samples: int,
+            contact_epsilon: float,
+            env_reward_multipliers: tuple[float, ...] | None = None,
+        ) -> torch.Tensor:
+            del (
+                force_sources,
+                force_reader,
+                terminal_reward,
+                coefficient,
+                epsilon,
+                max_bonus,
+                min_valid_samples,
+                contact_epsilon,
+            )
+            self._update_force_history(env)
+
+            success = env.termination_manager.get_term(success_term_name).to(
+                dtype=torch.bool
+            )
+            invalid = env.termination_manager.time_outs.to(dtype=torch.bool).clone()
+            for term_name in failure_term_names:
+                invalid |= env.termination_manager.get_term(term_name).to(
+                    dtype=torch.bool
+                )
+            valid_success = success & ~invalid
+
+            mean_force = self.trajectory_mean_force
+            enough_samples = self._force_count >= self._min_valid_samples
+            force_bonus = self._coefficient / mean_force.clamp(min=self._epsilon)
+            force_bonus = force_bonus.clamp(min=0.0, max=self._max_bonus)
+            force_bonus = torch.where(
+                enough_samples, force_bonus, torch.zeros_like(force_bonus)
+            )
+            reward = valid_success.to(dtype=torch.float32) * (
+                self._terminal_reward + force_bonus
+            )
+            reward = reward / float(env.step_dt)
+            if env_reward_multipliers is not None:
+                multipliers = torch.as_tensor(
+                    env_reward_multipliers,
+                    dtype=reward.dtype,
+                    device=reward.device,
+                )
+                if multipliers.shape != reward.shape:
+                    raise ValueError(
+                        "env_reward_multipliers must match the vector env reward shape; "
+                        f"got {tuple(multipliers.shape)} for {tuple(reward.shape)}."
+                    )
+                reward = reward * multipliers
+            return reward
+
+    TrajectoryForceSuccessRewardTerm.__name__ = "TrajectoryForceSuccessRewardTerm"
+    return TrajectoryForceSuccessRewardTerm
+
+
 def _termination_term_items(terminations_cfg: Any) -> list[tuple[str, Any]]:
     terms: list[tuple[str, Any]] = []
     for name in dir(terminations_cfg):
@@ -630,12 +1026,32 @@ def _install_success_reward(
     manager_term_base_cls: type,
     required_steps: int = 1,
     env_reward_multipliers: tuple[float, ...] | None = None,
+    terminal_reward: float = 1.0,
+    force_bonus_cfg: Any = None,
+    force_reader: Any = None,
 ) -> None:
     terminations_cfg = getattr(isaac_env_cfg, "terminations", None)
     success_term = getattr(terminations_cfg, "success", None)
     success_func = getattr(success_term, "func", None)
     if success_func is None:
         return
+
+    normalized_force_bonus = _validate_force_bonus_cfg(
+        force_bonus_cfg, terminal_reward=float(terminal_reward)
+    )
+    force_sources: tuple[tuple[str, str], ...] = ()
+    if normalized_force_bonus["enabled"]:
+        if force_reader is None:
+            raise ValueError(
+                "Tabero success.force_bonus is enabled but no measured-force "
+                "reader is available."
+            )
+        force_sources = _resolve_force_bonus_sources(isaac_env_cfg)
+        if not force_sources:
+            raise ValueError(
+                "Tabero success.force_bonus is enabled but the environment has no "
+                "grasp observations for object-filtered force tracking."
+            )
 
     success_params = dict(getattr(success_term, "params", {}) or {})
     success_term.func = _make_consecutive_success_term(manager_term_base_cls)
@@ -655,9 +1071,27 @@ def _install_success_reward(
     }
     if env_reward_multipliers is not None:
         reward_params["env_reward_multipliers"] = tuple(env_reward_multipliers)
+    if normalized_force_bonus["enabled"]:
+        reward_params.update(
+            {
+                "force_sources": force_sources,
+                "force_reader": force_reader,
+                "terminal_reward": float(terminal_reward),
+                "coefficient": normalized_force_bonus["coefficient"],
+                "epsilon": normalized_force_bonus["epsilon"],
+                "max_bonus": normalized_force_bonus["max_bonus"],
+                "min_valid_samples": normalized_force_bonus["min_valid_samples"],
+                "contact_epsilon": normalized_force_bonus["contact_epsilon"],
+            }
+        )
+        reward_func = _make_trajectory_force_success_reward_term(manager_term_base_cls)
+        reward_weight = float(reward_coef)
+    else:
+        reward_func = _stable_success_terminal_reward
+        reward_weight = float(reward_coef) * float(terminal_reward)
     success_reward = reward_term_cls(
-        func=_stable_success_terminal_reward,
-        weight=float(reward_coef),
+        func=reward_func,
+        weight=reward_weight,
         params=reward_params,
     )
     rewards_cfg = getattr(isaac_env_cfg, "rewards", None)
@@ -1151,11 +1585,14 @@ class IsaaclabTaberoTacFieldEnv(IsaaclabBaseEnv):
                 func=_camera_rgb_observation,
                 params={"camera_name": "eye_in_hand_cam"},
             )
+            force_bonus_cfg = _cfg_get(self._success_cfg, "force_bonus", None)
+            force_reader = None
+            if bool(_cfg_get(force_bonus_cfg, "enabled", False)):
+                force_reader = _read_current_gripper_force_local
             _install_success_reward(
                 isaac_env_cfg,
                 RewTerm,
-                float(self.cfg.reward_coef)
-                * float(_cfg_get(self._success_cfg, "terminal_reward", 1.0)),
+                float(self.cfg.reward_coef),
                 ManagerTermBase,
                 required_steps=int(
                     _cfg_get(self._success_cfg, "required_consecutive_steps", 1)
@@ -1164,6 +1601,11 @@ class IsaaclabTaberoTacFieldEnv(IsaaclabBaseEnv):
                     self._prompt_condition_ids,
                     self._success_cfg,
                 ),
+                terminal_reward=float(
+                    _cfg_get(self._success_cfg, "terminal_reward", 1.0)
+                ),
+                force_bonus_cfg=force_bonus_cfg,
+                force_reader=force_reader,
             )
 
             env = gym.make(
@@ -1298,6 +1740,17 @@ class IsaaclabTaberoTacFieldEnv(IsaaclabBaseEnv):
         raw_terminations = raw_terminations.clone().to(dtype=torch.bool)
         raw_truncations = raw_truncations.clone().to(dtype=torch.bool)
         raw_infos = dict(raw_infos or {})
+        trajectory_force_mean = raw_infos.pop(
+            _TERMINAL_TRAJECTORY_MEAN_MEASURED_SQUEEZE_KEY, None
+        )
+        trajectory_force_count = raw_infos.pop(
+            _TERMINAL_FORCE_VALID_SAMPLE_COUNT_KEY, None
+        )
+        if (trajectory_force_mean is None) != (trajectory_force_count is None):
+            raise RuntimeError(
+                "Tabero terminal step must provide trajectory force mean and "
+                "valid-sample count together."
+            )
 
         self._elapsed_steps[active_mask] += 1
         horizon_truncations = active_mask & (
@@ -1333,6 +1786,38 @@ class IsaaclabTaberoTacFieldEnv(IsaaclabBaseEnv):
 
         step_reward = torch.where(active_mask, step_reward, 0.0)
         infos = self._record_metrics(step_reward, terminations, {})
+        if trajectory_force_mean is not None:
+            trajectory_force_mean = torch.as_tensor(
+                trajectory_force_mean,
+                dtype=torch.float32,
+                device=step_reward.device,
+            ).reshape(-1)
+            trajectory_force_count = torch.as_tensor(
+                trajectory_force_count,
+                dtype=torch.int64,
+                device=step_reward.device,
+            ).reshape(-1)
+            expected_shape = (self.num_envs,)
+            if (
+                trajectory_force_mean.shape != expected_shape
+                or trajectory_force_count.shape != expected_shape
+            ):
+                raise RuntimeError(
+                    "Tabero terminal trajectory force metrics must match the "
+                    f"environment batch {expected_shape}."
+                )
+            if (trajectory_force_count < 0).any() or not torch.isfinite(
+                trajectory_force_mean[trajectory_force_count > 0]
+            ).all():
+                raise RuntimeError(
+                    "Tabero terminal trajectory force metrics are invalid."
+                )
+            infos["episode"][_EPISODE_TRAJECTORY_MEAN_MEASURED_SQUEEZE_KEY] = (
+                trajectory_force_mean.clone()
+            )
+            infos["episode"][_EPISODE_FORCE_VALID_SAMPLE_COUNT_KEY] = (
+                trajectory_force_count.clone()
+            )
         final_info = {"episode": _clone_nested_tensors(infos["episode"])}
         returned_terminations = terminations.clone()
         if self.ignore_terminations:
@@ -1452,6 +1937,17 @@ class IsaaclabTaberoTacFieldEnv(IsaaclabBaseEnv):
                         torch.float32
                     ),
                 }
+                if _EPISODE_TRAJECTORY_MEAN_MEASURED_SQUEEZE_KEY in episode:
+                    selected_episode_fields[
+                        _EPISODE_TRAJECTORY_MEAN_MEASURED_SQUEEZE_KEY
+                    ] = episode[_EPISODE_TRAJECTORY_MEAN_MEASURED_SQUEEZE_KEY][
+                        newly_done
+                    ].to(torch.float32)
+                    selected_episode_fields[_EPISODE_FORCE_VALID_SAMPLE_COUNT_KEY] = (
+                        episode[_EPISODE_FORCE_VALID_SAMPLE_COUNT_KEY][newly_done].to(
+                            torch.int64
+                        )
+                    )
                 for field, values in selected_episode_fields.items():
                     episode_record_shards.setdefault(field, []).append(values.clone())
                 first_done_step[newly_done] = step_index

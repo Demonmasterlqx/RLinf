@@ -81,16 +81,31 @@ def tabero_chunk_episode_records_to_env_info(
         "task_id",
         "task_shard_id",
     }
+    force_metric_fields = {
+        "trajectory_mean_measured_squeeze",
+        "force_valid_sample_count",
+    }
     missing = sorted(required_fields - set(records))
     if missing:
         if not records:
             return {}
         raise ValueError(f"Tabero chunk episode records are missing fields {missing}.")
+    present_force_metric_fields = force_metric_fields & set(records)
+    if (
+        present_force_metric_fields
+        and present_force_metric_fields != force_metric_fields
+    ):
+        missing_force_fields = sorted(force_metric_fields - set(records))
+        raise ValueError(
+            "Tabero chunk episode records must provide trajectory force metrics "
+            f"together; missing {missing_force_fields}."
+        )
 
     record_count = int(records["condition_id"].numel())
+    validated_fields = required_fields | present_force_metric_fields
     invalid_shapes = {
         field: tuple(records[field].shape)
-        for field in required_fields
+        for field in validated_fields
         if not torch.is_tensor(records[field])
         or records[field].ndim != 1
         or int(records[field].numel()) != record_count
@@ -117,6 +132,8 @@ def tabero_chunk_episode_records_to_env_info(
             "task_shard_id",
         )
     }
+    for field in present_force_metric_fields:
+        env_info[field] = records[field].detach().reshape(-1).cpu()
     condition_ids = records["condition_id"].detach().reshape(-1)
     for condition_name, condition_id in (("firm", 0), ("gentle", 1)):
         mask = condition_ids.eq(condition_id)
