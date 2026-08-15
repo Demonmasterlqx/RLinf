@@ -762,11 +762,8 @@ def _validate_force_bonus_cfg(
         raise ValueError("Tabero success.force_bonus.coefficient must be non-negative.")
     if normalized["epsilon"] <= 0:
         raise ValueError("Tabero success.force_bonus.epsilon must be positive.")
-    if not 0 < normalized["max_bonus"] < float(terminal_reward):
-        raise ValueError(
-            "Tabero success.force_bonus.max_bonus must be positive and smaller "
-            "than terminal_reward so task success remains the primary objective."
-        )
+    if normalized["max_bonus"] <= 0:
+        raise ValueError("Tabero success.force_bonus.max_bonus must be positive.")
     if normalized["min_valid_samples"] < 1:
         raise ValueError(
             "Tabero success.force_bonus.min_valid_samples must be at least one."

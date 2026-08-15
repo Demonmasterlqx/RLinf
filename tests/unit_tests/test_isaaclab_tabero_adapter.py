@@ -1411,7 +1411,10 @@ def test_force_bonus_rejects_non_finite_measured_force():
     [
         ("coefficient", -0.1, "coefficient"),
         ("epsilon", 0.0, "epsilon"),
-        ("max_bonus", 1.0, "max_bonus"),
+        ("max_bonus", 0.0, "max_bonus"),
+        ("max_bonus", -1.0, "max_bonus"),
+        ("max_bonus", float("nan"), "finite"),
+        ("max_bonus", float("inf"), "finite"),
         ("min_valid_samples", 0, "min_valid_samples"),
         ("contact_epsilon", -1.0, "contact_epsilon"),
     ],
@@ -1431,6 +1434,47 @@ def test_force_bonus_config_rejects_unsafe_values(field, value, message):
         tabero_tacfield._validate_force_bonus_cfg(
             OmegaConf.create(config), terminal_reward=1.0
         )
+
+
+def test_force_bonus_config_allows_positive_cap_above_terminal_reward():
+    config = OmegaConf.create(
+        {
+            "enabled": True,
+            "coefficient": 1.0,
+            "epsilon": 1.0,
+            "max_bonus": 10.0,
+            "min_valid_samples": 4,
+            "contact_epsilon": 1.0,
+        }
+    )
+
+    normalized = tabero_tacfield._validate_force_bonus_cfg(
+        config, terminal_reward=1.0
+    )
+
+    assert normalized["max_bonus"] == 10.0
+
+
+@pytest.mark.parametrize(
+    ("mean_force", "expected_bonus"),
+    [(0.5, 1.0), (2.0, 0.5), (50.0, 0.02)],
+)
+def test_force_bonus_coef1_maxbonus10_values(mean_force, expected_bonus):
+    reward_term, run_step = _make_force_bonus_term(
+        grasp_schedule=[[True]],
+        squeeze_schedule=[[mean_force]],
+        success_schedule=[[True]],
+        coefficient=1.0,
+        epsilon=1.0,
+        max_bonus=10.0,
+    )
+
+    reward = run_step(0)
+
+    assert reward_term.trajectory_mean_force.item() == pytest.approx(mean_force)
+    # The term divides by step_dt; RewardManager multiplies it back by step_dt.
+    terminal_reward = reward.item() * 0.05
+    assert terminal_reward == pytest.approx(1.0 + expected_bonus)
 
 
 def test_install_success_reward_wraps_raw_success_and_lists_failure_terms():
