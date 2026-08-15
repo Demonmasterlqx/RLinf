@@ -1,0 +1,312 @@
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+  job_logging:
+    version: 1
+    formatters:
+      simple:
+        format: "%(message)s"
+    handlers:
+      console:
+        class: logging.StreamHandler
+        formatter: simple
+        stream: ext://sys.stdout
+    root:
+      level: INFO
+      handlers: [console]
+    disable_existing_loggers: false
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor: "1"
+    rollout: "0"
+    env: "0"
+
+runner:
+  task_type: embodied
+  logger:
+    log_path: "/data/home/sim6g/code/tabero/results/tabero_task0_no_adverb_uniform_mass_friction_no_damage_force_reward_coef20_maxbonus1_action_expert_lora_phase2_step100_to200_2gpu_${oc.env:TABERO_TASK0_PHASE2_RUN_ID}"
+    project_name: tabero-rlinf
+    experiment_name: "tabero_task0_no_adverb_uniform_mass_friction_no_damage_force_reward_coef20_maxbonus1_action_expert_lora_phase2_step100_to200_2gpu_${oc.env:TABERO_TASK0_PHASE2_RUN_ID}"
+    logger_backends: ["tensorboard", "wandb"]
+  max_epochs: 200
+  max_steps: -1
+  only_eval: False
+  val_check_interval: -1
+  save_interval: 10
+  resume_dir: null
+  ckpt_path: null
+
+algorithm:
+  tabero_ppo_transition_boundary_semantics: terminal_observation_first_done_prefix_logprob_hdf5_reset_v1
+  normalize_advantages: True
+  kl_penalty: kl
+  group_size: 1
+  reward_coef: 1.0
+  reward_type: chunk_level
+  logprob_type: chunk_level
+  entropy_type: token_level
+  update_epoch: 1
+  adv_type: gae
+  loss_type: actor_critic
+  loss_agg_func: "token-mean"
+  kl_beta: 0.05
+  entropy_bonus: 0
+  clip_ratio_high: 0.2
+  clip_ratio_low: 0.2
+  clip_ratio_c: 3.0
+  value_clip: 0.2
+  huber_delta: 10.0
+  gamma: 0.99
+  gae_lambda: 0.95
+  filter_rewards: False
+  rewards_lower_bound: 0.1
+  rewards_upper_bound: 0.9
+
+env:
+  group_name: "EnvGroup"
+  train:
+    env_type: isaaclab
+    rollout_epoch: 2
+    total_num_envs: 21
+    auto_reset: False
+    ignore_terminations: False
+    use_rel_reward: False
+    seed: 42
+    group_size: 1
+    reward_coef: 1.0
+    use_fixed_reset_state_ids: True
+    max_steps_per_rollout_epoch: 360
+    max_episode_steps: 360
+    video_cfg:
+      save_video: False
+      info_on_video: True
+      fps: 20
+      video_base_dir: ${runner.logger.log_path}/video/train
+    init_params:
+      id: "Isaac-Libero-Franka-Hybrid-Tactile-v0"
+      num_envs: null
+      max_episode_steps: ${..max_episode_steps}
+      task_description: "pick up the alphabet soup and place it in the basket"
+      extension_path: "/data/home/sim6g/code/tabero/Tabero/source/tac_manip"
+      libero_config_dir: "/data/home/sim6g/code/tabero/Tabero/benchmarks/datasets/libero/config_profiles/alltask_fixed_damage_1000000_uniform_mass_05_16_friction_04_08_from_rlinf_sft_20k"
+      libero_assets_dir: "/data/home/sim6g/code/tabero/Tabero/benchmarks/datasets/libero/USD"
+      hdf5_initial_states_path: "/data/home/sim6g/code/tabero/Tabero/benchmarks/datasets/libero/assembled_hdf5/libero_object_task0_pick_up_the_alphabet_soup_and_place_it_in_the_basket_demo.hdf5"
+      hdf5_reset_assignment: cyclic
+      chunk_boundary_mode: terminal_safe_hdf5_v1
+      task_suite: "libero_object"
+      task_id: 0
+      tasks:
+        - task_suite: "libero_object"
+          task_id: 0
+      require_all_tasks_active: True
+      success:
+        required_consecutive_steps: 8
+        terminal_reward: 1.0
+        condition_reward_multipliers: null
+        force_bonus:
+          enabled: true
+          coefficient: 20.0
+          epsilon: 1.0
+          max_bonus: 1.0
+          min_valid_samples: 4
+          contact_epsilon: 1.0
+      prompt_conditions:
+        enabled: False
+      use_relative_mode: False
+      marker_history_len: 8
+      combined_marker_count: 198
+      main_image_key: "agentview_rgb"
+      wrist_image_key: "eye_in_hand_rgb"
+      marker_motion_key: "gripper_marker_motion"
+      force_key: null
+      agentview_cam:
+        height: 256
+        width: 256
+      eye_in_hand_cam:
+        height: 256
+        width: 256
+
+  eval:
+    env_type: isaaclab
+    rollout_epoch: 1
+    total_num_envs: 4
+    auto_reset: False
+    ignore_terminations: False
+    use_rel_reward: False
+    seed: 42
+    group_size: 1
+    reward_coef: 1.0
+    use_fixed_reset_state_ids: True
+    max_steps_per_rollout_epoch: 360
+    max_episode_steps: 360
+    video_cfg:
+      save_video: False
+      info_on_video: True
+      fps: 20
+      video_base_dir: ${runner.logger.log_path}/video/eval
+    init_params:
+      id: "Isaac-Libero-Franka-Hybrid-Tactile-v0"
+      num_envs: null
+      max_episode_steps: ${..max_episode_steps}
+      task_description: "pick up the alphabet soup and place it in the basket"
+      extension_path: "/data/home/sim6g/code/tabero/Tabero/source/tac_manip"
+      libero_config_dir: "/data/home/sim6g/code/tabero/Tabero/benchmarks/datasets/libero/config_profiles/alltask_fixed_damage_1000000_uniform_mass_05_16_friction_04_08_from_rlinf_sft_20k"
+      libero_assets_dir: "/data/home/sim6g/code/tabero/Tabero/benchmarks/datasets/libero/USD"
+      hdf5_initial_states_path: "/data/home/sim6g/code/tabero/Tabero/benchmarks/datasets/libero/assembled_hdf5/libero_object_task0_pick_up_the_alphabet_soup_and_place_it_in_the_basket_demo.hdf5"
+      hdf5_reset_assignment: cyclic
+      chunk_boundary_mode: terminal_safe_hdf5_v1
+      task_suite: "libero_object"
+      task_id: 0
+      tasks:
+        - task_suite: "libero_object"
+          task_id: 0
+      require_all_tasks_active: True
+      success:
+        required_consecutive_steps: 8
+        terminal_reward: 1.0
+        condition_reward_multipliers: null
+        force_bonus:
+          enabled: true
+          coefficient: 20.0
+          epsilon: 1.0
+          max_bonus: 1.0
+          min_valid_samples: 4
+          contact_epsilon: 1.0
+      prompt_conditions:
+        enabled: False
+      use_relative_mode: False
+      marker_history_len: 8
+      combined_marker_count: 198
+      main_image_key: "agentview_rgb"
+      wrist_image_key: "eye_in_hand_rgb"
+      marker_motion_key: "gripper_marker_motion"
+      force_key: null
+      agentview_cam:
+        height: 256
+        width: 256
+      eye_in_hand_cam:
+        height: 256
+        width: 256
+
+rollout:
+  group_name: "RolloutGroup"
+  backend: "huggingface"
+  enable_offload: True
+  pipeline_stage_num: 1
+  model:
+    model_path: "/data/home/sim6g/code/tabero/models/pi0_lora_tacfield_tabero_all_firm_safetensors"
+    precision: ${actor.model.precision}
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 2
+  global_batch_size: 42
+  seed: 42
+  enable_offload: False
+  combine_reference_model: True
+  model:
+    model_path: "/data/home/sim6g/code/tabero/models/pi0_lora_tacfield_tabero_all_firm_safetensors"
+    model_type: "openpi"
+    precision: null
+    num_action_chunks: 10
+    action_dim: 13
+    is_lora: True
+    lora_rank: 32
+    lora_path: null
+    lora_target: "action_expert"
+    freeze_non_lora: True
+    use_proprio: True
+    num_steps: 10
+    add_value_head: True
+    openpi:
+      config_name: "pi0_lora_tacfield_tabero"
+      num_images_in_input: 2
+      noise_level: 0.5
+      action_chunk: ${actor.model.num_action_chunks}
+      num_steps: ${actor.model.num_steps}
+      train_expert_only: True
+      action_env_dim: ${actor.model.action_dim}
+      noise_method: "flow_sde"
+      add_value_head: ${actor.model.add_value_head}
+      joint_logprob: False
+      value_after_vlm: False
+      value_vlm_mode: "mean_token"
+      detach_critic_input: True
+      tactile_loss_weight: 0.0
+      use_dsrl: False
+      dsrl_state_dim: 8
+      dsrl_action_noise_dim: 32
+      dsrl_num_q_heads: 10
+      dsrl_agg_q: "mean"
+      dsrl_image_latent_dim: 64
+      dsrl_state_latent_dim: 64
+      dsrl_hidden_dims: [128, 128, 128]
+  optim:
+    lr: 1.0e-6
+    value_lr: 1.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-08
+    clip_grad: 1.0
+    weight_decay: 0.01
+    critic_warmup_steps: 0
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "no_shard"
+    gradient_checkpointing: False
+    cpu_offload: False
+    offload_pin_memory: False
+    reshard_after_forward: True
+    enable_gradient_accumulation: True
+    forward_prefetch: False
+    limit_all_gathers: False
+    backward_prefetch: null
+    use_orig_params: False
+    use_liger_kernel: False
+    mixed_precision:
+      param_dtype: ${actor.model.precision}
+      reduce_dtype: ${actor.model.precision}
+      buffer_dtype: ${actor.model.precision}
+    amp_autocast:
+      enabled: False
+      precision: "bf16"
+    grad_scaler:
+      enabled: False
+    checkpoint_format: "dcp"
+    save_full_model_weights: False
+    save_trainable_model_weights: True
+    trainable_checkpoint_metadata:
+      method: pirl
+      task_id: 0
+      prompt_condition: no_adverb
+      training_config: isaaclab_pi0_peft_lora_tacfield_tabero_task0_no_adverb_uniform_mass_friction_no_damage_force_reward_coef20_maxbonus1_phase2_step100_to200_2gpu
+      target_global_step: 200
+      phase: uniform_mass_friction_continuation
+      source_global_step: 100
+      source_training_config: isaaclab_pi0_peft_lora_tacfield_tabero_task0_no_adverb_fixed_mean_no_random_force_reward_coef20_maxbonus1_2gpu_100step
+      source_checkpoint_sidecar_sha256: 65f97ebe7cbc62c71038e5da6e7b1f724530e8ea5c8cd281519773352c376d2b
+      physics_profile_sha256: 6e1a446027fde35f591a3c6584be61a3073fc0cc7485225bb1e378c3c473c342
+      tabero_ppo_transition_boundary_semantics: terminal_observation_first_done_prefix_logprob_hdf5_reset_v1
+
+reward:
+  use_reward_model: False
+
+critic:
+  use_critic_model: False
+
+weight_syncer:
+  type: patch
+  patch:
+    snapshot_device: cpu
+    delta_encoding: True
+    compression: none
+    init_sync:
+      enabled: True
+      prefixes: null
+      bucket_size: 134217728
