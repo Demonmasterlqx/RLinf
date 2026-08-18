@@ -173,6 +173,52 @@ _CONFIGS = [
         ema_decay=None,
     ),
     TrainConfig(
+        name="pi05_lora_tacfield_tabero",
+        model=OpenPi0Config(
+            config_name="pi05_lora_tacfield_tabero",
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            action_dim=32,
+            action_horizon=10,
+            discrete_state_input=True,
+            action_env_dim=13,
+            effective_action_dim=13,
+            tactile_type="expert_his_c_fut",
+            tactile_dim=6,
+            tactile_dim_in=0,
+            tactile_prefix_dim_in=9 * 440 * 2,
+            tactile_prefix_history=8,
+            tactile_prefix_encoder_type="tcn",
+            tactile_prefix_use_reference_frame=True,
+            tactile_prefix_diff_from_reference=False,
+            tactile_streams=("tactile_prefix",),
+            tactile_loss_weight=0.01,
+            padding_loss_weight=1.0,
+            expert_his_c_fut_loss_mode="weighted_full",
+        ),
+        data=TaberoTacFieldDataConfig(
+            repo_id="replay_firm_tabero",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(asset_id="replay_firm_tabero"),
+            extra_delta_transform=True,
+        ),
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=2.5e-5,
+            decay_steps=30_000,
+            decay_lr=2.5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "checkpoints/jax/pi05_base"
+        ),
+        pytorch_weight_path="checkpoints/torch/pi05_base",
+        num_train_steps=20_000,
+        ema_decay=None,
+    ),
+    TrainConfig(
         name="pi05_libero",
         model=pi0_config.Pi0Config(
             pi05=True, action_horizon=10, discrete_state_input=False
