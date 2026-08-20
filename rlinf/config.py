@@ -51,9 +51,9 @@ from rlinf.utils.placement import (
     PlacementMode,
 )
 from rlinf.utils.tabero_ppo_boundary import (
+    TABERO_PPO_BOUNDARY_CONTRACTS,
     TABERO_PPO_CHECKPOINT_METADATA_KEY,
-    TABERO_PPO_CHUNK_BOUNDARY_MODE,
-    TABERO_PPO_TRANSITION_BOUNDARY_SEMANTICS,
+    TABERO_PPO_DEFAULT_RESET_TRANSITION_BOUNDARY_SEMANTICS,
 )
 
 if TYPE_CHECKING:
@@ -863,11 +863,14 @@ def validate_embodied_cfg(cfg):
         "tabero_ppo_transition_boundary_semantics"
     )
     if ppo_boundary_semantics is not None:
-        if ppo_boundary_semantics != TABERO_PPO_TRANSITION_BOUNDARY_SEMANTICS:
+        boundary_contract = TABERO_PPO_BOUNDARY_CONTRACTS.get(
+            ppo_boundary_semantics
+        )
+        if boundary_contract is None:
             raise ValueError(
                 "Unsupported algorithm.tabero_ppo_transition_boundary_semantics "
-                f"{ppo_boundary_semantics!r}; expected "
-                f"{TABERO_PPO_TRANSITION_BOUNDARY_SEMANTICS!r}."
+                f"{ppo_boundary_semantics!r}; expected one of "
+                f"{sorted(TABERO_PPO_BOUNDARY_CONTRACTS)!r}."
             )
         if only_eval:
             raise ValueError(
@@ -875,13 +878,19 @@ def validate_embodied_cfg(cfg):
                 "cannot be declared by an embodied-eval-only config."
             )
         openpi_cfg = model_cfg.get("openpi", {})
+        expected_openpi_config = (
+            "pi05_lora_tacfield_tabero"
+            if ppo_boundary_semantics
+            == TABERO_PPO_DEFAULT_RESET_TRANSITION_BOUNDARY_SEMANTICS
+            else "pi0_lora_tacfield_tabero"
+        )
         if (
             model_type != SupportedModel.OPENPI
-            or openpi_cfg.get("config_name") != "pi0_lora_tacfield_tabero"
+            or openpi_cfg.get("config_name") != expected_openpi_config
         ):
             raise ValueError(
                 "Tabero PPO transition boundary semantics requires the Tabero tactile "
-                "OpenPI model configuration."
+                f"OpenPI model configuration {expected_openpi_config!r}."
             )
         required_ppo_values = {
             "adv_type": "gae",
@@ -907,6 +916,16 @@ def validate_embodied_cfg(cfg):
                 "Tabero PPO transition boundary semantics requires a positive integer "
                 "actor.model.num_action_chunks."
             )
+        if (
+            ppo_boundary_semantics
+            == TABERO_PPO_DEFAULT_RESET_TRANSITION_BOUNDARY_SEMANTICS
+        ):
+            if action_chunk != 10 or model_cfg.get("action_dim") != 13:
+                raise ValueError(
+                    "Tabero default-reset PPO boundary semantics requires "
+                    "actor.model.num_action_chunks=10 and actor.model.action_dim=13; "
+                    f"got {action_chunk!r} and {model_cfg.get('action_dim')!r}."
+                )
 
         for split_name in ("train", "eval"):
             split_cfg = cfg.env.get(split_name)
@@ -927,22 +946,32 @@ def validate_embodied_cfg(cfg):
                 )
             init_params = split_cfg.get("init_params", {})
             boundary_mode = init_params.get("chunk_boundary_mode")
-            if boundary_mode != TABERO_PPO_CHUNK_BOUNDARY_MODE:
+            expected_boundary_mode = boundary_contract["chunk_boundary_mode"]
+            if boundary_mode != expected_boundary_mode:
                 raise ValueError(
                     f"Tabero PPO transition boundary semantics requires env.{split_name}."
                     "init_params.chunk_boundary_mode="
-                    f"{TABERO_PPO_CHUNK_BOUNDARY_MODE!r}; got {boundary_mode!r}."
+                    f"{expected_boundary_mode!r}; got {boundary_mode!r}."
                 )
             hdf5_path = init_params.get("hdf5_initial_states_path")
-            if not isinstance(hdf5_path, str) or not hdf5_path.strip():
+            if boundary_contract["requires_hdf5"]:
+                if not isinstance(hdf5_path, str) or not hdf5_path.strip():
+                    raise ValueError(
+                        f"Tabero PPO transition boundary semantics requires env.{split_name}."
+                        "init_params.hdf5_initial_states_path."
+                    )
+                if init_params.get("hdf5_reset_assignment") != "cyclic":
+                    raise ValueError(
+                        f"Tabero PPO transition boundary semantics requires env.{split_name}."
+                        "init_params.hdf5_reset_assignment='cyclic'."
+                    )
+            elif (
+                hdf5_path is not None
+                or init_params.get("hdf5_reset_assignment") is not None
+            ):
                 raise ValueError(
-                    f"Tabero PPO transition boundary semantics requires env.{split_name}."
-                    "init_params.hdf5_initial_states_path."
-                )
-            if init_params.get("hdf5_reset_assignment") != "cyclic":
-                raise ValueError(
-                    f"Tabero PPO transition boundary semantics requires env.{split_name}."
-                    "init_params.hdf5_reset_assignment='cyclic'."
+                    "Tabero default-reset PPO boundary semantics forbids "
+                    f"env.{split_name} HDF5 reset configuration."
                 )
             max_episode_steps = split_cfg.get("max_episode_steps")
             if (

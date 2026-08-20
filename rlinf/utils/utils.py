@@ -31,7 +31,8 @@ from torch.optim import Optimizer
 from rlinf.scheduler import Worker
 from rlinf.utils.metric_utils import compute_embodied_loss_masks
 from rlinf.utils.tabero_ppo_boundary import (
-    TABERO_PPO_TRANSITION_BOUNDARY_SEMANTICS,
+    TABERO_PPO_BOUNDARY_CONTRACTS,
+    uses_tabero_primitive_prefix_boundary,
 )
 
 
@@ -779,10 +780,10 @@ def preprocess_embodied_batch(
 ) -> dict[str, torch.Tensor]:
     batch = merge_rollout_epochs(batch, rollout_epoch)
 
-    if transition_boundary_semantics not in {
-        None,
-        TABERO_PPO_TRANSITION_BOUNDARY_SEMANTICS,
-    }:
+    if (
+        transition_boundary_semantics is not None
+        and transition_boundary_semantics not in TABERO_PPO_BOUNDARY_CONTRACTS
+    ):
         raise ValueError(
             "Unsupported embodied PPO transition boundary semantics "
             f"{transition_boundary_semantics!r}."
@@ -793,9 +794,8 @@ def preprocess_embodied_batch(
             compute_embodied_loss_masks(
                 batch["dones"],
                 reward_type=reward_type,
-                use_primitive_prefix_logprobs=(
+                use_primitive_prefix_logprobs=uses_tabero_primitive_prefix_boundary(
                     transition_boundary_semantics
-                    == TABERO_PPO_TRANSITION_BOUNDARY_SEMANTICS
                 ),
             )
         )

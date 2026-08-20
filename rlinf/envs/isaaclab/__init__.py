@@ -12,12 +12,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .tasks.realworld_tabero_tacfield import IsaaclabRealWorldTaberoTacFieldEnv
 from .tasks.stack_cube import IsaaclabStackCubeEnv
 from .tasks.tabero_tacfield import IsaaclabTaberoTacFieldEnv
 
 REGISTER_ISAACLAB_ENVS = {
     "Isaac-Stack-Cube-Franka-IK-Rel-Visuomotor-Rewarded-v0": IsaaclabStackCubeEnv,
     "Isaac-Libero-Franka-Hybrid-Tactile-v0": IsaaclabTaberoTacFieldEnv,
+    "Isaac-RealWorld-GentleGrasp-XarmUmi-Hybrid-Tactile-v0": (
+        IsaaclabRealWorldTaberoTacFieldEnv
+    ),
 }
 
 __all__ = [list(REGISTER_ISAACLAB_ENVS.keys())]

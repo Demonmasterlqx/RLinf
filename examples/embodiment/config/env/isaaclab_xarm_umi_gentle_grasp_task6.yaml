@@ -1,0 +1,45 @@
+env_type: isaaclab
+total_num_envs: null
+auto_reset: False
+ignore_terminations: False
+use_rel_reward: False
+seed: 42
+group_size: 1
+
+reward_coef: 1.0
+use_fixed_reset_state_ids: False
+max_steps_per_rollout_epoch: 360
+max_episode_steps: 360
+
+video_cfg:
+  save_video: False
+  info_on_video: True
+  fps: 20
+  video_base_dir: ${runner.logger.log_path}/video/train
+
+init_params:
+  id: "Isaac-RealWorld-GentleGrasp-XarmUmi-Hybrid-Tactile-v0"
+  num_envs: null
+  max_episode_steps: ${..max_episode_steps}
+  task_description: "place the Vitasoy, Coca-Cola, cookie, and basket on the table"
+
+  extension_path: "/data/home/sim6g/code/tabero/Tabero_X/source/tac_manip"
+  realworld_config_dir: "/data/home/sim6g/code/tabero/Tabero_X/benchmarks/datasets/realworld/config"
+  realworld_assets_dir: "/data/home/sim6g/code/tabero/Tabero_X/benchmarks/datasets/realworld/USD"
+  tactile_backend: taxim_fots
+  chunk_boundary_mode: terminal_safe_v1
+
+  task_suite: gentle_grasp
+  task_id: 6
+  marker_history_len: 8
+  combined_marker_count: 440
+  success:
+    required_consecutive_steps: 8
+    terminal_reward: 1.0
+
+  agentview_cam:
+    height: 256
+    width: 256
+  eye_in_hand_cam:
+    height: 256
+    width: 256
