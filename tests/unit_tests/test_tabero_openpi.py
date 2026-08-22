@@ -124,10 +124,38 @@ def test_tabero_pi05_xense_tacfield_inputs_build_880_dim_prefix():
     assert out["actions"].shape == (10, 13)
 
 
+def test_tabero_pi0_xense_tacfield_inputs_build_50_step_actions():
+    transform = TaberoTacFieldInputs(model_type=_model.ModelType.PI0)
+    marker_motion = np.arange(9 * 440 * 2, dtype=np.float32).reshape(9, 440, 2)
+    data = {
+        "image": _image(1),
+        "wrist_image": _image(2),
+        "state": np.arange(7, dtype=np.float32),
+        "tactile_marker_motion": marker_motion,
+        "actions": np.zeros((50, 13), dtype=np.float32),
+        "prompt": "lift the mug",
+    }
+
+    out = transform(data)
+
+    assert out["state"].shape == (7,)
+    assert out["tactile_prefix"].shape == (9, 880)
+    np.testing.assert_array_equal(
+        out["tactile_prefix"], marker_motion.reshape(9, 880)
+    )
+    assert out["actions"].shape == (50, 13)
+
+
 def test_tabero_openpi_configs_are_registered_with_extended_config():
     tacimg = get_openpi_config("pi0_lora_tacimg_tabero")
     tacfield = get_openpi_config("pi0_lora_tacfield_tabero")
+    xarm_pi0_tacfield = get_openpi_config(
+        "pi0_lora_tacfield_tabero_xarm_gripper"
+    )
     pi05_tacfield = get_openpi_config("pi05_lora_tacfield_tabero")
+    xarm_pi05_tacfield = get_openpi_config(
+        "pi05_lora_tacfield_tabero_xarm_gripper"
+    )
 
     assert isinstance(tacimg.model, OpenPi0Config)
     assert tacimg.model.paligemma_variant == "gemma_2b_lora"
@@ -146,6 +174,25 @@ def test_tabero_openpi_configs_are_registered_with_extended_config():
     assert tacfield.model.tactile_prefix_encoder_type == "tcn"
     assert tacfield.model.tactile_streams == ("tactile_prefix",)
     assert tacfield.data.repo_id == "NathanWu7/tabero_object_25"
+
+    assert isinstance(xarm_pi0_tacfield.model, OpenPi0Config)
+    assert xarm_pi0_tacfield.model.model_type == _model.ModelType.PI0
+    assert xarm_pi0_tacfield.model.pi05 is False
+    assert xarm_pi0_tacfield.model.action_horizon == 50
+    assert xarm_pi0_tacfield.model.max_token_len == 48
+    assert xarm_pi0_tacfield.model.discrete_state_input is False
+    assert xarm_pi0_tacfield.model.action_env_dim == 13
+    assert xarm_pi0_tacfield.model.effective_action_dim == 13
+    assert xarm_pi0_tacfield.model.tactile_prefix_dim_in == 9 * 440 * 2
+    assert xarm_pi0_tacfield.model.tactile_prefix_history == 8
+    assert xarm_pi0_tacfield.model.tactile_prefix_use_reference_frame is True
+    assert xarm_pi0_tacfield.model.tactile_prefix_diff_from_reference is False
+    assert xarm_pi0_tacfield.model.tactile_loss_weight == pytest.approx(0.01)
+    assert xarm_pi0_tacfield.data.repo_id == "replay_firm_tabero_xarm_gripper"
+    assert (
+        xarm_pi0_tacfield.data.assets.asset_id
+        == "replay_firm_tabero_xarm_gripper"
+    )
 
     assert isinstance(pi05_tacfield.model, OpenPi0Config)
     assert pi05_tacfield.model.model_type == _model.ModelType.PI05
@@ -169,6 +216,19 @@ def test_tabero_openpi_configs_are_registered_with_extended_config():
     assert pi05_tacfield.data.repo_id == "replay_firm_tabero"
     assert pi05_tacfield.data.assets.asset_id == "replay_firm_tabero"
     assert pi05_tacfield.data.extra_delta_transform is True
+
+    assert isinstance(xarm_pi05_tacfield.model, OpenPi0Config)
+    assert xarm_pi05_tacfield.model.model_type == _model.ModelType.PI05
+    assert xarm_pi05_tacfield.model.action_horizon == 10
+    assert xarm_pi05_tacfield.model.discrete_state_input is True
+    assert xarm_pi05_tacfield.model.effective_action_dim == 13
+    assert xarm_pi05_tacfield.model.tactile_prefix_dim_in == 9 * 440 * 2
+    assert xarm_pi05_tacfield.data.repo_id == "replay_firm_tabero_xarm_gripper"
+    assert (
+        xarm_pi05_tacfield.data.assets.asset_id
+        == "replay_firm_tabero_xarm_gripper"
+    )
+    assert xarm_pi05_tacfield.data.extra_delta_transform is True
 
 
 def test_explicit_fp32_keeps_entire_openpi_model_fp32_and_disables_tf32():

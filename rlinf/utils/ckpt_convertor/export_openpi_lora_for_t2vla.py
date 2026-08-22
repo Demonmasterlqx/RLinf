@@ -319,10 +319,21 @@ def _save_filtered_safetensors(
             for key in set(state_dict) - base_keys
             if not key.startswith(allowed_extra_prefixes)
         )
-        if missing or unexpected:
+        shape_mismatches = sorted(
+            (
+                key,
+                tuple(state_dict[key].shape),
+                tuple(base.get_slice(key).get_shape()),
+            )
+            for key in base_keys & set(state_dict)
+            if tuple(state_dict[key].shape)
+            != tuple(base.get_slice(key).get_shape())
+        )
+        if missing or unexpected or shape_mismatches:
             raise ValueError(
                 "Merged OpenPI state keys do not match the allowed architecture; "
-                f"missing={missing[:10]}, unexpected={unexpected[:10]}"
+                f"missing={missing[:10]}, unexpected={unexpected[:10]}, "
+                f"shape_mismatches={shape_mismatches[:10]}"
             )
         for key in sorted(state_dict):
             if output_dtype is not None and state_dict[key].is_floating_point():
@@ -347,6 +358,61 @@ def _save_filtered_safetensors(
 def _safetensor_count(path: str | Path) -> int:
     with safe_open(_checkpoint_path(path), framework="pt", device="cpu") as handle:
         return len(handle.keys())
+
+
+def _validate_tabero_sft_export_schema(
+    model_path: str | Path,
+    base_model_path: str | Path,
+    *,
+    expected_tcn_tensor_count: int = 16,
+) -> dict[str, int]:
+    """Validate the base-plus-TacField schema used by Pi0 and Pi0.5 SFT."""
+    with (
+        safe_open(_checkpoint_path(model_path), framework="pt", device="cpu") as model,
+        safe_open(
+            _checkpoint_path(base_model_path), framework="pt", device="cpu"
+        ) as base,
+    ):
+        model_keys = set(model.keys())
+        base_keys = set(base.keys())
+        missing = sorted(base_keys - model_keys)
+        extra = sorted(model_keys - base_keys)
+        invalid_extra = sorted(
+            key for key in extra if not key.startswith("tactile_prefix_encoder.")
+        )
+        shape_mismatches = sorted(
+            (
+                key,
+                tuple(model.get_slice(key).get_shape()),
+                tuple(base.get_slice(key).get_shape()),
+            )
+            for key in model_keys & base_keys
+            if model.get_slice(key).get_shape() != base.get_slice(key).get_shape()
+        )
+        dtypes = {
+            str(model.get_slice(key).get_dtype()) for key in model_keys
+        }
+    if (
+        missing
+        or invalid_extra
+        or shape_mismatches
+        or len(extra) != expected_tcn_tensor_count
+        or dtypes != {"BF16"}
+    ):
+        raise ValueError(
+            "Tabero SFT export must preserve every fixed-base key and shape, "
+            f"add exactly {expected_tcn_tensor_count} tactile-prefix tensors, "
+            "and contain only BF16 tensors; "
+            f"base_count={len(base_keys)}, model_count={len(model_keys)}, "
+            f"extra_count={len(extra)}, missing={missing[:10]}, "
+            f"invalid_extra={invalid_extra[:10]}, "
+            f"shape_mismatches={shape_mismatches[:10]}, dtypes={sorted(dtypes)}"
+        )
+    return {
+        "base_tensor_count": len(base_keys),
+        "tactile_prefix_tensor_count": len(extra),
+        "model_tensor_count": len(model_keys),
+    }
 
 
 def _validate_reference_schema(
@@ -430,14 +496,37 @@ def _build_export_metadata(
     if method == "pirl" and (type(task_id) is not int or task_id not in range(10)):
         raise ValueError("piRL checkpoint provenance task_id must be in [0, 9]")
     if method == "sft_full_lora_tacfield":
-        if checkpoint_meta.get("dataset") != "datas/tabero_firm":
+        dataset = checkpoint_meta.get("dataset")
+        if dataset not in {
+            "datas/tabero_firm",
+            "datas/replay_firm_tabero",
+            "datas/replay_firm_tabero_xarm_gripper",
+        }:
             raise ValueError(
-                "Tabero SFT checkpoint provenance dataset must be 'datas/tabero_firm'."
+                "Tabero SFT checkpoint provenance dataset must be "
+                "'datas/tabero_firm', 'datas/replay_firm_tabero', or "
+                "'datas/replay_firm_tabero_xarm_gripper'."
             )
-        if checkpoint_meta.get("training_precision") != "fp32":
-            raise ValueError(
-                "Tabero SFT checkpoint provenance training_precision must be 'fp32'."
-            )
+        if dataset == "datas/tabero_firm":
+            if checkpoint_meta.get("training_precision") != "fp32":
+                raise ValueError(
+                    "Legacy Tabero SFT checkpoint provenance "
+                    "training_precision must be 'fp32'."
+                )
+        else:
+            required_precision = {
+                "frozen_parameter_precision": "bf16",
+                "trainable_parameter_precision": "fp32",
+                "compute_precision": "bf16_amp",
+                "export_precision": "bf16",
+            }
+            for field, expected in required_precision.items():
+                if checkpoint_meta.get(field) != expected:
+                    raise ValueError(
+                        "Replay Firm checkpoint provenance "
+                        f"{field} must be {expected!r}, got "
+                        f"{checkpoint_meta.get(field)!r}"
+                    )
     global_step = checkpoint_meta.get("global_step")
     if type(global_step) is not int or global_step <= 0:
         raise ValueError("OpenPI checkpoint provenance global_step must be positive")
@@ -464,6 +553,8 @@ def _build_export_metadata(
     if method == "pirl" and lora_target == "action_expert":
         validate_pirl_action_expert_delta(output_model, base_checkpoint)
     safe_metadata = _json_safe(dict(checkpoint_meta))
+    base_tensor_count = _safetensor_count(base_checkpoint)
+    model_tensor_count = _safetensor_count(output_model)
     return {
         "source_train_config": str(train_config),
         "source_ckpt": str(source_checkpoint),
@@ -479,7 +570,9 @@ def _build_export_metadata(
         "target_global_step": target_global_step,
         "is_final": is_final,
         "model_sha256": _sha256(output_model),
-        "model_tensor_count": _safetensor_count(output_model),
+        "model_tensor_count": model_tensor_count,
+        "base_model_tensor_count": base_tensor_count,
+        "extra_tensor_count": model_tensor_count - base_tensor_count,
         "adapter_dir": (
             adapter_dirs[0]
             if len(adapter_dirs) == 1
@@ -488,7 +581,18 @@ def _build_export_metadata(
         "adapter_dirs": adapter_dirs,
         "dataset": checkpoint_meta.get("dataset"),
         "training_precision": checkpoint_meta.get("training_precision"),
-        "export_precision": "bf16" if method == "sft_full_lora_tacfield" else None,
+        "export_precision": (
+            checkpoint_meta.get("export_precision", "bf16")
+            if method == "sft_full_lora_tacfield"
+            else None
+        ),
+        "frozen_parameter_precision": checkpoint_meta.get(
+            "frozen_parameter_precision"
+        ),
+        "trainable_parameter_precision": checkpoint_meta.get(
+            "trainable_parameter_precision"
+        ),
+        "compute_precision": checkpoint_meta.get("compute_precision"),
         "tactile_tcn_initialization": checkpoint_meta.get("tactile_tcn_initialization"),
     }
 
@@ -590,22 +694,13 @@ def export_checkpoint(
         output_dtype=torch.bfloat16 if is_tabero_sft else None,
     )
     if is_tabero_sft:
-        with safe_open(model_path, framework="pt", device="cpu") as exported:
-            tensor_count = len(exported.keys())
-            dtypes = {
-                str(exported.get_slice(key).get_dtype()) for key in exported.keys()
-            }
-        if tensor_count != 793 or dtypes != {"BF16"}:
-            raise ValueError(
-                "Tabero SFT export must contain exactly 793 BF16 tensors; "
-                f"got count={tensor_count}, dtypes={sorted(dtypes)}"
-            )
+        _validate_tabero_sft_export_schema(
+            model_path,
+            str(model_cfg.model_path),
+        )
         reference_model_path = model_cfg.get("export_reference_model_path")
-        if reference_model_path is None:
-            raise ValueError(
-                "Tabero SFT export requires actor.model.export_reference_model_path."
-            )
-        _validate_reference_schema(model_path, reference_model_path)
+        if reference_model_path is not None:
+            _validate_reference_schema(model_path, reference_model_path)
     _copy_assets(str(model_cfg.model_path), str(output_path))
     if is_tabero_sft:
         norm_stats_path = model_cfg.get("openpi_data", {}).get("norm_stats_path")

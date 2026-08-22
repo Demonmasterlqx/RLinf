@@ -186,6 +186,72 @@ def test_tabero_sft_filtered_export_keeps_tcn_and_casts_all_bf16(tmp_path):
         }
 
 
+def test_tabero_sft_schema_is_base_plus_exact_tcn_and_not_fixed_total(tmp_path):
+    base = tmp_path / "pi05_base"
+    base.mkdir()
+    base_tensors = {
+        "base.weight": torch.ones((2, 2), dtype=torch.bfloat16),
+        "base.bias": torch.ones(2, dtype=torch.bfloat16),
+    }
+    save_file(base_tensors, base / "model.safetensors")
+    model = tmp_path / "model.safetensors"
+    tcn_tensors = {
+        f"tactile_prefix_encoder.layer_{index}.weight": torch.ones(
+            1, dtype=torch.bfloat16
+        )
+        for index in range(16)
+    }
+    save_file({**base_tensors, **tcn_tensors}, model)
+
+    counts = exporter._validate_tabero_sft_export_schema(model, base)
+
+    assert counts == {
+        "base_tensor_count": 2,
+        "tactile_prefix_tensor_count": 16,
+        "model_tensor_count": 18,
+    }
+
+
+@pytest.mark.parametrize(
+    "mutation,match",
+    [
+        ("missing_tcn", "extra_count=15"),
+        ("wrong_prefix", "invalid_extra="),
+        ("wrong_shape", "shape_mismatches="),
+        ("wrong_dtype", "dtypes=.*F32"),
+    ],
+)
+def test_tabero_sft_schema_rejects_invalid_pi05_export(tmp_path, mutation, match):
+    base = tmp_path / "base"
+    base.mkdir()
+    base_tensors = {"base.weight": torch.ones(2, dtype=torch.bfloat16)}
+    save_file(base_tensors, base / "model.safetensors")
+    tensors = {
+        **base_tensors,
+        **{
+            f"tactile_prefix_encoder.layer_{index}.weight": torch.ones(
+                1, dtype=torch.bfloat16
+            )
+            for index in range(16)
+        },
+    }
+    if mutation == "missing_tcn":
+        tensors.pop("tactile_prefix_encoder.layer_15.weight")
+    elif mutation == "wrong_prefix":
+        tensors["unexpected.weight"] = tensors.pop(
+            "tactile_prefix_encoder.layer_15.weight"
+        )
+    elif mutation == "wrong_shape":
+        tensors["base.weight"] = torch.ones(3, dtype=torch.bfloat16)
+    elif mutation == "wrong_dtype":
+        tensors["base.weight"] = tensors["base.weight"].float()
+    model = tmp_path / "model.safetensors"
+    save_file(tensors, model)
+
+    with pytest.raises(ValueError, match=match):
+        exporter._validate_tabero_sft_export_schema(model, base)
+
+
 def test_trainable_sidecar_rejects_frozen_base_or_missing_tcn():
     model = nn.Module()
     model.base = nn.Linear(2, 2)
@@ -226,6 +292,87 @@ def test_export_metadata_carries_verified_fsdp_provenance_and_hashes(tmp_path):
     assert metadata["source_ckpt_metadata"] == inputs["checkpoint_meta"]
     assert metadata["model_sha256"] == _sha256(inputs["model_path"])
     assert metadata["model_tensor_count"] == 126
+
+
+@pytest.mark.parametrize(
+    "dataset,config_stem",
+    [
+        (
+            "datas/replay_firm_tabero",
+            "replay_firm_tabero_pi05_tacfield_sft_2gpu",
+        ),
+        (
+            "datas/replay_firm_tabero_xarm_gripper",
+            "replay_firm_tabero_xarm_gripper_pi05_tacfield_sft_2gpu",
+        ),
+        (
+            "datas/replay_firm_tabero_xarm_gripper",
+            "replay_firm_tabero_xarm_gripper_pi0_tacfield_sft_2gpu",
+        ),
+    ],
+)
+def test_export_metadata_accepts_replay_firm_pi05_precision_contract(
+    tmp_path, dataset, config_stem
+):
+    train_config = tmp_path / f"{config_stem}.yaml"
+    train_config.write_text("actor: {}\n")
+    checkpoint = tmp_path / "trainable_weights.pt"
+    checkpoint_metadata = {
+        "format": "trainable_weights",
+        "method": "sft_full_lora_tacfield",
+        "dataset": dataset,
+        "training_config": train_config.stem,
+        "step": 20000,
+        "global_step": 20000,
+        "target_global_step": 20000,
+        "is_final": True,
+        "frozen_parameter_precision": "bf16",
+        "trainable_parameter_precision": "fp32",
+        "compute_precision": "bf16_amp",
+        "export_precision": "bf16",
+    }
+    torch.save(
+        {"model": {"weight": torch.ones(1)}, "metadata": checkpoint_metadata},
+        checkpoint,
+    )
+    base = tmp_path / "base"
+    base.mkdir()
+    save_file(
+        {"base.weight": torch.ones(1, dtype=torch.bfloat16)},
+        base / "model.safetensors",
+    )
+    model = tmp_path / "model.safetensors"
+    save_file(
+        {
+            "base.weight": torch.ones(1, dtype=torch.bfloat16),
+            **{
+                f"tactile_prefix_encoder.layer_{index}.weight": torch.ones(
+                    1, dtype=torch.bfloat16
+                )
+                for index in range(16)
+            },
+        },
+        model,
+    )
+
+    metadata = exporter._build_export_metadata(
+        train_config_path=str(train_config),
+        ckpt_path=str(checkpoint),
+        source_model_path=str(base),
+        checkpoint_meta=checkpoint_metadata,
+        model_path=model,
+        lora_target="both",
+        adapter_dirs=["lora_adapter", "action_expert_lora_adapter"],
+    )
+
+    assert metadata["dataset"] == dataset
+    assert metadata["base_model_tensor_count"] == 1
+    assert metadata["extra_tensor_count"] == 16
+    assert metadata["model_tensor_count"] == 17
+    assert metadata["frozen_parameter_precision"] == "bf16"
+    assert metadata["trainable_parameter_precision"] == "fp32"
+    assert metadata["compute_precision"] == "bf16_amp"
+    assert metadata["export_precision"] == "bf16"
 
 
 @pytest.mark.parametrize(

@@ -21,6 +21,18 @@ CONFIG_PATH = (
     Path(__file__).resolve().parents[2]
     / "examples/sft/config/replay_firm_tabero_pi05_tacfield_sft_2gpu.yaml"
 )
+XARM_CONFIG_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "examples/sft/config/replay_firm_tabero_xarm_gripper_pi05_tacfield_sft_2gpu.yaml"
+)
+XARM_20K_CONFIG_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "examples/sft/config/replay_firm_tabero_xarm_gripper_pi05_tacfield_sft_2gpu_20k.yaml"
+)
+XARM_PI0_CONFIG_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "examples/sft/config/replay_firm_tabero_xarm_gripper_pi0_tacfield_sft_2gpu.yaml"
+)
 
 
 def test_replay_firm_pi05_tacfield_sft_2gpu_config_contract(
@@ -119,3 +131,164 @@ def test_replay_firm_pi05_tacfield_sft_2gpu_config_contract(
     assert metadata.action_horizon == 10
     assert metadata.tactile_prefix_dim_in == 9 * 440 * 2
     assert metadata.target_global_step == 20000
+
+
+def test_replay_firm_xarm_gripper_pi05_tacfield_sft_2gpu_config_contract(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("EMBODIED_PATH", str(XARM_CONFIG_PATH.parents[1]))
+    monkeypatch.setenv("REPLAY_FIRM_XARM_PI05_RUN_DIR", str(tmp_path))
+    monkeypatch.setenv("REPLAY_FIRM_XARM_PI05_RUN_NAME", "xarm-gripper-test")
+    monkeypatch.setenv(
+        "REPLAY_FIRM_XARM_PI05_CHECKPOINT_ROOT", str(tmp_path / "checkpoints")
+    )
+    monkeypatch.setenv(
+        "REPLAY_FIRM_XARM_PI05_NORM_STATS", str(tmp_path / "norm_stats.json")
+    )
+
+    cfg = OmegaConf.load(XARM_CONFIG_PATH)
+    cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
+
+    assert cfg.defaults[0] == "model/pi0_5@actor.model"
+    assert cfg.runner.max_steps == 5000
+    assert cfg.runner.save_interval == 1000
+    assert cfg.actor.micro_batch_size == 16
+    assert cfg.actor.global_batch_size == 32
+    assert cfg.actor.optim.total_training_steps == 5000
+    assert cfg.actor.optim.lr_warmup_steps == 1000
+    assert cfg.actor.optim.lr_decay_steps == 30000
+    assert cfg.data.train_data_paths[0].dataset_path.endswith(
+        "datas/replay_firm_tabero_xarm_gripper"
+    )
+
+    model = cfg.actor.model
+    assert model.openpi.config_name == "pi05_lora_tacfield_tabero_xarm_gripper"
+    assert model.openpi.pi05 is True
+    assert model.openpi.action_horizon == 10
+    assert model.openpi.discrete_state_input is True
+    assert model.openpi.effective_action_dim == 13
+    assert model.openpi.tactile_prefix_dim_in == 9 * 440 * 2
+    assert model.export_norm_asset_id == "replay_firm_tabero_xarm_gripper"
+
+    metadata = cfg.actor.fsdp_config.trainable_checkpoint_metadata
+    assert metadata.dataset == "datas/replay_firm_tabero_xarm_gripper"
+    assert metadata.gripper_coordinate == "xarm_positive_open"
+    assert metadata.training_config == XARM_CONFIG_PATH.stem
+    assert metadata.target_global_step == 5000
+
+
+def test_replay_firm_xarm_gripper_pi05_tacfield_sft_2gpu_20k_config_contract(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("EMBODIED_PATH", str(XARM_20K_CONFIG_PATH.parents[1]))
+    monkeypatch.setenv("REPLAY_FIRM_XARM_PI05_RUN_DIR", str(tmp_path))
+    monkeypatch.setenv("REPLAY_FIRM_XARM_PI05_RUN_NAME", "xarm-gripper-20k-test")
+    monkeypatch.setenv(
+        "REPLAY_FIRM_XARM_PI05_CHECKPOINT_ROOT", str(tmp_path / "checkpoints")
+    )
+    monkeypatch.setenv(
+        "REPLAY_FIRM_XARM_PI05_NORM_STATS", str(tmp_path / "norm_stats.json")
+    )
+
+    cfg = OmegaConf.load(XARM_20K_CONFIG_PATH)
+    cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
+
+    assert cfg.defaults[0] == "model/pi0_5@actor.model"
+    assert cfg.cluster.component_placement.actor == "5-6"
+    assert cfg.runner.resume_dir is None
+    assert cfg.runner.max_steps == 20000
+    assert cfg.runner.save_interval == 1000
+    assert cfg.actor.micro_batch_size == 16
+    assert cfg.actor.global_batch_size == 32
+    assert cfg.actor.optim.total_training_steps == 20000
+    assert cfg.actor.optim.lr_warmup_steps == 1000
+    assert cfg.actor.optim.lr_decay_steps == 30000
+    assert cfg.data.train_data_paths[0].dataset_path.endswith(
+        "datas/replay_firm_tabero_xarm_gripper"
+    )
+
+    model = cfg.actor.model
+    assert model.model_path.endswith("models/pi05_libero_pytorch")
+    assert model.openpi.config_name == "pi05_lora_tacfield_tabero_xarm_gripper"
+    assert model.openpi.pi05 is True
+    assert model.openpi.action_horizon == 10
+    assert model.openpi.discrete_state_input is True
+    assert model.openpi.effective_action_dim == 13
+    assert model.openpi.tactile_prefix_dim_in == 9 * 440 * 2
+    assert model.lora_target == "both"
+    assert model.freeze_non_lora is True
+    assert model.extra_trainable_modules == [
+        "paligemma_with_expert.paligemma.base_model.model.model.vision_tower",
+        "action_in_proj",
+        "time_mlp_in",
+        "time_mlp_out",
+        "action_out_proj",
+        "tactile_prefix_encoder",
+    ]
+    assert model.export_norm_asset_id == "replay_firm_tabero_xarm_gripper"
+
+    metadata = cfg.actor.fsdp_config.trainable_checkpoint_metadata
+    assert metadata.dataset == "datas/replay_firm_tabero_xarm_gripper"
+    assert metadata.model_family == "pi05"
+    assert metadata.gripper_coordinate == "xarm_positive_open"
+    assert metadata.training_config == XARM_20K_CONFIG_PATH.stem
+    assert metadata.target_global_step == 20000
+
+
+def test_replay_firm_xarm_gripper_pi0_tacfield_sft_2gpu_config_contract(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("EMBODIED_PATH", str(XARM_PI0_CONFIG_PATH.parents[1]))
+    monkeypatch.setenv("REPLAY_FIRM_XARM_PI0_RUN_DIR", str(tmp_path))
+    monkeypatch.setenv("REPLAY_FIRM_XARM_PI0_RUN_NAME", "xarm-pi0-test")
+    monkeypatch.setenv(
+        "REPLAY_FIRM_XARM_PI0_CHECKPOINT_ROOT", str(tmp_path / "checkpoints")
+    )
+    monkeypatch.setenv(
+        "REPLAY_FIRM_XARM_PI0_NORM_STATS", str(tmp_path / "norm_stats.json")
+    )
+
+    cfg = OmegaConf.load(XARM_PI0_CONFIG_PATH)
+    cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
+
+    assert cfg.defaults[0] == "model/pi0@actor.model"
+    assert cfg.runner.max_steps == 5000
+    assert cfg.runner.save_interval == 1000
+    assert cfg.actor.micro_batch_size == 16
+    assert cfg.actor.global_batch_size == 32
+    assert cfg.data.train_data_paths[0].dataset_path.endswith(
+        "datas/replay_firm_tabero_xarm_gripper"
+    )
+
+    model = cfg.actor.model
+    assert model.model_path.endswith("models/pi0_base")
+    assert model.num_action_chunks == 50
+    assert model.extra_trainable_modules == [
+        "paligemma_with_expert.paligemma.base_model.model.model.vision_tower",
+        "state_proj",
+        "action_in_proj",
+        "action_time_mlp_in",
+        "action_time_mlp_out",
+        "action_out_proj",
+        "tactile_prefix_encoder",
+    ]
+    assert model.openpi.config_name == "pi0_lora_tacfield_tabero_xarm_gripper"
+    assert model.openpi.pi05 is False
+    assert model.openpi.action_horizon == 50
+    assert model.openpi.action_chunk == 50
+    assert model.openpi.discrete_state_input is False
+    assert model.openpi.effective_action_dim == 13
+    assert model.openpi.tactile_prefix_dim_in == 9 * 440 * 2
+    assert model.export_norm_asset_id == "replay_firm_tabero_xarm_gripper"
+
+    metadata = cfg.actor.fsdp_config.trainable_checkpoint_metadata
+    assert metadata.dataset == "datas/replay_firm_tabero_xarm_gripper"
+    assert metadata.model_family == "pi0"
+    assert metadata.action_horizon == 50
+    assert metadata.control_hz == 20
+    assert metadata.policy_horizon_seconds == pytest.approx(2.5)
+    assert metadata.execution_steps == 10
+    assert metadata.execution_horizon_seconds == pytest.approx(0.5)
+    assert metadata.gripper_coordinate == "xarm_positive_open"
+    assert metadata.training_config == XARM_PI0_CONFIG_PATH.stem
+    assert metadata.target_global_step == 5000
