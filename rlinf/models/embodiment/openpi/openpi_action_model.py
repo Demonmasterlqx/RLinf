@@ -1332,6 +1332,21 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                     ).contiguous()
         return processed_obs
 
+    def _sample_actions_with_inference_autocast(self, *args, **kwargs):
+        """Run mixed-precision rollout inference with the synced projection dtype."""
+        compute_dtype = self.action_in_proj.weight.dtype
+        device_type = self.action_in_proj.weight.device.type
+        enabled = device_type == "cuda" and compute_dtype in {
+            torch.bfloat16,
+            torch.float16,
+        }
+        with torch.autocast(
+            device_type=device_type,
+            dtype=compute_dtype,
+            enabled=enabled,
+        ):
+            return self.sample_actions(*args, **kwargs)
+
     def predict_action_batch(
         self,
         env_obs,
@@ -1371,7 +1386,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             )
 
             # Step 2: Use noise to sample actual actions from diffusion model
-            outputs = self.sample_actions(
+            outputs = self._sample_actions_with_inference_autocast(
                 observation,
                 noise=noise_actions,
                 mode="eval",
@@ -1400,7 +1415,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
 
         else:
             # Non-DSRL or eval mode
-            outputs = self.sample_actions(
+            outputs = self._sample_actions_with_inference_autocast(
                 observation, mode=mode, compute_values=compute_values
             )
             actions = self.output_transform(
@@ -1916,19 +1931,34 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         # prefix_output:
         # pi05: [bs, (256 * 3 + 200) = 968, 2048]
         # pi0: [bs, (256 * 3 + 48) = 816, 1024]
+        # Tabero TacField appends one or more tactile tokens to that base prefix.
         # token length
         if "pi05_" in self.config.config_name:
             lang_token_len = 200
-            all_token_length = 968
+            base_token_length = 968
         elif "pi0_" in self.config.config_name:
             lang_token_len = 48
-            all_token_length = 816
+            base_token_length = 816
+        else:
+            raise ValueError(
+                "VLM value head only supports pi0/pi05 configs; got "
+                f"{self.config.config_name!r}."
+            )
+
+        all_token_length = prefix_output.shape[1]
+        extra_token_count = all_token_length - base_token_length
+        if extra_token_count < 0:
+            raise ValueError(
+                "VLM prefix is shorter than the configured base prefix: "
+                f"{all_token_length} < {base_token_length}."
+            )
 
         if self.config.value_vlm_mode == "mean_token":
             prefix_mask = (
                 [True] * 256 * self.config.num_images_in_input
                 + [False] * 256 * (3 - self.config.num_images_in_input)
                 + [True] * lang_token_len
+                + [True] * extra_token_count
             )
         elif self.config.value_vlm_mode == "last_token":
             prefix_mask = [False] * (all_token_length - 1) + [True] * 1

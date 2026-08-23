@@ -78,7 +78,7 @@ from rlinf.utils.placement import (
     ModelParallelComponentPlacement,
 )
 from rlinf.utils.tabero_ppo_boundary import (
-    TABERO_PPO_TRANSITION_BOUNDARY_SEMANTICS,
+    uses_tabero_primitive_prefix_boundary,
     validate_tabero_ppo_checkpoint_boundary_metadata,
 )
 from rlinf.utils.utils import (
@@ -1253,9 +1253,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 compute_embodied_loss_masks(
                     rollout_batch["dones"],
                     reward_type=self.cfg.algorithm.reward_type,
-                    use_primitive_prefix_logprobs=(
+                    use_primitive_prefix_logprobs=uses_tabero_primitive_prefix_boundary(
                         self._tabero_ppo_transition_boundary_semantics
-                        == TABERO_PPO_TRANSITION_BOUNDARY_SEMANTICS
                     ),
                 )
             )
@@ -1634,9 +1633,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         forward_inputs = micro_batch.get("forward_inputs", None)
 
         loss_normalization_steps = self.cfg.env.train.max_episode_steps
-        if (
+        if uses_tabero_primitive_prefix_boundary(
             self._tabero_ppo_transition_boundary_semantics
-            == TABERO_PPO_TRANSITION_BOUNDARY_SEMANTICS
         ):
             action_chunk = int(self.cfg.actor.model.num_action_chunks)
             if loss_normalization_steps % action_chunk != 0:

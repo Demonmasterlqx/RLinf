@@ -54,6 +54,7 @@ from rlinf.utils.tabero_ppo_boundary import (
     TABERO_PPO_BOUNDARY_CONTRACTS,
     TABERO_PPO_CHECKPOINT_METADATA_KEY,
     TABERO_PPO_DEFAULT_RESET_TRANSITION_BOUNDARY_SEMANTICS,
+    validate_tabero_pi05_pirl_deployment_checkpoint,
 )
 
 if TYPE_CHECKING:
@@ -846,6 +847,292 @@ def validate_megatron_cfg(cfg: DictConfig) -> DictConfig:
     return cfg
 
 
+def _validate_tabero_realworld_pi05_pirl_contract(cfg, model_cfg) -> None:
+    """Fail before Ray starts when the RealWorld PI0.5 PiRL contract drifts."""
+
+    required_model_values = {
+        "num_action_chunks": 10,
+        "action_dim": 13,
+        "is_lora": True,
+        "lora_target": "action_expert",
+        "freeze_non_lora": True,
+        "lora_path": None,
+        "use_proprio": True,
+        "num_steps": 10,
+        "add_value_head": True,
+        "precision": None,
+        "frozen_parameter_precision": "bf16",
+        "trainable_parameter_precision": "fp32",
+    }
+    for key, expected in required_model_values.items():
+        actual = model_cfg.get(key)
+        if actual != expected:
+            raise ValueError(
+                "RealWorld Tabero PI0.5 PiRL requires "
+                f"actor.model.{key}={expected!r}; got {actual!r}."
+            )
+
+    allowed_missing_prefixes = model_cfg.get("checkpoint_load_allowed_missing_prefixes")
+    if allowed_missing_prefixes is None or list(allowed_missing_prefixes) != [
+        "value_head."
+    ]:
+        raise ValueError(
+            "RealWorld Tabero PI0.5 PiRL requires "
+            "actor.model.checkpoint_load_allowed_missing_prefixes="
+            "['value_head.'] so every SFT tensor except the new critic is strict."
+        )
+
+    openpi_cfg = model_cfg.get("openpi", {})
+    required_openpi_values = {
+        "config_name": "pi05_lora_tacfield_tabero_xarm_gripper",
+        "pi05": True,
+        "action_horizon": 10,
+        "discrete_state_input": True,
+        "num_images_in_input": 2,
+        "train_expert_only": True,
+        "action_chunk": 10,
+        "action_env_dim": 13,
+        "effective_action_dim": 13,
+        "tactile_type": "expert_his_c_fut",
+        "tactile_dim": 6,
+        "tactile_dim_in": 0,
+        "tactile_prefix_dim_in": 9 * 440 * 2,
+        "tactile_prefix_history": 8,
+        "tactile_prefix_encoder_type": "tcn",
+        "tactile_prefix_use_reference_frame": True,
+        "tactile_prefix_diff_from_reference": False,
+        "num_steps": 10,
+        "add_value_head": True,
+        "joint_logprob": False,
+        "value_after_vlm": True,
+        "detach_critic_input": True,
+        "use_dsrl": False,
+    }
+    for key, expected in required_openpi_values.items():
+        actual = openpi_cfg.get(key)
+        if actual != expected:
+            raise ValueError(
+                "RealWorld Tabero PI0.5 PiRL requires "
+                f"actor.model.openpi.{key}={expected!r}; got {actual!r}."
+            )
+    tactile_streams = openpi_cfg.get("tactile_streams")
+    if tactile_streams is None or list(tactile_streams) != ["tactile_prefix"]:
+        raise ValueError(
+            "RealWorld Tabero PI0.5 PiRL requires exactly one tactile_prefix stream."
+        )
+
+    openpi_data_cfg = model_cfg.get("openpi_data")
+    if openpi_data_cfg is not None and openpi_data_cfg.get("norm_stats_path"):
+        raise ValueError(
+            "RealWorld Tabero PI0.5 PiRL forbids actor.model.openpi_data."
+            "norm_stats_path; normalization must load from the audited checkpoint."
+        )
+
+    actor_model_path = str(model_cfg.get("model_path", ""))
+    rollout_model_path = str(cfg.rollout.model.get("model_path", ""))
+    if (
+        not actor_model_path
+        or not rollout_model_path
+        or Path(actor_model_path).expanduser().resolve()
+        != Path(rollout_model_path).expanduser().resolve()
+    ):
+        raise ValueError(
+            "RealWorld Tabero PI0.5 PiRL requires actor and rollout to load the "
+            "same local model_path."
+        )
+
+    checkpoint_contract = model_cfg.get("tabero_pi05_checkpoint_contract")
+    if checkpoint_contract is None:
+        raise ValueError(
+            "RealWorld Tabero PI0.5 PiRL requires "
+            "actor.model.tabero_pi05_checkpoint_contract."
+        )
+    require_final = checkpoint_contract.get("require_final")
+    expected_config_name = checkpoint_contract.get("expected_config_name")
+    expected_norm_asset_id = checkpoint_contract.get("expected_norm_asset_id")
+    expected_dataset = checkpoint_contract.get("expected_dataset")
+    expected_gripper_coordinate = checkpoint_contract.get("expected_gripper_coordinate")
+    validate_tabero_pi05_pirl_deployment_checkpoint(
+        actor_model_path,
+        expected_model_sha256=checkpoint_contract.get("expected_model_sha256"),
+        expected_norm_stats_sha256=checkpoint_contract.get(
+            "expected_norm_stats_sha256"
+        ),
+        expected_config_name=expected_config_name,
+        expected_norm_asset_id=expected_norm_asset_id,
+        expected_dataset=expected_dataset,
+        expected_gripper_coordinate=expected_gripper_coordinate,
+        require_final=require_final,
+    )
+
+    checkpoint_metadata = (
+        cfg.actor.get("fsdp_config", {}).get("trainable_checkpoint_metadata", {}) or {}
+    )
+    required_checkpoint_metadata = {
+        "method": "pirl",
+        "task_domain": "realworld",
+        "task_suite": "gentle_grasp",
+        "task_id": 6,
+        "target_object": "target_object_1",
+        "task_description": "pick up the Vitasoy and put it into the basket",
+        "control_mode": "hybrid_tactile",
+        "reset_source": "task_config_default_reset",
+        "policy_gripper_sign_bridge": False,
+        "gripper_coordinate": expected_gripper_coordinate,
+        "action_filter": "xarm_sim_action_chunk_filter_v1",
+        "camera_preprocess": "stretch_480x640_to_224x224_inter_area",
+        "model_family": "pi05",
+        "openpi_config_name": expected_config_name,
+        "dataset": expected_dataset,
+        "normalization_asset_id": expected_norm_asset_id,
+        "base_model_sha256": checkpoint_contract.get("expected_model_sha256"),
+        "base_norm_stats_sha256": checkpoint_contract.get("expected_norm_stats_sha256"),
+        "base_checkpoint_require_final": require_final,
+        "action_horizon": 10,
+        "effective_action_dim": 13,
+        "state_dim": 7,
+        "camera_count": 2,
+        "tactile_prefix_dim_in": 9 * 440 * 2,
+        "tactile_prefix_history": 8,
+        "combined_marker_count": 440,
+        "target_global_step": cfg.runner.get("max_epochs"),
+        "tabero_ppo_transition_boundary_semantics": (
+            TABERO_PPO_DEFAULT_RESET_TRANSITION_BOUNDARY_SEMANTICS
+        ),
+    }
+    for key, expected in required_checkpoint_metadata.items():
+        actual = checkpoint_metadata.get(key)
+        if actual != expected:
+            raise ValueError(
+                "RealWorld Tabero PI0.5 PiRL requires auditable "
+                "actor.fsdp_config.trainable_checkpoint_metadata."
+                f"{key}={expected!r}; got {actual!r}."
+            )
+    training_config = checkpoint_metadata.get("training_config")
+    if not isinstance(training_config, str) or not training_config.strip():
+        raise ValueError(
+            "RealWorld Tabero PI0.5 PiRL checkpoint metadata requires a "
+            "non-empty training_config."
+        )
+
+    if require_final is False and (
+        cfg.runner.get("max_epochs") != 1
+        or cfg.env.train.get("total_num_envs") != 1
+        or cfg.actor.get("global_batch_size") != 1
+    ):
+        raise ValueError(
+            "A non-final PI0.5 TacField checkpoint is restricted to a one-update, "
+            "single-environment PiRL smoke run."
+        )
+
+    expected_env_values = {
+        "id": "Isaac-RealWorld-GentleGrasp-XarmUmi-Hybrid-Tactile-v0",
+        "target_object": "target_object_1",
+        "task_description": "pick up the Vitasoy and put it into the basket",
+        "reset_source": "task_config_default_reset",
+        "task_suite": "gentle_grasp",
+        "task_id": 6,
+        "tactile_backend": "taxim_fots",
+        "chunk_boundary_mode": "terminal_safe_v1",
+        "policy_gripper_sign_bridge": False,
+        "marker_history_len": 8,
+        "combined_marker_count": 440,
+    }
+    for split_name in ("train", "eval"):
+        init_params = cfg.env[split_name].get("init_params", {})
+        for key, expected in expected_env_values.items():
+            actual = init_params.get(key)
+            if actual != expected:
+                raise ValueError(
+                    "RealWorld Tabero PI0.5 PiRL requires "
+                    f"env.{split_name}.init_params.{key}={expected!r}; "
+                    f"got {actual!r}."
+                )
+
+        success_cfg = init_params.get("success", {})
+        if (
+            success_cfg.get("required_consecutive_steps") != 8
+            or success_cfg.get("terminal_reward") != 1.0
+        ):
+            raise ValueError(
+                "RealWorld Tabero PI0.5 PiRL requires eight consecutive success "
+                "steps and terminal_reward=1.0."
+            )
+        action_filter_cfg = init_params.get("action_filter", {})
+        required_action_filter = {
+            "enabled": True,
+            "transition_steps": 3,
+            "max_position_step_m": 0.008,
+            "max_position_delta_change_m": 0.006,
+            "max_orientation_step_deg": 2.0,
+            "max_orientation_delta_change_deg": 1.5,
+        }
+        for key, expected in required_action_filter.items():
+            actual = action_filter_cfg.get(key)
+            if actual != expected:
+                raise ValueError(
+                    "RealWorld Tabero PI0.5 PiRL requires "
+                    f"env.{split_name}.init_params.action_filter.{key}="
+                    f"{expected!r}; got {actual!r}."
+                )
+
+        camera_cfg = init_params.get("camera_preprocess", {})
+        required_camera_preprocess = {
+            "source_height": 480,
+            "source_width": 640,
+            "target_height": 224,
+            "target_width": 224,
+            "mode": "stretch",
+            "interpolation": "INTER_AREA",
+        }
+        for key, expected in required_camera_preprocess.items():
+            actual = camera_cfg.get(key)
+            if actual != expected:
+                raise ValueError(
+                    "RealWorld Tabero PI0.5 PiRL requires "
+                    f"env.{split_name}.init_params.camera_preprocess.{key}="
+                    f"{expected!r}; got {actual!r}."
+                )
+        for legacy_camera_override in ("agentview_cam", "eye_in_hand_cam"):
+            if init_params.get(legacy_camera_override) is not None:
+                raise ValueError(
+                    "RealWorld Tabero PI0.5 PiRL must preserve the native 480x640 "
+                    f"camera before stretch preprocessing; remove env.{split_name}."
+                    f"init_params.{legacy_camera_override}."
+                )
+
+        if (
+            cfg.env[split_name].get("max_episode_steps") != 300
+            or cfg.env[split_name].get("max_steps_per_rollout_epoch") != 300
+        ):
+            raise ValueError(
+                "RealWorld Tabero PI0.5 PiRL control-loop parity requires exactly "
+                f"300 primitive steps in env.{split_name}."
+            )
+
+        extension_path = (
+            Path(str(init_params.get("extension_path", ""))).expanduser().resolve()
+        )
+        if not extension_path.is_dir() or extension_path.parts[-3:] != (
+            "Tabero_X",
+            "source",
+            "tac_manip",
+        ):
+            raise ValueError(
+                "RealWorld Tabero PI0.5 PiRL extension_path must resolve to "
+                "Tabero_X/source/tac_manip."
+            )
+        for directory_key in ("realworld_config_dir", "realworld_assets_dir"):
+            directory = (
+                Path(str(init_params.get(directory_key, ""))).expanduser().resolve()
+            )
+            if not directory.is_dir():
+                raise ValueError(
+                    "RealWorld Tabero PI0.5 PiRL requires existing "
+                    f"env.{split_name}.init_params.{directory_key}; got {directory}."
+                )
+
+
 def validate_embodied_cfg(cfg):
     only_eval = (
         cfg.runner.get("only_eval", False)
@@ -863,9 +1150,7 @@ def validate_embodied_cfg(cfg):
         "tabero_ppo_transition_boundary_semantics"
     )
     if ppo_boundary_semantics is not None:
-        boundary_contract = TABERO_PPO_BOUNDARY_CONTRACTS.get(
-            ppo_boundary_semantics
-        )
+        boundary_contract = TABERO_PPO_BOUNDARY_CONTRACTS.get(ppo_boundary_semantics)
         if boundary_contract is None:
             raise ValueError(
                 "Unsupported algorithm.tabero_ppo_transition_boundary_semantics "
@@ -879,7 +1164,7 @@ def validate_embodied_cfg(cfg):
             )
         openpi_cfg = model_cfg.get("openpi", {})
         expected_openpi_config = (
-            "pi05_lora_tacfield_tabero"
+            "pi05_lora_tacfield_tabero_xarm_gripper"
             if ppo_boundary_semantics
             == TABERO_PPO_DEFAULT_RESET_TRANSITION_BOUNDARY_SEMANTICS
             else "pi0_lora_tacfield_tabero"
@@ -986,6 +1271,12 @@ def validate_embodied_cfg(cfg):
                     f"actor.model.num_action_chunks={action_chunk}; got "
                     f"{max_episode_steps!r}."
                 )
+
+        if (
+            ppo_boundary_semantics
+            == TABERO_PPO_DEFAULT_RESET_TRANSITION_BOUNDARY_SEMANTICS
+        ):
+            _validate_tabero_realworld_pi05_pirl_contract(cfg, model_cfg)
 
         fsdp_cfg = cfg.actor.get("fsdp_config", {})
         if fsdp_cfg.get("save_trainable_model_weights") is not True:

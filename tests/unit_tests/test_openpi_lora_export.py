@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 import torch
+from omegaconf import OmegaConf
 from safetensors import safe_open
 from safetensors.torch import save_file
 from torch import nn
@@ -44,6 +45,10 @@ def test_get_lora_modules_supports_dual_openpi_export_targets():
         "lora_adapter",
         "action_expert_lora_adapter",
     ]
+    assert [item.target_name for item in modules] == [
+        "paligemma",
+        "action_expert",
+    ]
     assert modules[0].module is model.paligemma_with_expert.paligemma
     assert modules[1].module is model.paligemma_with_expert.gemma_expert.model
 
@@ -55,8 +60,112 @@ def test_get_lora_modules_supports_dual_openpi_export_targets():
     assert model.paligemma_with_expert.gemma_expert.model is replacement_expert
 
 
+def test_canonical_peft_key_removes_nested_wrappers():
+    assert (
+        exporter._canonical_peft_key(  # noqa: SLF001
+            "root.base_model.model.branch.base_model.model.proj.weight"
+        )
+        == "root.branch.proj.weight"
+    )
+
+
+def test_collect_extra_trainable_keys_requires_explicit_module_ownership():
+    model = nn.Module()
+    model.branch = nn.Module()
+    model.branch.base_model = nn.Module()
+    model.branch.base_model.model = nn.Module()
+    model.branch.base_model.model.extra = nn.Linear(2, 2)
+    model.register_parameter("lora_test", nn.Parameter(torch.ones(1)))
+    model.value_head = nn.Linear(2, 1)
+
+    key_map, prefixes = exporter._collect_extra_trainable_keys(  # noqa: SLF001
+        model, ("branch.base_model.model.extra",)
+    )
+
+    assert prefixes == ("branch.extra",)
+    assert key_map == {
+        "branch.extra.weight": "branch.base_model.model.extra.weight",
+        "branch.extra.bias": "branch.base_model.model.extra.bias",
+    }
+
+    model.unowned = nn.Linear(2, 2)
+    with pytest.raises(ValueError, match="unowned=.*unowned.weight"):
+        exporter._collect_extra_trainable_keys(  # noqa: SLF001
+            model, ("branch.base_model.model.extra",)
+        )
+
+
+def test_save_extra_trainable_uses_merged_canonical_values(tmp_path):
+    model = nn.Module()
+    model.branch = nn.Module()
+    model.branch.extra = nn.Linear(2, 2)
+    output = tmp_path / "extra_trainable.safetensors"
+
+    exporter._save_extra_trainable(  # noqa: SLF001
+        model,
+        {
+            "branch.extra.weight": "branch.base_model.model.extra.weight",
+            "branch.extra.bias": "branch.base_model.model.extra.bias",
+        },
+        output,
+        output_dtype=torch.bfloat16,
+    )
+
+    with safe_open(output, framework="pt", device="cpu") as handle:
+        assert set(handle.keys()) == {"branch.extra.weight", "branch.extra.bias"}
+        assert {str(handle.get_slice(key).get_dtype()) for key in handle.keys()} == {
+            "BF16"
+        }
+
+
+def test_bundle_staging_rejects_nonempty_target(tmp_path):
+    target = tmp_path / "bundle"
+    target.mkdir()
+    (target / "user-data").write_text("preserve")
+
+    with pytest.raises(FileExistsError, match="new or empty"):
+        exporter._prepare_bundle_staging(target)  # noqa: SLF001
+
+    assert (target / "user-data").read_text() == "preserve"
+
+
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_resolve_norm_stats_uses_pirl_base_asset_contract(tmp_path):
+    base = tmp_path / "base"
+    norm_stats = base / "assets" / "replay_firm_tabero_xarm_gripper" / "norm_stats.json"
+    norm_stats.parent.mkdir(parents=True)
+    norm_stats.write_text('{"norm_stats": {}}')
+    model_cfg = OmegaConf.create({"model_path": str(base)})
+    checkpoint_meta = {
+        "normalization_asset_id": "replay_firm_tabero_xarm_gripper",
+        "base_norm_stats_sha256": _sha256(norm_stats),
+    }
+
+    source, asset_id = exporter._resolve_norm_stats_source(  # noqa: SLF001
+        model_cfg, checkpoint_meta
+    )
+
+    assert source == norm_stats.resolve()
+    assert asset_id == "replay_firm_tabero_xarm_gripper"
+
+
+def test_resolve_norm_stats_rejects_pirl_hash_mismatch(tmp_path):
+    base = tmp_path / "base"
+    norm_stats = base / "assets" / "dataset" / "norm_stats.json"
+    norm_stats.parent.mkdir(parents=True)
+    norm_stats.write_text('{"norm_stats": {}}')
+
+    with pytest.raises(ValueError, match="checkpoint contract"):
+        exporter._resolve_norm_stats_source(  # noqa: SLF001
+            OmegaConf.create({"model_path": str(base)}),
+            {
+                "normalization_asset_id": "dataset",
+                "base_norm_stats_sha256": "0" * 64,
+            },
+        )
 
 
 _ACTION_EXPERT_PROJECTIONS = (

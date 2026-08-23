@@ -8,8 +8,8 @@ group_size: 1
 
 reward_coef: 1.0
 use_fixed_reset_state_ids: False
-max_steps_per_rollout_epoch: 360
-max_episode_steps: 360
+max_steps_per_rollout_epoch: 300
+max_episode_steps: 300
 
 video_cfg:
   save_video: False
@@ -21,13 +21,31 @@ init_params:
   id: "Isaac-RealWorld-GentleGrasp-XarmUmi-Hybrid-Tactile-v0"
   num_envs: null
   max_episode_steps: ${..max_episode_steps}
-  task_description: "place the Vitasoy, Coca-Cola, cookie, and basket on the table"
+  target_object: target_object_1
+  task_description: "pick up the Vitasoy and put it into the basket"
+  reset_source: task_config_default_reset
 
   extension_path: "/data/home/sim6g/code/tabero/Tabero_X/source/tac_manip"
   realworld_config_dir: "/data/home/sim6g/code/tabero/Tabero_X/benchmarks/datasets/realworld/config"
   realworld_assets_dir: "/data/home/sim6g/code/tabero/Tabero_X/benchmarks/datasets/realworld/USD"
   tactile_backend: taxim_fots
   chunk_boundary_mode: terminal_safe_v1
+  # replay_firm_tabero_xarm_gripper uses the native XArm positive-open coordinate.
+  policy_gripper_sign_bridge: false
+  action_filter:
+    enabled: true
+    transition_steps: 3
+    max_position_step_m: 0.008
+    max_position_delta_change_m: 0.006
+    max_orientation_step_deg: 2.0
+    max_orientation_delta_change_deg: 1.5
+  camera_preprocess:
+    source_height: 480
+    source_width: 640
+    target_height: 224
+    target_width: 224
+    mode: stretch
+    interpolation: INTER_AREA
 
   task_suite: gentle_grasp
   task_id: 6
@@ -36,10 +54,3 @@ init_params:
   success:
     required_consecutive_steps: 8
     terminal_reward: 1.0
-
-  agentview_cam:
-    height: 256
-    width: 256
-  eye_in_hand_cam:
-    height: 256
-    width: 256

@@ -14,11 +14,31 @@
 
 import dataclasses
 
+import cv2
 import numpy as np
 from openpi import transforms
 from openpi.models import model as _model
 
 from rlinf.models.embodiment.openpi.policies.libero_policy import _parse_image
+
+TABERO_CAMERA_TARGET_HW = (224, 224)
+
+
+def stretch_camera_image_to_224(image: object) -> np.ndarray:
+    """Match the RealWorld OpenPI client's no-padding INTER_AREA resize."""
+
+    parsed = _parse_image(image)
+    if parsed.ndim != 3 or parsed.shape[-1] != 3:
+        raise ValueError(
+            f"Tabero camera image must have HWC RGB shape; got {parsed.shape}."
+        )
+    if parsed.shape[:2] == TABERO_CAMERA_TARGET_HW:
+        return parsed
+    return cv2.resize(
+        parsed,
+        (TABERO_CAMERA_TARGET_HW[1], TABERO_CAMERA_TARGET_HW[0]),
+        interpolation=cv2.INTER_AREA,
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -61,8 +81,8 @@ class TaberoTacFieldInputs(transforms.DataTransformFn):
     model_type: _model.ModelType
 
     def __call__(self, data: dict) -> dict:
-        base_image = _parse_image(data["image"])
-        wrist_image = _parse_image(data["wrist_image"])
+        base_image = stretch_camera_image_to_224(data["image"])
+        wrist_image = stretch_camera_image_to_224(data["wrist_image"])
 
         right_image = np.zeros_like(base_image)
         right_mask = (

@@ -1,0 +1,17 @@
+defaults:
+  - isaaclab_pi05_pirl_realworld_tabero_task6_2gpu_smoke
+  - _self_
+
+cluster:
+  component_placement:
+    actor: "4"
+    rollout: "4"
+    env: "4"
+
+actor:
+  group_name: RealWorldTaberoTask6ActorStartupGroup
+
+runner:
+  per_worker_log: true
+  logger:
+    experiment_name: realworld_tabero_task6_pi05_pirl_actor_startup_gpu4

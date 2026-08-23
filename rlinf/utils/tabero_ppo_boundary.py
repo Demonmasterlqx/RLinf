@@ -42,9 +42,6 @@ TABERO_PPO_BOUNDARY_CONTRACTS = {
     },
 }
 TABERO_PPO_CHECKPOINT_METADATA_KEY = "tabero_ppo_transition_boundary_semantics"
-TABERO_PI05_PIRL_CONFIG_NAME = "pi05_lora_tacfield_tabero"
-TABERO_PI05_PIRL_NORM_ASSET_ID = "replay_firm_tabero"
-TABERO_PI05_PIRL_DATASET = "datas/replay_firm_tabero"
 
 
 def _load_json_mapping(path: Path, *, label: str) -> dict[str, Any]:
@@ -85,6 +82,12 @@ def _validate_expected_sha256(value: Any, *, field: str) -> str:
             f"Tabero PiRL {field} must be a lowercase 64-character SHA-256."
         )
     return value
+
+
+def _validate_expected_string(value: Any, *, field: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"Tabero PiRL {field} must be a non-empty string.")
+    return value.strip()
 
 
 def _require_exact_values(
@@ -133,6 +136,10 @@ def validate_tabero_pi05_pirl_deployment_checkpoint(
     *,
     expected_model_sha256: str,
     expected_norm_stats_sha256: str,
+    expected_config_name: str,
+    expected_norm_asset_id: str,
+    expected_dataset: str,
+    expected_gripper_coordinate: str,
     require_final: bool,
 ) -> dict[str, Any]:
     """Validate a local merged PI0.5 TacField checkpoint before Ray starts.
@@ -149,6 +156,23 @@ def validate_tabero_pi05_pirl_deployment_checkpoint(
     )
     expected_norm_stats_sha256 = _validate_expected_sha256(
         expected_norm_stats_sha256, field="expected_norm_stats_sha256"
+    )
+    expected_config_name = _validate_expected_string(
+        expected_config_name, field="expected_config_name"
+    )
+    expected_norm_asset_id = _validate_expected_string(
+        expected_norm_asset_id, field="expected_norm_asset_id"
+    )
+    if Path(expected_norm_asset_id).name != expected_norm_asset_id:
+        raise ValueError(
+            "Tabero PiRL expected_norm_asset_id must be one checkpoint-relative "
+            f"directory name; got {expected_norm_asset_id!r}."
+        )
+    expected_dataset = _validate_expected_string(
+        expected_dataset, field="expected_dataset"
+    )
+    expected_gripper_coordinate = _validate_expected_string(
+        expected_gripper_coordinate, field="expected_gripper_coordinate"
     )
 
     checkpoint_dir = Path(model_path).expanduser().resolve()
@@ -169,9 +193,7 @@ def validate_tabero_pi05_pirl_deployment_checkpoint(
     model_config = _load_json_mapping(
         checkpoint_dir / "config.json", label="model config"
     )
-    norm_stats_path = (
-        checkpoint_dir / TABERO_PI05_PIRL_NORM_ASSET_ID / "norm_stats.json"
-    )
+    norm_stats_path = checkpoint_dir / expected_norm_asset_id / "norm_stats.json"
     norm_payload = _load_json_mapping(norm_stats_path, label="normalization statistics")
 
     actual_model_sha256 = _sha256(model_file)
@@ -200,7 +222,7 @@ def validate_tabero_pi05_pirl_deployment_checkpoint(
         {
             "format": "t2vla_openpi_pytorch_merged_lora",
             "method": "sft_full_lora_tacfield",
-            "dataset": TABERO_PI05_PIRL_DATASET,
+            "dataset": expected_dataset,
         },
         label="export metadata",
     )
@@ -212,14 +234,15 @@ def validate_tabero_pi05_pirl_deployment_checkpoint(
     _require_exact_values(
         source_metadata,
         {
-            "dataset": TABERO_PI05_PIRL_DATASET,
+            "dataset": expected_dataset,
             "model_family": "pi05",
-            "openpi_config_name": TABERO_PI05_PIRL_CONFIG_NAME,
-            "deployment_config_name": TABERO_PI05_PIRL_CONFIG_NAME,
+            "openpi_config_name": expected_config_name,
+            "deployment_config_name": expected_config_name,
             "action_horizon": 10,
             "effective_action_dim": 13,
             "tactile_prefix_dim_in": 9 * 440 * 2,
             "tactile_prefix_history": 8,
+            "gripper_coordinate": expected_gripper_coordinate,
         },
         label="source checkpoint metadata",
     )
@@ -253,7 +276,7 @@ def validate_tabero_pi05_pirl_deployment_checkpoint(
             "action_horizon": 10,
             "pi05": True,
             "discrete_state_input": True,
-            "config_name": TABERO_PI05_PIRL_CONFIG_NAME,
+            "config_name": expected_config_name,
             "num_images_in_input": 2,
             "action_chunk": 10,
             "action_env_dim": 13,
@@ -298,6 +321,10 @@ def validate_tabero_pi05_pirl_deployment_checkpoint(
         "global_step": global_step,
         "target_global_step": target_global_step,
         "is_final": is_final,
+        "config_name": expected_config_name,
+        "norm_asset_id": expected_norm_asset_id,
+        "dataset": expected_dataset,
+        "gripper_coordinate": expected_gripper_coordinate,
     }
 
 

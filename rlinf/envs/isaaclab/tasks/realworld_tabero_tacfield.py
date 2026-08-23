@@ -22,8 +22,10 @@ observation conversion, and Hybrid action validation.
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -34,7 +36,6 @@ from omegaconf import open_dict
 from rlinf.envs.isaaclab.utils import quat2axisangle_torch
 
 from ..isaaclab_env import IsaaclabBaseEnv
-
 
 REALWORLD_ENV_ID = "Isaac-RealWorld-GentleGrasp-XarmUmi-Hybrid-Tactile-v0"
 REALWORLD_TASK_SUITE = "gentle_grasp"
@@ -50,6 +51,16 @@ REALWORLD_CHUNK_BOUNDARY_MODE = "terminal_safe_v1"
 _TERMINAL_RAW_OBSERVATION_KEY = "_realworld_terminal_raw_observation"
 _TERMINAL_OBSERVATION_MASK_KEY = "_realworld_terminal_observation_mask"
 _EXECUTED_CHUNK_ACTIONS_KEY = "_tabero_executed_chunk_actions"
+_RAW_CHUNK_ACTIONS_KEY = "_tabero_raw_chunk_actions"
+
+REALWORLD_TARGET_PROMPTS = {
+    "target_object_1": "pick up the Vitasoy and put it into the basket",
+    "target_object_2": "Pick up the Coca-Cola and put it into the basket",
+    "target_object_3": "pick up the cookie and put it into the basket",
+}
+REALWORLD_BASKET_OBJECT = "target_object_4"
+REALWORLD_CAMERA_SOURCE_HW = (480, 640)
+REALWORLD_CAMERA_TARGET_HW = (224, 224)
 
 
 def _clone_nested(value: Any) -> Any:
@@ -145,7 +156,9 @@ def _make_consecutive_success_term(manager_term_base_cls: type) -> type:
             required_steps: int,
         ) -> torch.Tensor:
             if int(required_steps) != self._tracker.required_steps:
-                raise RuntimeError("RealWorld required success streak changed at runtime.")
+                raise RuntimeError(
+                    "RealWorld required success streak changed at runtime."
+                )
             return self._tracker.update(success_func(env, **success_params))
 
     RealWorldConsecutiveSuccessTerm.__name__ = "RealWorldConsecutiveSuccessTerm"
@@ -259,7 +272,12 @@ def _validate_extension_import(
         ) from error
 
 
-def _load_task_description(config_dir: Path) -> str:
+def _load_task_contract(
+    config_dir: Path,
+    *,
+    target_object: str,
+    task_description: str,
+) -> tuple[str, list[dict[str, Any]]]:
     config_path = config_dir / f"{REALWORLD_TASK_SUITE}.json"
     if not config_path.is_file():
         raise FileNotFoundError(f"RealWorld task config not found: {config_path}")
@@ -284,11 +302,18 @@ def _load_task_description(config_dir: Path) -> str:
             f"RealWorld {REALWORLD_TASK_SUITE} Task {REALWORLD_TASK_ID} is missing "
             f"from {config_path}."
         )
-    task_description = str(task_entry.get("language_instruction", "")).strip()
-    if not task_description:
+    configured_description = str(task_description).strip()
+    expected_description = REALWORLD_TARGET_PROMPTS.get(target_object)
+    if expected_description is None:
         raise ValueError(
-            f"RealWorld {REALWORLD_TASK_SUITE} Task {REALWORLD_TASK_ID} has no "
-            "language_instruction."
+            "RealWorld Task 6 target_object must be one of "
+            f"{sorted(REALWORLD_TARGET_PROMPTS)}; got {target_object!r}."
+        )
+    if configured_description != expected_description:
+        raise ValueError(
+            "RealWorld Task 6 target prompt mismatch: "
+            f"target={target_object!r}, expected={expected_description!r}, "
+            f"got={configured_description!r}."
         )
     goals = task_entry.get("goals")
     if not isinstance(goals, list) or not goals:
@@ -296,7 +321,27 @@ def _load_task_description(config_dir: Path) -> str:
             f"RealWorld {REALWORLD_TASK_SUITE} Task {REALWORLD_TASK_ID} must "
             "define non-empty goals."
         )
-    return task_description
+    matching_branches = []
+    for goal in goals:
+        if not isinstance(goal, dict):
+            continue
+        any_of = goal.get("any_of")
+        if not isinstance(any_of, list):
+            continue
+        matching_branches.extend(
+            branch
+            for branch in any_of
+            if isinstance(branch, dict)
+            and branch.get("ref_obj") == target_object
+            and branch.get("target") == REALWORLD_BASKET_OBJECT
+        )
+    if len(matching_branches) != 1:
+        raise ValueError(
+            "RealWorld Task 6 must contain exactly one success branch for "
+            f"{target_object!r} -> {REALWORLD_BASKET_OBJECT!r}; "
+            f"got {len(matching_branches)}."
+        )
+    return configured_description, [{"any_of": [matching_branches[0]]}]
 
 
 def _prepend_python_path(path: Path) -> None:
@@ -305,30 +350,46 @@ def _prepend_python_path(path: Path) -> None:
         sys.path.insert(0, path_str)
 
 
-def _set_camera_resolution(scene: Any, camera_name: str, camera_cfg: Any) -> None:
-    if camera_cfg is None or not hasattr(scene, camera_name):
-        return
-    camera = getattr(scene, camera_name)
-    height = _cfg_get(camera_cfg, "height")
-    width = _cfg_get(camera_cfg, "width")
-    if height is not None:
-        camera.height = int(height)
-    if width is not None:
-        camera.width = int(width)
+def _validate_camera_source_cfg(scene: Any, camera_name: str) -> None:
+    camera = getattr(scene, camera_name, None)
+    if camera is None:
+        raise ValueError(f"RealWorld scene is missing camera {camera_name!r}.")
+    actual = (int(camera.height), int(camera.width))
+    if actual != REALWORLD_CAMERA_SOURCE_HW:
+        raise ValueError(
+            f"RealWorld {camera_name} must preserve native source resolution "
+            f"{REALWORLD_CAMERA_SOURCE_HW}; got {actual}."
+        )
 
 
 def _camera_rgb_observation(env: Any, camera_name: str) -> torch.Tensor:
     return env.scene[camera_name].data.output["rgb"]
 
 
-def _validate_hybrid_action_cfg(isaac_env_cfg: Any) -> None:
+def _validate_hybrid_action_cfg(
+    isaac_env_cfg: Any,
+    *,
+    require_policy_gripper_sign_bridge: bool,
+) -> None:
     actions_cfg = getattr(isaac_env_cfg, "actions", None)
     arm_action = getattr(actions_cfg, "arm_action", None)
     gripper_action = getattr(actions_cfg, "gripper_action", None)
     action_class = getattr(arm_action, "class_type", None)
-    if getattr(action_class, "__name__", None) != "ForcePositionAction":
+    action_mro_names = {
+        getattr(base_class, "__name__", "")
+        for base_class in getattr(action_class, "__mro__", ())
+    }
+    if "ForcePositionAction" not in action_mro_names:
         raise ValueError(
             "RealWorld Task 6 requires the 13D ForcePositionAction controller."
+        )
+    if require_policy_gripper_sign_bridge and (
+        getattr(action_class, "__name__", None)
+        != "XarmPolicyGripperSignBridgeForcePositionAction"
+    ):
+        raise ValueError(
+            "RealWorld legacy Tabero normalization requires the XArm policy "
+            "gripper sign bridge action term."
         )
     if gripper_action is not None:
         raise ValueError(
@@ -338,6 +399,16 @@ def _validate_hybrid_action_cfg(isaac_env_cfg: Any) -> None:
     controller_cfg = getattr(ik_cfg, "controller", None)
     if bool(getattr(controller_cfg, "use_relative_mode", True)):
         raise ValueError("RealWorld Hybrid control requires absolute EEF poses.")
+    if require_policy_gripper_sign_bridge:
+        observations_cfg = getattr(isaac_env_cfg, "observations", None)
+        policy_cfg = getattr(observations_cfg, "policy", None)
+        gripper_pos_cfg = getattr(policy_cfg, "gripper_pos", None)
+        gripper_pos_func = getattr(gripper_pos_cfg, "func", None)
+        if getattr(gripper_pos_func, "__name__", None) != "policy_gripper_pos":
+            raise ValueError(
+                "RealWorld legacy Tabero normalization requires the policy "
+                "gripper sign bridge observation term."
+            )
 
 
 def _build_state(policy_obs: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -349,8 +420,7 @@ def _build_state(policy_obs: dict[str, torch.Tensor]) -> torch.Tensor:
     if gripper_pos is None or gripper_pos.ndim not in (1, 2):
         shape = None if gripper_pos is None else tuple(gripper_pos.shape)
         raise ValueError(
-            "RealWorld gripper_pos must have shape (N,) or (N, J); "
-            f"got {shape}."
+            f"RealWorld gripper_pos must have shape (N,) or (N, J); got {shape}."
         )
     if gripper_pos.shape[0] != eef_pose.shape[0]:
         raise ValueError("RealWorld eef_pose and gripper_pos batches do not match.")
@@ -367,6 +437,299 @@ def _build_state(policy_obs: dict[str, torch.Tensor]) -> torch.Tensor:
     if tuple(state.shape[1:]) != (7,) or not torch.isfinite(state).all():
         raise ValueError("RealWorld state must be finite with shape (N, 7).")
     return state
+
+
+class _RealWorldActionChunkFilter:
+    """Vectorized XArm absolute-pose filter matching the Tabero_X evaluator."""
+
+    def __init__(
+        self,
+        num_envs: int,
+        *,
+        transition_steps: int,
+        max_position_step_m: float,
+        max_position_delta_change_m: float,
+        max_orientation_step_deg: float,
+        max_orientation_delta_change_deg: float,
+    ) -> None:
+        if transition_steps <= 0:
+            raise ValueError(
+                "RealWorld action filter transition_steps must be positive."
+            )
+        positive_limits = {
+            "max_position_step_m": max_position_step_m,
+            "max_position_delta_change_m": max_position_delta_change_m,
+            "max_orientation_step_deg": max_orientation_step_deg,
+            "max_orientation_delta_change_deg": max_orientation_delta_change_deg,
+        }
+        for name, value in positive_limits.items():
+            if not math.isfinite(float(value)) or float(value) <= 0:
+                raise ValueError(
+                    f"RealWorld action filter {name} must be finite and positive."
+                )
+        self.num_envs = int(num_envs)
+        self.transition_steps = int(transition_steps)
+        self.max_position_step_m = float(max_position_step_m)
+        self.max_position_delta_change_m = float(max_position_delta_change_m)
+        self.max_orientation_step_rad = math.radians(float(max_orientation_step_deg))
+        self.max_orientation_delta_change_rad = math.radians(
+            float(max_orientation_delta_change_deg)
+        )
+        self._last_action: torch.Tensor | None = None
+        self._last_position_delta: torch.Tensor | None = None
+        self._last_orientation_delta: torch.Tensor | None = None
+        self._initialized: torch.Tensor | None = None
+
+    @staticmethod
+    def _limit_norm(vector: torch.Tensor, limit: float) -> torch.Tensor:
+        norm = torch.linalg.vector_norm(vector, dim=-1, keepdim=True)
+        scale = torch.clamp(float(limit) / torch.clamp(norm, min=1e-12), max=1.0)
+        return vector * scale
+
+    @staticmethod
+    def _rotvec_to_quat(rotation_vector: torch.Tensor) -> torch.Tensor:
+        angle = torch.linalg.vector_norm(rotation_vector, dim=-1, keepdim=True)
+        half_angle = 0.5 * angle
+        xyz = torch.where(
+            angle > 1e-12,
+            rotation_vector / torch.clamp(angle, min=1e-12) * torch.sin(half_angle),
+            torch.zeros_like(rotation_vector),
+        )
+        return torch.cat([torch.cos(half_angle), xyz], dim=-1)
+
+    @staticmethod
+    def _quat_multiply(first: torch.Tensor, second: torch.Tensor) -> torch.Tensor:
+        scalar = first[..., :1] * second[..., :1] - torch.sum(
+            first[..., 1:] * second[..., 1:], dim=-1, keepdim=True
+        )
+        vector = (
+            first[..., :1] * second[..., 1:]
+            + second[..., :1] * first[..., 1:]
+            + torch.linalg.cross(first[..., 1:], second[..., 1:], dim=-1)
+        )
+        return torch.cat([scalar, vector], dim=-1)
+
+    @staticmethod
+    def _quat_inverse(quaternion: torch.Tensor) -> torch.Tensor:
+        conjugate = torch.cat([quaternion[..., :1], -quaternion[..., 1:]], dim=-1)
+        return conjugate / torch.sum(quaternion * quaternion, dim=-1, keepdim=True)
+
+    @staticmethod
+    def _quat_to_rotvec(quaternion: torch.Tensor) -> torch.Tensor:
+        quaternion = quaternion / torch.linalg.vector_norm(
+            quaternion, dim=-1, keepdim=True
+        )
+        quaternion = torch.where(
+            quaternion[..., :1] < 0,
+            -quaternion,
+            quaternion,
+        )
+        sin_half_angle = torch.linalg.vector_norm(
+            quaternion[..., 1:], dim=-1, keepdim=True
+        )
+        angle = 2.0 * torch.atan2(sin_half_angle, quaternion[..., :1])
+        return torch.where(
+            sin_half_angle > 1e-12,
+            quaternion[..., 1:] / torch.clamp(sin_half_angle, min=1e-12) * angle,
+            torch.zeros_like(quaternion[..., 1:]),
+        )
+
+    @classmethod
+    def _quat_to_nearest_rotvec(
+        cls,
+        quaternion: torch.Tensor,
+        reference: torch.Tensor,
+    ) -> torch.Tensor:
+        canonical = cls._quat_to_rotvec(quaternion)
+        angle = torch.linalg.vector_norm(canonical, dim=-1, keepdim=True)
+        axis = canonical / torch.clamp(angle, min=1e-12)
+        reference_turn = (torch.sum(reference * axis, dim=-1, keepdim=True) - angle) / (
+            2.0 * math.pi
+        )
+        center = torch.round(reference_turn)
+        offsets = torch.tensor(
+            [-1.0, 0.0, 1.0],
+            device=canonical.device,
+            dtype=canonical.dtype,
+        ).view(1, 3, 1)
+        candidates = (
+            canonical[:, None]
+            + (center[:, None] + offsets) * (2.0 * math.pi) * axis[:, None]
+        )
+        distances = torch.linalg.vector_norm(candidates - reference[:, None], dim=-1)
+        selected = distances.argmin(dim=1)
+        nearest = candidates[
+            torch.arange(candidates.shape[0], device=candidates.device), selected
+        ]
+        return torch.where(angle > 1e-12, nearest, canonical)
+
+    @staticmethod
+    def _shortest_slerp(
+        first: torch.Tensor,
+        second: torch.Tensor,
+        fraction: float,
+    ) -> torch.Tensor:
+        dot = torch.sum(first * second, dim=-1, keepdim=True)
+        second = torch.where(dot < 0, -second, second)
+        dot = torch.clamp(torch.abs(dot), -1.0, 1.0)
+        linear = first + float(fraction) * (second - first)
+        linear = linear / torch.linalg.vector_norm(linear, dim=-1, keepdim=True)
+        angle = torch.acos(dot)
+        sin_angle = torch.sin(angle)
+        spherical = (
+            torch.sin((1.0 - float(fraction)) * angle)
+            / torch.clamp(sin_angle, min=1e-12)
+            * first
+            + torch.sin(float(fraction) * angle)
+            / torch.clamp(sin_angle, min=1e-12)
+            * second
+        )
+        return torch.where(dot > 0.9995, linear, spherical)
+
+    def reset(
+        self,
+        anchor_state: torch.Tensor,
+        env_ids: torch.Tensor | None = None,
+    ) -> None:
+        if tuple(anchor_state.shape) != (self.num_envs, 7):
+            raise ValueError(
+                "RealWorld action filter anchor must have shape "
+                f"({self.num_envs}, 7); got {tuple(anchor_state.shape)}."
+            )
+        if self._last_action is None or (
+            self._last_action.device != anchor_state.device
+            or self._last_action.dtype != anchor_state.dtype
+        ):
+            self._last_action = torch.zeros(
+                self.num_envs,
+                REALWORLD_ACTION_DIM,
+                device=anchor_state.device,
+                dtype=anchor_state.dtype,
+            )
+            self._last_position_delta = torch.zeros(
+                self.num_envs, 3, device=anchor_state.device, dtype=torch.float64
+            )
+            self._last_orientation_delta = torch.zeros_like(self._last_position_delta)
+            self._initialized = torch.zeros(
+                self.num_envs, device=anchor_state.device, dtype=torch.bool
+            )
+        assert self._last_position_delta is not None
+        assert self._last_orientation_delta is not None
+        assert self._initialized is not None
+        indices = (
+            torch.arange(self.num_envs, device=anchor_state.device)
+            if env_ids is None
+            else torch.as_tensor(env_ids, device=anchor_state.device, dtype=torch.long)
+        )
+        self._last_action[indices] = 0
+        self._last_action[indices, :7] = anchor_state[indices]
+        self._last_position_delta[indices] = 0
+        self._last_orientation_delta[indices] = 0
+        self._initialized[indices] = True
+
+    def filter(self, actions: torch.Tensor) -> torch.Tensor:
+        expected_shape = (
+            self.num_envs,
+            REALWORLD_ACTION_HORIZON,
+            REALWORLD_ACTION_DIM,
+        )
+        if tuple(actions.shape) != expected_shape:
+            raise ValueError(
+                f"RealWorld action filter expects {expected_shape}; "
+                f"got {tuple(actions.shape)}."
+            )
+        if self._initialized is None or not bool(self._initialized.all()):
+            raise RuntimeError(
+                "RealWorld action filter must be anchored from reset observations "
+                "before filtering a policy chunk."
+            )
+        assert self._last_action is not None
+        assert self._last_position_delta is not None
+        assert self._last_orientation_delta is not None
+        assert self._initialized is not None
+
+        if self._last_action.device != actions.device:
+            self._last_action = self._last_action.to(device=actions.device)
+            self._last_position_delta = self._last_position_delta.to(
+                device=actions.device
+            )
+            self._last_orientation_delta = self._last_orientation_delta.to(
+                device=actions.device
+            )
+            self._initialized = self._initialized.to(device=actions.device)
+
+        filtered = actions.clone()
+        work_dtype = torch.float64
+        chunk_anchor = self._last_action.to(work_dtype)
+        previous = chunk_anchor.clone()
+        previous_position_delta = self._last_position_delta.clone()
+        previous_orientation_delta = self._last_orientation_delta.clone()
+
+        for action_index in range(REALWORLD_ACTION_HORIZON):
+            candidate = filtered[:, action_index].to(work_dtype)
+            if action_index < self.transition_steps:
+                fraction = (action_index + 1) / self.transition_steps
+                candidate[:, :3] = chunk_anchor[:, :3] + fraction * (
+                    candidate[:, :3] - chunk_anchor[:, :3]
+                )
+                anchor_quat = self._rotvec_to_quat(chunk_anchor[:, 3:6])
+                candidate_quat = self._rotvec_to_quat(candidate[:, 3:6])
+                candidate[:, 3:6] = self._quat_to_rotvec(
+                    self._shortest_slerp(anchor_quat, candidate_quat, fraction)
+                )
+
+            position_delta = self._limit_norm(
+                candidate[:, :3] - previous[:, :3],
+                self.max_position_step_m,
+            )
+            position_delta_change = self._limit_norm(
+                position_delta - previous_position_delta,
+                self.max_position_delta_change_m,
+            )
+            position_delta = self._limit_norm(
+                previous_position_delta + position_delta_change,
+                self.max_position_step_m,
+            )
+            candidate[:, :3] = previous[:, :3] + position_delta
+
+            previous_quat = self._rotvec_to_quat(previous[:, 3:6])
+            candidate_quat = self._rotvec_to_quat(candidate[:, 3:6])
+            orientation_delta = self._quat_to_rotvec(
+                self._quat_multiply(
+                    candidate_quat,
+                    self._quat_inverse(previous_quat),
+                )
+            )
+            orientation_delta = self._limit_norm(
+                orientation_delta,
+                self.max_orientation_step_rad,
+            )
+            orientation_delta_change = self._limit_norm(
+                orientation_delta - previous_orientation_delta,
+                self.max_orientation_delta_change_rad,
+            )
+            orientation_delta = self._limit_norm(
+                previous_orientation_delta + orientation_delta_change,
+                self.max_orientation_step_rad,
+            )
+            candidate_quat = self._quat_multiply(
+                self._rotvec_to_quat(orientation_delta),
+                previous_quat,
+            )
+            candidate[:, 3:6] = self._quat_to_nearest_rotvec(
+                candidate_quat,
+                previous[:, 3:6],
+            )
+
+            filtered[:, action_index, :6] = candidate[:, :6].to(actions.dtype)
+            previous_position_delta = candidate[:, :3] - previous[:, :3]
+            previous_orientation_delta = orientation_delta
+            previous = filtered[:, action_index].to(work_dtype)
+
+        self._last_action = filtered[:, -1].clone()
+        self._last_position_delta = previous_position_delta
+        self._last_orientation_delta = previous_orientation_delta
+        return filtered
 
 
 class _RealWorldMarkerHistory:
@@ -518,9 +881,7 @@ class IsaaclabRealWorldTaberoTacFieldEnv(IsaaclabBaseEnv):
                 f"RealWorld wrapper supports only {REALWORLD_ENV_ID!r}; got {env_id!r}."
             )
 
-        task_suite = str(
-            _cfg_get(init_params, "task_suite", REALWORLD_TASK_SUITE)
-        )
+        task_suite = str(_cfg_get(init_params, "task_suite", REALWORLD_TASK_SUITE))
         task_id = int(_cfg_get(init_params, "task_id", REALWORLD_TASK_ID))
         if task_suite != REALWORLD_TASK_SUITE or task_id != REALWORLD_TASK_ID:
             raise ValueError(
@@ -528,9 +889,11 @@ class IsaaclabRealWorldTaberoTacFieldEnv(IsaaclabBaseEnv):
                 f"got suite={task_suite!r}, task_id={task_id}."
             )
 
-        tactile_backend = str(
-            _cfg_get(init_params, "tactile_backend", REALWORLD_TACTILE_BACKEND)
-        ).strip().lower()
+        tactile_backend = (
+            str(_cfg_get(init_params, "tactile_backend", REALWORLD_TACTILE_BACKEND))
+            .strip()
+            .lower()
+        )
         if tactile_backend != REALWORLD_TACTILE_BACKEND:
             raise ValueError(
                 "RealWorld wrapper requires tactile_backend='taxim_fots'; "
@@ -599,14 +962,94 @@ class IsaaclabRealWorldTaberoTacFieldEnv(IsaaclabBaseEnv):
         if not torch.isfinite(torch.tensor(terminal_reward)) or terminal_reward <= 0:
             raise ValueError("RealWorld terminal_reward must be finite and positive.")
 
+        policy_gripper_sign_bridge = _cfg_get(
+            init_params, "policy_gripper_sign_bridge", False
+        )
+        if not isinstance(policy_gripper_sign_bridge, bool):
+            raise ValueError(
+                "RealWorld init_params.policy_gripper_sign_bridge must be boolean."
+            )
+        if policy_gripper_sign_bridge:
+            raise ValueError(
+                "RealWorld XArm-gripper PiRL requires "
+                "policy_gripper_sign_bridge=false; use a dedicated legacy preset "
+                "for negative-open checkpoints."
+            )
+
+        target_object = str(_cfg_get(init_params, "target_object", "")).strip()
+        configured_task_description = str(
+            _cfg_get(init_params, "task_description", "")
+        ).strip()
+        reset_source = str(_cfg_get(init_params, "reset_source", "")).strip()
+        if reset_source != "task_config_default_reset":
+            raise ValueError(
+                "RealWorld Task 6 PiRL requires reset_source="
+                "'task_config_default_reset'."
+            )
+
+        action_filter_cfg = _cfg_get(init_params, "action_filter")
+        if (
+            action_filter_cfg is None
+            or _cfg_get(action_filter_cfg, "enabled") is not True
+        ):
+            raise ValueError(
+                "RealWorld Task 6 PiRL requires action_filter.enabled=true."
+            )
+        self._action_filter = _RealWorldActionChunkFilter(
+            num_envs,
+            transition_steps=int(_cfg_get(action_filter_cfg, "transition_steps", 0)),
+            max_position_step_m=float(
+                _cfg_get(action_filter_cfg, "max_position_step_m", 0.0)
+            ),
+            max_position_delta_change_m=float(
+                _cfg_get(action_filter_cfg, "max_position_delta_change_m", 0.0)
+            ),
+            max_orientation_step_deg=float(
+                _cfg_get(action_filter_cfg, "max_orientation_step_deg", 0.0)
+            ),
+            max_orientation_delta_change_deg=float(
+                _cfg_get(action_filter_cfg, "max_orientation_delta_change_deg", 0.0)
+            ),
+        )
+
+        camera_preprocess_cfg = _cfg_get(init_params, "camera_preprocess")
+        actual_camera_contract = {
+            "source_height": int(_cfg_get(camera_preprocess_cfg, "source_height", -1)),
+            "source_width": int(_cfg_get(camera_preprocess_cfg, "source_width", -1)),
+            "target_height": int(_cfg_get(camera_preprocess_cfg, "target_height", -1)),
+            "target_width": int(_cfg_get(camera_preprocess_cfg, "target_width", -1)),
+            "mode": str(_cfg_get(camera_preprocess_cfg, "mode", "")),
+            "interpolation": str(_cfg_get(camera_preprocess_cfg, "interpolation", "")),
+        }
+        expected_camera_contract = {
+            "source_height": REALWORLD_CAMERA_SOURCE_HW[0],
+            "source_width": REALWORLD_CAMERA_SOURCE_HW[1],
+            "target_height": REALWORLD_CAMERA_TARGET_HW[0],
+            "target_width": REALWORLD_CAMERA_TARGET_HW[1],
+            "mode": "stretch",
+            "interpolation": "INTER_AREA",
+        }
+        if actual_camera_contract != expected_camera_contract:
+            raise ValueError(
+                "RealWorld camera preprocessing contract mismatch: "
+                f"expected={expected_camera_contract}, actual={actual_camera_contract}."
+            )
+
         self._extension_path = _required_directory(init_params, "extension_path")
         _validate_extension_path(self._extension_path)
         self._config_dir = _required_directory(init_params, "realworld_config_dir")
         self._assets_dir = _required_directory(init_params, "realworld_assets_dir")
         self._tactile_backend = tactile_backend
+        self._policy_gripper_sign_bridge = policy_gripper_sign_bridge
+        self._target_object = target_object
+        self._reset_source = reset_source
         self._required_success_steps = required_success_steps
         self._terminal_reward = terminal_reward
-        self._task_description = _load_task_description(self._config_dir)
+        self._task_description, self._success_goals = _load_task_contract(
+            self._config_dir,
+            target_object=target_object,
+            task_description=configured_task_description,
+        )
         self._marker_history = _RealWorldMarkerHistory(num_envs)
 
         with open_dict(cfg):
@@ -649,7 +1092,20 @@ class IsaaclabRealWorldTaberoTacFieldEnv(IsaaclabBaseEnv):
                 isaac_env_cfg = load_cfg_from_registry(
                     self.isaaclab_env_id, "env_cfg_entry_point"
                 )
-                _validate_hybrid_action_cfg(isaac_env_cfg)
+                if not hasattr(isaac_env_cfg, "policy_gripper_sign_bridge"):
+                    raise ValueError(
+                        "Tabero_X RealWorld EnvCfg does not expose "
+                        "policy_gripper_sign_bridge."
+                    )
+                isaac_env_cfg.policy_gripper_sign_bridge = (
+                    self._policy_gripper_sign_bridge
+                )
+                _validate_hybrid_action_cfg(
+                    isaac_env_cfg,
+                    require_policy_gripper_sign_bridge=(
+                        self._policy_gripper_sign_bridge
+                    ),
+                )
                 success_term_cfg = getattr(
                     getattr(isaac_env_cfg, "terminations", None),
                     "success",
@@ -672,9 +1128,8 @@ class IsaaclabRealWorldTaberoTacFieldEnv(IsaaclabBaseEnv):
                     raise ValueError(
                         "RealWorld Task 6 success must contain non-empty task goals."
                     )
-                success_term_cfg.func = _make_consecutive_success_term(
-                    ManagerTermBase
-                )
+                raw_success_params["goals"] = _clone_nested(self._success_goals)
+                success_term_cfg.func = _make_consecutive_success_term(ManagerTermBase)
                 success_term_cfg.params = {
                     "success_func": raw_success_func,
                     "success_params": raw_success_params,
@@ -695,16 +1150,8 @@ class IsaaclabRealWorldTaberoTacFieldEnv(IsaaclabBaseEnv):
                     * int(isaac_env_cfg.decimation)
                 )
 
-                _set_camera_resolution(
-                    isaac_env_cfg.scene,
-                    "agentview_cam",
-                    _cfg_get(self.cfg.init_params, "agentview_cam"),
-                )
-                _set_camera_resolution(
-                    isaac_env_cfg.scene,
-                    "eye_in_hand_cam",
-                    _cfg_get(self.cfg.init_params, "eye_in_hand_cam"),
-                )
+                _validate_camera_source_cfg(isaac_env_cfg.scene, "agentview_cam")
+                _validate_camera_source_cfg(isaac_env_cfg.scene, "eye_in_hand_cam")
                 isaac_env_cfg.observations.policy.agentview_rgb = ObsTerm(
                     func=_camera_rgb_observation,
                     params={"camera_name": "agentview_cam"},
@@ -735,6 +1182,8 @@ class IsaaclabRealWorldTaberoTacFieldEnv(IsaaclabBaseEnv):
                     )
                 return _TerminalObservationCapture(env), sim_app
             except BaseException:
+                traceback.print_exc()
+                sys.stderr.flush()
                 sim_app.close()
                 raise
 
@@ -758,14 +1207,13 @@ class IsaaclabRealWorldTaberoTacFieldEnv(IsaaclabBaseEnv):
         else:
             raw_obs, _ = self.env.reset(seed=seed, env_ids=target_env_ids)
         obs = self._wrap_obs(raw_obs, marker_update_mask=update_mask)
+        self._action_filter.reset(obs["states"], env_ids=target_env_ids)
         self._reset_metrics(target_env_ids)
         return obs, {}
 
     def step(self, actions=None, auto_reset=True):
         actions = self._validate_actions(actions, expected_rank=2)
-        active_mask = torch.ones(
-            self.num_envs, device=self.device, dtype=torch.bool
-        )
+        active_mask = torch.ones(self.num_envs, device=self.device, dtype=torch.bool)
         obs, reward, terminations, truncations, infos = self._terminal_safe_step(
             actions, active_mask=active_mask
         )
@@ -777,10 +1225,11 @@ class IsaaclabRealWorldTaberoTacFieldEnv(IsaaclabBaseEnv):
         return obs, reward, terminations, truncations, infos
 
     def chunk_step(self, chunk_actions: torch.Tensor):
-        chunk_actions = self._validate_actions(chunk_actions, expected_rank=3)
-        active_mask = torch.ones(
-            self.num_envs, device=self.device, dtype=torch.bool
-        )
+        raw_chunk_actions = self._validate_actions(
+            chunk_actions, expected_rank=3
+        ).clone()
+        chunk_actions = self._action_filter.filter(raw_chunk_actions)
+        active_mask = torch.ones(self.num_envs, device=self.device, dtype=torch.bool)
         first_done_step = torch.full(
             (self.num_envs,), -1, device=self.device, dtype=torch.long
         )
@@ -835,15 +1284,10 @@ class IsaaclabRealWorldTaberoTacFieldEnv(IsaaclabBaseEnv):
         if past_dones.any():
             env_ids = torch.nonzero(past_dones, as_tuple=False).squeeze(-1)
             reset_obs, _ = self.reset(env_ids=env_ids)
-            obs_list[-1] = _replace_batch_rows(
-                obs_list[-1], reset_obs, past_dones
-            )
+            obs_list[-1] = _replace_batch_rows(obs_list[-1], reset_obs, past_dones)
 
         early_done_envs = int(
-            (
-                (first_done_step >= 0)
-                & (first_done_step < REALWORLD_ACTION_HORIZON - 1)
-            )
+            ((first_done_step >= 0) & (first_done_step < REALWORLD_ACTION_HORIZON - 1))
             .sum()
             .item()
         )
@@ -866,6 +1310,7 @@ class IsaaclabRealWorldTaberoTacFieldEnv(IsaaclabBaseEnv):
         infos_list[-1][_EXECUTED_CHUNK_ACTIONS_KEY] = torch.stack(
             executed_actions, dim=1
         )
+        infos_list[-1][_RAW_CHUNK_ACTIONS_KEY] = raw_chunk_actions
         return (
             obs_list,
             chunk_rewards,
@@ -880,17 +1325,15 @@ class IsaaclabRealWorldTaberoTacFieldEnv(IsaaclabBaseEnv):
         *,
         active_mask: torch.Tensor,
     ):
-        active_mask = torch.as_tensor(
-            active_mask, device=self.device, dtype=torch.bool
-        )
+        active_mask = torch.as_tensor(active_mask, device=self.device, dtype=torch.bool)
         if active_mask.shape != (self.num_envs,):
             raise ValueError(
                 "RealWorld active mask must have shape "
                 f"({self.num_envs},); got {tuple(active_mask.shape)}."
             )
 
-        raw_obs, reward, raw_terminations, raw_truncations, raw_infos = (
-            self.env.step(actions)
+        raw_obs, reward, raw_terminations, raw_truncations, raw_infos = self.env.step(
+            actions
         )
         reward = reward.clone()
         raw_terminations = raw_terminations.clone().to(dtype=torch.bool)
@@ -1025,14 +1468,20 @@ class IsaaclabRealWorldTaberoTacFieldEnv(IsaaclabBaseEnv):
 
         main_image = policy_obs["agentview_rgb"]
         wrist_image = policy_obs["eye_in_hand_rgb"]
-        for name, image in (("agentview_rgb", main_image), ("eye_in_hand_rgb", wrist_image)):
+        for name, image in (
+            ("agentview_rgb", main_image),
+            ("eye_in_hand_rgb", wrist_image),
+        ):
             if (
                 image.ndim != 4
                 or image.shape[0] != self.num_envs
+                or tuple(image.shape[1:3]) != REALWORLD_CAMERA_SOURCE_HW
                 or image.shape[-1] != 3
             ):
                 raise ValueError(
-                    f"RealWorld {name} must have shape (N, H, W, 3); "
+                    "RealWorld camera parity requires "
+                    f"{name} shape (N, {REALWORLD_CAMERA_SOURCE_HW[0]}, "
+                    f"{REALWORLD_CAMERA_SOURCE_HW[1]}, 3); "
                     f"got {tuple(image.shape)}."
                 )
 
@@ -1049,9 +1498,10 @@ class IsaaclabRealWorldTaberoTacFieldEnv(IsaaclabBaseEnv):
         force = policy_obs.get("gripper_net_force")
         if force is not None:
             expected_force_shape = (self.num_envs, 1, 2, 3)
-            if tuple(force.shape) != expected_force_shape or not torch.isfinite(
-                force
-            ).all():
+            if (
+                tuple(force.shape) != expected_force_shape
+                or not torch.isfinite(force).all()
+            ):
                 raise ValueError(
                     "RealWorld gripper_net_force must be finite with shape "
                     f"{expected_force_shape}; got {tuple(force.shape)}."

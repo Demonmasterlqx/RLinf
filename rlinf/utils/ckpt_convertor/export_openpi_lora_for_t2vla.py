@@ -31,7 +31,9 @@ import json
 import os
 import re
 import shutil
+import tempfile
 from collections.abc import Callable, Mapping
+from importlib import metadata as importlib_metadata
 from pathlib import Path
 
 import safetensors.torch
@@ -59,6 +61,8 @@ DROP_EXACT_KEYS = {
 }
 
 PIRL_ACTION_EXPERT_LORA_TENSOR_COUNT = 126
+BUNDLE_FORMAT = "tabero_rlinf_openpi_lora_bundle"
+BUNDLE_FORMAT_VERSION = 1
 
 
 def _is_action_expert_lora_weight(key: str) -> bool:
@@ -124,6 +128,7 @@ class LoraModuleSpec:
     module: torch.nn.Module
     assign_module: Callable[[torch.nn.Module], None]
     adapter_dir_name: str
+    target_name: str
 
 
 def _load_model_cfg(train_config_path: str) -> DictConfig:
@@ -250,6 +255,41 @@ def _copy_norm_stats(
         shutil.copy2(source, destination)
 
 
+def _resolve_norm_stats_source(
+    model_cfg: DictConfig, checkpoint_meta: Mapping
+) -> tuple[Path | None, str]:
+    """Resolve normalization assets without weakening the checkpoint contract."""
+    norm_asset_id = str(
+        model_cfg.get("export_norm_asset_id")
+        or checkpoint_meta.get("normalization_asset_id")
+        or "NathanWu7/tabero_object_25"
+    )
+    openpi_data = model_cfg.get("openpi_data") or {}
+    configured_source = openpi_data.get("norm_stats_path")
+    if configured_source is not None:
+        source = Path(configured_source).expanduser().resolve()
+        if source.is_dir():
+            source = source / "norm_stats.json"
+    else:
+        source = (
+            Path(model_cfg.model_path).expanduser().resolve()
+            / "assets"
+            / norm_asset_id
+            / "norm_stats.json"
+        )
+    if not source.is_file():
+        return None, norm_asset_id
+
+    expected_hash = checkpoint_meta.get("base_norm_stats_sha256")
+    if expected_hash is not None and _sha256_file(source) != expected_hash:
+        raise ValueError(
+            "Normalization stats SHA256 differs from the piRL checkpoint "
+            f"contract: path={source}, expected={expected_hash}, "
+            f"actual={_sha256_file(source)}"
+        )
+    return source, norm_asset_id
+
+
 def _json_safe(value):
     if dataclasses.is_dataclass(value):
         value = dataclasses.asdict(value)
@@ -277,6 +317,178 @@ def _sha256(path: str | Path) -> str:
         while chunk := source.read(8 * 1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _sha256_file(path: str | Path) -> str:
+    file_path = Path(path).expanduser().resolve()
+    if not file_path.is_file():
+        raise FileNotFoundError(f"File not found: {file_path}")
+    digest = hashlib.sha256()
+    with file_path.open("rb") as source:
+        while chunk := source.read(8 * 1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _canonical_peft_key(key: str) -> str:
+    """Map a PEFT-wrapped parameter name to the merged OpenPI state key."""
+    canonical = key
+    marker = ".base_model.model."
+    while marker in canonical:
+        canonical = canonical.replace(marker, ".")
+    return canonical
+
+
+def _matches_module_prefix(key: str, module_name: str) -> bool:
+    return key == module_name or key.startswith(f"{module_name}.")
+
+
+def _collect_extra_trainable_keys(
+    model: torch.nn.Module, configured_modules: tuple[str, ...]
+) -> tuple[dict[str, str], tuple[str, ...]]:
+    """Collect every trainable non-LoRA, non-RL parameter for the bundle."""
+    invalid_modules = [
+        name for name in configured_modules if not isinstance(name, str) or not name
+    ]
+    if invalid_modules:
+        raise ValueError(
+            "extra_trainable_modules must contain non-empty strings; "
+            f"invalid={invalid_modules!r}"
+        )
+    canonical_prefixes = tuple(
+        dict.fromkeys(_canonical_peft_key(name) for name in configured_modules)
+    )
+    result: dict[str, str] = {}
+    unowned: list[str] = []
+    for source_key, parameter in model.named_parameters():
+        if not parameter.requires_grad or "lora_" in source_key:
+            continue
+        canonical_key = _canonical_peft_key(source_key)
+        if canonical_key.startswith(RL_ONLY_PREFIXES):
+            continue
+        if not any(
+            _matches_module_prefix(source_key, module_name)
+            for module_name in configured_modules
+        ):
+            unowned.append(source_key)
+            continue
+        previous = result.setdefault(canonical_key, source_key)
+        if previous != source_key:
+            raise ValueError(
+                "PEFT key canonicalization collision for extra trainable parameters: "
+                f"{previous!r} and {source_key!r} -> {canonical_key!r}"
+            )
+    if unowned:
+        raise ValueError(
+            "Trainable non-LoRA parameters must belong to actor.model."
+            f"extra_trainable_modules; unowned={unowned[:20]}"
+        )
+    return result, canonical_prefixes
+
+
+def _tensor_bytes(tensor: torch.Tensor) -> memoryview:
+    value = tensor.detach().cpu().contiguous().view(torch.uint8).numpy()
+    return memoryview(value)
+
+
+def _schema_digest(schema: list[dict]) -> str:
+    payload = json.dumps(schema, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _safetensors_contract(path: str | Path) -> dict:
+    checkpoint = _checkpoint_path(path)
+    schema: list[dict] = []
+    tensor_digest = hashlib.sha256()
+    with safe_open(checkpoint, framework="pt", device="cpu") as handle:
+        for key in sorted(handle.keys()):
+            tensor = handle.get_tensor(key)
+            entry = {
+                "key": key,
+                "shape": list(tensor.shape),
+                "dtype": str(handle.get_slice(key).get_dtype()),
+            }
+            schema.append(entry)
+            tensor_digest.update(
+                json.dumps(entry, sort_keys=True, separators=(",", ":")).encode()
+            )
+            tensor_digest.update(_tensor_bytes(tensor))
+    return {
+        "tensor_count": len(schema),
+        "schema": schema,
+        "schema_sha256": _schema_digest(schema),
+        "tensor_sha256": tensor_digest.hexdigest(),
+    }
+
+
+def _save_extra_trainable(
+    model: torch.nn.Module,
+    key_map: Mapping[str, str],
+    output_path: Path,
+    *,
+    output_dtype: torch.dtype | None,
+) -> None:
+    merged_state = model.state_dict()
+    missing = sorted(set(key_map) - set(merged_state))
+    if missing:
+        raise ValueError(
+            f"Merged model is missing canonical extra-trainable keys: {missing[:20]}"
+        )
+    tensors = {}
+    for key in sorted(key_map):
+        value = merged_state[key].detach().cpu()
+        if output_dtype is not None and value.is_floating_point():
+            value = value.to(output_dtype)
+        tensors[key] = value.contiguous().clone()
+    safetensors.torch.save_file(tensors, output_path)
+
+
+def _adapter_manifest(adapter_dir: Path, bundle_root: Path) -> dict:
+    config_path = adapter_dir / "adapter_config.json"
+    weights_path = adapter_dir / "adapter_model.safetensors"
+    if not config_path.is_file() or not weights_path.is_file():
+        raise FileNotFoundError(
+            f"PEFT adapter is incomplete under {adapter_dir}; expected "
+            "adapter_config.json and adapter_model.safetensors"
+        )
+    with config_path.open(encoding="utf-8") as source:
+        config = json.load(source)
+    contract = _safetensors_contract(weights_path)
+    return {
+        "path": adapter_dir.relative_to(bundle_root).as_posix(),
+        "config_sha256": _sha256_file(config_path),
+        "weights_sha256": _sha256_file(weights_path),
+        "rank": config.get("r"),
+        "alpha": config.get("lora_alpha"),
+        "target_modules": sorted(config.get("target_modules") or []),
+        "exclude_modules": config.get("exclude_modules"),
+        "tensor_count": contract["tensor_count"],
+        "schema_sha256": contract["schema_sha256"],
+    }
+
+
+def _write_checksums(bundle_root: Path) -> None:
+    checksums = {
+        path.relative_to(bundle_root).as_posix(): _sha256_file(path)
+        for path in sorted(bundle_root.rglob("*"))
+        if path.is_file() and path.name != "checksums.json"
+    }
+    with (bundle_root / "checksums.json").open("w", encoding="utf-8") as output:
+        json.dump(checksums, output, indent=2, sort_keys=True)
+
+
+def _prepare_bundle_staging(bundle_dir: str | Path) -> tuple[Path, Path]:
+    target = Path(bundle_dir).expanduser().resolve()
+    if target.exists():
+        if not target.is_dir():
+            raise FileExistsError(f"LoRA bundle target is not a directory: {target}")
+        if any(target.iterdir()):
+            raise FileExistsError(f"LoRA bundle target must be new or empty: {target}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(
+        tempfile.mkdtemp(prefix=f".{target.name}.tmp-", dir=str(target.parent))
+    )
+    return target, staging
 
 
 _SAFETENSORS_DTYPES = {
@@ -326,8 +538,7 @@ def _save_filtered_safetensors(
                 tuple(base.get_slice(key).get_shape()),
             )
             for key in base_keys & set(state_dict)
-            if tuple(state_dict[key].shape)
-            != tuple(base.get_slice(key).get_shape())
+            if tuple(state_dict[key].shape) != tuple(base.get_slice(key).get_shape())
         )
         if missing or unexpected or shape_mismatches:
             raise ValueError(
@@ -389,9 +600,7 @@ def _validate_tabero_sft_export_schema(
             for key in model_keys & base_keys
             if model.get_slice(key).get_shape() != base.get_slice(key).get_shape()
         )
-        dtypes = {
-            str(model.get_slice(key).get_dtype()) for key in model_keys
-        }
+        dtypes = {str(model.get_slice(key).get_dtype()) for key in model_keys}
     if (
         missing
         or invalid_extra
@@ -483,8 +692,7 @@ def _build_export_metadata(
     is_final = checkpoint_meta.get("is_final")
     if type(is_final) is not bool:
         raise ValueError(
-            "OpenPI checkpoint provenance is_final must be a boolean, "
-            f"got {is_final!r}"
+            f"OpenPI checkpoint provenance is_final must be a boolean, got {is_final!r}"
         )
     if not is_final and not allow_non_final:
         raise ValueError(
@@ -532,8 +740,7 @@ def _build_export_metadata(
         raise ValueError("OpenPI checkpoint provenance global_step must be positive")
     if checkpoint_meta.get("step") != global_step:
         raise ValueError(
-            "OpenPI checkpoint provenance "
-            f"step must equal global_step {global_step}"
+            f"OpenPI checkpoint provenance step must equal global_step {global_step}"
         )
     target_global_step = checkpoint_meta.get("target_global_step")
     if type(target_global_step) is not int or target_global_step <= 0:
@@ -586,9 +793,7 @@ def _build_export_metadata(
             if method == "sft_full_lora_tacfield"
             else None
         ),
-        "frozen_parameter_precision": checkpoint_meta.get(
-            "frozen_parameter_precision"
-        ),
+        "frozen_parameter_precision": checkpoint_meta.get("frozen_parameter_precision"),
         "trainable_parameter_precision": checkpoint_meta.get(
             "trainable_parameter_precision"
         ),
@@ -603,6 +808,7 @@ def _get_lora_module(model: torch.nn.Module, lora_target: str) -> LoraModuleSpec
             model.paligemma_with_expert.paligemma,
             lambda module: setattr(model.paligemma_with_expert, "paligemma", module),
             "lora_adapter",
+            "paligemma",
         )
     if lora_target == "action_expert":
         return LoraModuleSpec(
@@ -611,6 +817,7 @@ def _get_lora_module(model: torch.nn.Module, lora_target: str) -> LoraModuleSpec
                 model.paligemma_with_expert.gemma_expert, "model", module
             ),
             "action_expert_lora_adapter",
+            "action_expert",
         )
     raise ValueError(
         "Unsupported OpenPI lora_target "
@@ -627,12 +834,144 @@ def _get_lora_modules(model: torch.nn.Module, lora_target: str) -> list[LoraModu
     return [_get_lora_module(model, lora_target)]
 
 
+def _expected_lora_rank(model_cfg: DictConfig, target_name: str) -> int:
+    rank = model_cfg.get(f"{target_name}_lora_rank")
+    if rank is None:
+        rank = model_cfg.get("lora_rank")
+    if isinstance(rank, bool) or not isinstance(rank, int) or rank <= 0:
+        raise ValueError(
+            f"OpenPI {target_name} LoRA rank must be a positive integer, got {rank!r}"
+        )
+    return rank
+
+
+def _build_lora_bundle_manifest(
+    *,
+    bundle_root: Path,
+    model_cfg: DictConfig,
+    checkpoint_meta: Mapping,
+    export_metadata: Mapping,
+    lora_target: str,
+    adapter_specs: Mapping[str, dict],
+    extra_key_map: Mapping[str, str],
+    canonical_extra_prefixes: tuple[str, ...],
+    extra_path: Path,
+    norm_stats_path: Path,
+    norm_asset_id: str,
+    final_model_path: Path,
+) -> dict:
+    expected_targets = (
+        {"paligemma", "action_expert"} if lora_target == "both" else {lora_target}
+    )
+    if set(adapter_specs) != expected_targets:
+        raise ValueError(
+            "LoRA bundle adapter targets do not match lora_target; "
+            f"expected={sorted(expected_targets)}, actual={sorted(adapter_specs)}"
+        )
+    for target_name, adapter in adapter_specs.items():
+        expected_rank = _expected_lora_rank(model_cfg, target_name)
+        if adapter["rank"] != expected_rank or adapter["alpha"] != expected_rank:
+            raise ValueError(
+                f"LoRA bundle {target_name} adapter rank/alpha mismatch: "
+                f"expected={expected_rank}, rank={adapter['rank']}, "
+                f"alpha={adapter['alpha']}"
+            )
+
+    base_checkpoint = _checkpoint_path(str(model_cfg.model_path))
+    base_config_path = base_checkpoint.parent / "config.json"
+    openpi_cfg = model_cfg.get("openpi", {})
+    config_name = checkpoint_meta.get("deployment_config_name") or openpi_cfg.get(
+        "config_name"
+    )
+    if not isinstance(config_name, str) or not config_name:
+        raise ValueError(
+            "LoRA bundle requires checkpoint deployment_config_name or "
+            "actor.model.openpi.config_name."
+        )
+
+    extra_contract = _safetensors_contract(extra_path)
+    final_contract = _safetensors_contract(final_model_path)
+    relative_norm_path = norm_stats_path.relative_to(bundle_root).as_posix()
+    return {
+        "format": BUNDLE_FORMAT,
+        "format_version": BUNDLE_FORMAT_VERSION,
+        "peft_version": importlib_metadata.version("peft"),
+        "lora_target": lora_target,
+        "base_model": {
+            "source_path": str(Path(model_cfg.model_path).expanduser().resolve()),
+            "model_file": "model.safetensors",
+            "model_sha256": _sha256_file(base_checkpoint),
+            "model_tensor_count": _safetensor_count(base_checkpoint),
+            "config_file": "config.json" if base_config_path.is_file() else None,
+            "config_sha256": (
+                _sha256_file(base_config_path) if base_config_path.is_file() else None
+            ),
+        },
+        "policy_contract": {
+            "config_name": config_name,
+            "norm_asset_id": norm_asset_id,
+            "norm_stats_path": relative_norm_path,
+            "norm_stats_sha256": _sha256_file(norm_stats_path),
+            "dataset": checkpoint_meta.get("dataset"),
+            "model_family": checkpoint_meta.get("model_family"),
+            "action_horizon": checkpoint_meta.get(
+                "action_horizon", openpi_cfg.get("action_horizon")
+            ),
+            "effective_action_dim": checkpoint_meta.get(
+                "effective_action_dim", openpi_cfg.get("effective_action_dim")
+            ),
+            "state_dim": checkpoint_meta.get("state_dim", 7),
+            "tactile_prefix_dim_in": checkpoint_meta.get(
+                "tactile_prefix_dim_in", openpi_cfg.get("tactile_prefix_dim_in")
+            ),
+            "tactile_prefix_history": checkpoint_meta.get(
+                "tactile_prefix_history", openpi_cfg.get("tactile_prefix_history")
+            ),
+            "gripper_coordinate": checkpoint_meta.get("gripper_coordinate"),
+        },
+        "checkpoint": {
+            "source": export_metadata.get("source_ckpt"),
+            "sha256": export_metadata.get("source_ckpt_sha256"),
+            "method": export_metadata.get("method"),
+            "global_step": export_metadata.get("global_step"),
+            "target_global_step": export_metadata.get("target_global_step"),
+            "is_final": export_metadata.get("is_final"),
+            "metadata": _json_safe(dict(checkpoint_meta)),
+        },
+        "adapters": dict(adapter_specs),
+        "extra_trainable": {
+            "path": extra_path.relative_to(bundle_root).as_posix(),
+            "configured_modules": list(
+                model_cfg.get("extra_trainable_modules", ()) or ()
+            ),
+            "canonical_prefixes": list(canonical_extra_prefixes),
+            "source_parameter_keys": [
+                extra_key_map[key] for key in sorted(extra_key_map)
+            ],
+            "keys": sorted(extra_key_map),
+            "file_sha256": _sha256_file(extra_path),
+            **extra_contract,
+        },
+        "final_merged": {
+            "reference_model_sha256": _sha256_file(final_model_path),
+            **final_contract,
+        },
+        "exclusions": {
+            "rl_only_prefixes": list(RL_ONLY_PREFIXES),
+            "drop_exact_keys": sorted(DROP_EXACT_KEYS),
+            "value_head_included": False,
+        },
+        "export_metadata": _json_safe(dict(export_metadata)),
+    }
+
+
 def export_checkpoint(
     train_config_path: str,
     ckpt_path: str,
     output_dir: str,
     save_adapter: bool,
     allow_non_final: bool = False,
+    bundle_dir: str | None = None,
 ) -> None:
     model_cfg = _load_model_cfg(train_config_path)
     if not model_cfg.get("is_lora", False):
@@ -660,6 +999,11 @@ def export_checkpoint(
         print(f"First unexpected keys: {unexpected_keys[:20]}")
         raise RuntimeError("Unexpected checkpoint keys were not loaded.")
 
+    configured_extra_modules = tuple(model_cfg.get("extra_trainable_modules", ()) or ())
+    extra_key_map, canonical_extra_prefixes = _collect_extra_trainable_keys(
+        model, configured_extra_modules
+    )
+
     lora_target = str(model_cfg.get("lora_target", "paligemma"))
     lora_specs = _get_lora_modules(model, lora_target)
     for lora_spec in lora_specs:
@@ -672,67 +1016,136 @@ def export_checkpoint(
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    adapter_dir_names = []
-    if save_adapter:
+    bundle_target = None
+    bundle_staging = None
+    if bundle_dir is not None:
+        bundle_target, bundle_staging = _prepare_bundle_staging(bundle_dir)
+        if bundle_target == output_path.expanduser().resolve():
+            shutil.rmtree(bundle_staging)
+            raise ValueError("--bundle_dir must differ from --output_dir.")
+
+    try:
+        adapter_dir_names = []
+        bundle_adapter_specs = {}
         for lora_spec in lora_specs:
-            adapter_dir = output_path / lora_spec.adapter_dir_name
-            lora_spec.module.save_pretrained(str(adapter_dir))
-            adapter_dir_names.append(lora_spec.adapter_dir_name)
-            print(f"Saved LoRA adapter to {adapter_dir}")
+            if save_adapter:
+                adapter_dir = output_path / lora_spec.adapter_dir_name
+                lora_spec.module.save_pretrained(
+                    str(adapter_dir), safe_serialization=True
+                )
+                adapter_dir_names.append(lora_spec.adapter_dir_name)
+                print(f"Saved LoRA adapter to {adapter_dir}")
+            if bundle_staging is not None:
+                adapter_dir = bundle_staging / "adapters" / lora_spec.target_name
+                lora_spec.module.save_pretrained(
+                    str(adapter_dir), safe_serialization=True
+                )
+                bundle_adapter_specs[lora_spec.target_name] = _adapter_manifest(
+                    adapter_dir, bundle_staging
+                )
 
-    for lora_spec in lora_specs:
-        lora_spec.assign_module(lora_spec.module.merge_and_unload())
-    is_tabero_sft = checkpoint_meta.get("method") == "sft_full_lora_tacfield"
-    if not is_tabero_sft:
-        model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
-    model_path = output_path / "model.safetensors"
-    _save_filtered_safetensors(
-        model,
-        str(model_path),
-        base_model_path=str(model_cfg.model_path),
-        allowed_extra_prefixes=("tactile_prefix_encoder.",) if is_tabero_sft else (),
-        output_dtype=torch.bfloat16 if is_tabero_sft else None,
-    )
-    if is_tabero_sft:
-        _validate_tabero_sft_export_schema(
-            model_path,
-            str(model_cfg.model_path),
+        for lora_spec in lora_specs:
+            lora_spec.assign_module(lora_spec.module.merge_and_unload())
+        is_tabero_sft = checkpoint_meta.get("method") == "sft_full_lora_tacfield"
+        if not is_tabero_sft:
+            model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
+        model_path = output_path / "model.safetensors"
+        _save_filtered_safetensors(
+            model,
+            str(model_path),
+            base_model_path=str(model_cfg.model_path),
+            allowed_extra_prefixes=("tactile_prefix_encoder.",)
+            if is_tabero_sft
+            else (),
+            output_dtype=torch.bfloat16 if is_tabero_sft else None,
         )
-        reference_model_path = model_cfg.get("export_reference_model_path")
-        if reference_model_path is not None:
-            _validate_reference_schema(model_path, reference_model_path)
-    _copy_assets(str(model_cfg.model_path), str(output_path))
-    if is_tabero_sft:
-        norm_stats_path = model_cfg.get("openpi_data", {}).get("norm_stats_path")
-        if norm_stats_path is None:
-            raise ValueError("Tabero SFT export requires openpi_data.norm_stats_path.")
-        norm_asset_id = model_cfg.get(
-            "export_norm_asset_id", "NathanWu7/tabero_object_25"
+        if is_tabero_sft:
+            _validate_tabero_sft_export_schema(
+                model_path,
+                str(model_cfg.model_path),
+            )
+            reference_model_path = model_cfg.get("export_reference_model_path")
+            if reference_model_path is not None:
+                _validate_reference_schema(model_path, reference_model_path)
+        _copy_assets(str(model_cfg.model_path), str(output_path))
+
+        norm_stats_source, norm_asset_id = _resolve_norm_stats_source(
+            model_cfg, checkpoint_meta
         )
-        _copy_norm_stats(norm_stats_path, output_path, str(norm_asset_id))
+        if is_tabero_sft:
+            if norm_stats_source is None:
+                raise ValueError(
+                    "Tabero SFT export requires openpi_data.norm_stats_path."
+                )
+            _copy_norm_stats(norm_stats_source, output_path, norm_asset_id)
+        if bundle_staging is not None and norm_stats_source is None:
+            raise ValueError(
+                "LoRA bundle export requires actor.model.openpi_data.norm_stats_path."
+            )
 
-    model_config = getattr(model, "config", None)
-    if dataclasses.is_dataclass(model_config):
-        with (output_path / "config.json").open("w", encoding="utf-8") as f:
-            json.dump(_json_safe(model_config), f, indent=2)
+        model_config = getattr(model, "config", None)
+        if dataclasses.is_dataclass(model_config):
+            with (output_path / "config.json").open("w", encoding="utf-8") as f:
+                json.dump(_json_safe(model_config), f, indent=2)
 
-    with (output_path / "export_meta.json").open("w", encoding="utf-8") as f:
-        json.dump(
-            _build_export_metadata(
-                train_config_path=os.path.abspath(train_config_path),
-                ckpt_path=os.path.abspath(ckpt_path),
-                source_model_path=str(model_cfg.model_path),
+        export_metadata = _build_export_metadata(
+            train_config_path=os.path.abspath(train_config_path),
+            ckpt_path=os.path.abspath(ckpt_path),
+            source_model_path=str(model_cfg.model_path),
+            checkpoint_meta=checkpoint_meta,
+            model_path=model_path,
+            lora_target=lora_target,
+            adapter_dirs=adapter_dir_names if save_adapter else [],
+            allow_non_final=allow_non_final,
+        )
+        with (output_path / "export_meta.json").open("w", encoding="utf-8") as f:
+            json.dump(export_metadata, f, indent=2)
+
+        if bundle_staging is not None:
+            extra_path = bundle_staging / "extra_trainable.safetensors"
+            _save_extra_trainable(
+                model,
+                extra_key_map,
+                extra_path,
+                output_dtype=torch.bfloat16 if is_tabero_sft else None,
+            )
+            bundle_norm_path = (
+                bundle_staging / "assets" / norm_asset_id / "norm_stats.json"
+            )
+            bundle_norm_path.parent.mkdir(parents=True, exist_ok=True)
+            norm_source_path = Path(norm_stats_source).expanduser().resolve()
+            if norm_source_path.is_dir():
+                norm_source_path = norm_source_path / "norm_stats.json"
+            shutil.copy2(norm_source_path, bundle_norm_path)
+            manifest = _build_lora_bundle_manifest(
+                bundle_root=bundle_staging,
+                model_cfg=model_cfg,
                 checkpoint_meta=checkpoint_meta,
-                model_path=model_path,
+                export_metadata=export_metadata,
                 lora_target=lora_target,
-                adapter_dirs=adapter_dir_names if save_adapter else [],
-                allow_non_final=allow_non_final,
-            ),
-            f,
-            indent=2,
-        )
+                adapter_specs=bundle_adapter_specs,
+                extra_key_map=extra_key_map,
+                canonical_extra_prefixes=canonical_extra_prefixes,
+                extra_path=extra_path,
+                norm_stats_path=bundle_norm_path,
+                norm_asset_id=norm_asset_id,
+                final_model_path=model_path,
+            )
+            with (bundle_staging / "manifest.json").open(
+                "w", encoding="utf-8"
+            ) as output:
+                json.dump(manifest, output, indent=2, sort_keys=True)
+            _write_checksums(bundle_staging)
+            if bundle_target.exists():
+                bundle_target.rmdir()
+            bundle_staging.replace(bundle_target)
+            bundle_staging = None
+            print(f"Saved versioned LoRA bundle to {bundle_target}")
 
-    print(f"Saved merged T2-VLA checkpoint to {output_path}")
+        print(f"Saved merged T2-VLA checkpoint to {output_path}")
+    finally:
+        if bundle_staging is not None and bundle_staging.exists():
+            shutil.rmtree(bundle_staging)
 
 
 def main() -> None:
@@ -740,6 +1153,14 @@ def main() -> None:
     parser.add_argument("--train_config_path", required=True)
     parser.add_argument("--ckpt_path", required=True)
     parser.add_argument("--output_dir", required=True)
+    parser.add_argument(
+        "--bundle_dir",
+        default=None,
+        help=(
+            "Optional new or empty directory for a versioned RLinf PEFT LoRA "
+            "bundle loadable by T2-VLA."
+        ),
+    )
     parser.add_argument("--no_save_adapter", action="store_true")
     parser.add_argument(
         "--allow_non_final",
@@ -757,6 +1178,7 @@ def main() -> None:
         output_dir=args.output_dir,
         save_adapter=not args.no_save_adapter,
         allow_non_final=args.allow_non_final,
+        bundle_dir=args.bundle_dir,
     )
 
 
