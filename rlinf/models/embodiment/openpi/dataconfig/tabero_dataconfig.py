@@ -34,7 +34,9 @@ class TaberoTacImgDataConfig(DataConfigFactory):
         self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig
     ) -> DataConfig:
         data_transforms = _transforms.Group(
-            inputs=[tabero_policy.TaberoTacImgInputs(model_type=model_config.model_type)],
+            inputs=[
+                tabero_policy.TaberoTacImgInputs(model_type=model_config.model_type)
+            ],
             outputs=[tabero_policy.LiberoForceOutputs()],
         )
 
@@ -65,6 +67,37 @@ class TaberoTacFieldDataConfig(DataConfigFactory):
         data_transforms = _transforms.Group(
             inputs=[
                 tabero_policy.TaberoTacFieldInputs(model_type=model_config.model_type)
+            ],
+            outputs=[tabero_policy.LiberoForceOutputs()],
+        )
+
+        if self.extra_delta_transform:
+            delta_action_mask = _transforms.make_bool_mask(6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            data_transforms=data_transforms,
+            model_transforms=ModelTransformFactory()(model_config),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class TaberoTacForceDataConfig(DataConfigFactory):
+    """Tabero two-image plus measured-force TCN-prefix data config."""
+
+    extra_delta_transform: bool = True
+
+    @override
+    def create(
+        self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig
+    ) -> DataConfig:
+        data_transforms = _transforms.Group(
+            inputs=[
+                tabero_policy.TaberoTacForceInputs(model_type=model_config.model_type)
             ],
             outputs=[tabero_policy.LiberoForceOutputs()],
         )

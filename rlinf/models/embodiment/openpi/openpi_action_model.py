@@ -598,6 +598,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                     "state",
                     "actions",
                     "tactile_marker_motion",
+                    "tactile_gripper_force",
                 }
                 inputs = {
                     key: inputs[key]
@@ -1268,7 +1269,11 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         return result
 
     def obs_processor(self, env_obs):
-        if "tabero" in self.config.config_name:
+        is_tabero_config = (
+            "tabero" in self.config.config_name
+            or self.config.config_name == "pi05_lora_tacforce_tcn_real"
+        )
+        if is_tabero_config:
             processed_obs = {
                 "image": env_obs["main_images"],
                 "wrist_image": env_obs["wrist_images"],
@@ -1292,6 +1297,14 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                     )
                 processed_obs["tactile_marker_motion"] = env_obs[
                     "tactile_marker_motion"
+                ]
+            if "tacforce" in self.config.config_name:
+                if "tactile_gripper_force" not in env_obs:
+                    raise KeyError(
+                        "Tabero tacforce expects 'tactile_gripper_force' in env_obs."
+                    )
+                processed_obs["tactile_gripper_force"] = env_obs[
+                    "tactile_gripper_force"
                 ]
             return processed_obs
 

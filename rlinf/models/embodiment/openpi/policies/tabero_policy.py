@@ -121,6 +121,52 @@ class TaberoTacFieldInputs(transforms.DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class TaberoTacForceInputs(transforms.DataTransformFn):
+    """Map an 8x6 measured gripper-force history to one TCN prefix stream."""
+
+    model_type: _model.ModelType
+
+    def __call__(self, data: dict) -> dict:
+        base_image = stretch_camera_image_to_224(data["image"])
+        wrist_image = stretch_camera_image_to_224(data["wrist_image"])
+
+        right_image = np.zeros_like(base_image)
+        right_mask = (
+            np.True_ if self.model_type == _model.ModelType.PI0_FAST else np.False_
+        )
+        inputs = {
+            "state": data["state"],
+            "image": {
+                "base_0_rgb": base_image,
+                "left_wrist_0_rgb": wrist_image,
+                "right_wrist_0_rgb": right_image,
+            },
+            "image_mask": {
+                "base_0_rgb": np.True_,
+                "left_wrist_0_rgb": np.True_,
+                "right_wrist_0_rgb": right_mask,
+            },
+        }
+
+        if "tactile_gripper_force" not in data:
+            raise KeyError("TaberoTacForceInputs expects 'tactile_gripper_force'.")
+        force_history = np.asarray(data["tactile_gripper_force"])
+        if force_history.shape != (8, 6):
+            raise ValueError(
+                "tactile_gripper_force must have shape (8, 6), got "
+                f"{force_history.shape}."
+            )
+        inputs["tactile_prefix"] = force_history
+
+        if "actions" in data:
+            inputs["actions"] = data["actions"]
+        if "prompt" in data:
+            inputs["prompt"] = data["prompt"]
+
+        return inputs
+
+
+@dataclasses.dataclass(frozen=True)
 class LiberoForceOutputs(transforms.DataTransformFn):
     """Return the 13D Tabero action/force slice."""
 

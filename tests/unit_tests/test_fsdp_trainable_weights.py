@@ -16,15 +16,61 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from omegaconf import OmegaConf
 from torch import nn
 
 import rlinf.hybrid_engines.fsdp.fsdp_model_manager as fsdp_model_manager
 from rlinf.hybrid_engines.fsdp.fsdp_model_manager import FSDPModelManager
+from rlinf.hybrid_engines.fsdp.model_weight_ema import ModelWeightEMA
 
 
 class _Logger:
     def info(self, *_args, **_kwargs):
         pass
+
+
+def test_model_weight_ema_updates_in_fp32_and_temporarily_applies_weights():
+    parameter = nn.Parameter(torch.tensor([1.0], dtype=torch.bfloat16))
+    ema = ModelWeightEMA([parameter], 0.99, parameter_names=["weight"])
+
+    parameter.data.fill_(3.0)
+    ema.update()
+
+    assert ema.shadows[0].dtype == torch.float32
+    torch.testing.assert_close(ema.shadows[0], torch.tensor([1.02]))
+    assert ema.num_updates == 1
+
+    with ema.apply_to_parameters():
+        torch.testing.assert_close(
+            parameter.float(), torch.tensor([1.02]), atol=0.01, rtol=0
+        )
+    torch.testing.assert_close(parameter.float(), torch.tensor([3.0]))
+
+
+def test_model_weight_ema_state_restore_is_strict():
+    source_parameter = nn.Parameter(torch.tensor([1.0, 2.0]))
+    source = ModelWeightEMA([source_parameter], 0.9, parameter_names=["flat_parameter"])
+    source_parameter.data.add_(2.0)
+    source.update()
+
+    target_parameter = nn.Parameter(torch.zeros(2))
+    target = ModelWeightEMA([target_parameter], 0.9, parameter_names=["flat_parameter"])
+    target.load_state_dict(source.state_dict())
+
+    torch.testing.assert_close(target.shadows[0], source.shadows[0])
+    assert target.num_updates == 1
+
+    wrong_decay = ModelWeightEMA(
+        [target_parameter], 0.99, parameter_names=["flat_parameter"]
+    )
+    with pytest.raises(ValueError, match="decay mismatch"):
+        wrong_decay.load_state_dict(source.state_dict())
+
+    wrong_name = ModelWeightEMA(
+        [target_parameter], 0.9, parameter_names=["different_parameter"]
+    )
+    with pytest.raises(ValueError, match="topology"):
+        wrong_name.load_state_dict(source.state_dict())
 
 
 def test_normalize_fsdp_param_name_strips_wrappers():
@@ -161,3 +207,102 @@ def test_save_trainable_model_weights_merges_configured_provenance(
     assert metadata["step"] == step
     assert metadata["global_step"] == step
     assert metadata["is_final"] is is_final
+
+
+def test_save_trainable_model_weights_serializes_omegaconf_metadata_safely(
+    monkeypatch, tmp_path
+):
+    manager = FSDPModelManager.__new__(FSDPModelManager)
+    manager.model = nn.Linear(2, 1)
+    manager._cfg = SimpleNamespace(
+        fsdp_config=OmegaConf.create(
+            {
+                "save_trainable_model_weights": True,
+                "trainable_checkpoint_metadata": {
+                    "target_global_step": 1,
+                    "excluded_tactile_inputs": [
+                        "tactile_image",
+                        "tactile_marker_motion",
+                    ],
+                },
+            }
+        )
+    )
+    manager._logger = _Logger()
+
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 1)
+    monkeypatch.setattr(torch.distributed, "barrier", lambda: None)
+
+    manager._save_trainable_model_weights(str(tmp_path), step=1)
+
+    checkpoint = torch.load(
+        tmp_path / "model_state_dict" / "trainable_weights.pt",
+        map_location="cpu",
+        weights_only=True,
+    )
+    assert checkpoint["metadata"]["excluded_tactile_inputs"] == [
+        "tactile_image",
+        "tactile_marker_motion",
+    ]
+
+
+def test_save_trainable_model_weights_exports_ema_and_restores_live_weights(
+    monkeypatch, tmp_path
+):
+    model = nn.Linear(2, 1, bias=False)
+    model.weight.data.fill_(1.0)
+    ema = ModelWeightEMA(model.parameters(), 0.5, parameter_names=["weight"])
+    model.weight.data.fill_(3.0)
+    ema.update()
+
+    manager = FSDPModelManager.__new__(FSDPModelManager)
+    manager.model = model
+    manager.trainable_param_names = ["weight"]
+    manager._model_weight_ema = ema
+    manager._cfg = SimpleNamespace(fsdp_config={"save_trainable_model_weights": True})
+    manager._logger = _Logger()
+
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 1)
+    monkeypatch.setattr(torch.distributed, "barrier", lambda: None)
+
+    manager._save_trainable_model_weights(str(tmp_path), step=4)
+
+    checkpoint = torch.load(
+        tmp_path / "model_state_dict" / "trainable_weights.pt",
+        map_location="cpu",
+        weights_only=True,
+    )
+    torch.testing.assert_close(checkpoint["model"]["weight"], torch.full((1, 2), 2.0))
+    torch.testing.assert_close(model.weight, torch.full((1, 2), 3.0))
+    assert checkpoint["metadata"]["weight_variant"] == "ema"
+    assert checkpoint["metadata"]["model_weight_ema_decay"] == 0.5
+    assert checkpoint["metadata"]["model_weight_ema_num_updates"] == 1
+
+
+def test_model_weight_ema_rank_checkpoint_round_trip(monkeypatch, tmp_path):
+    parameter = nn.Parameter(torch.tensor([2.0]))
+    source_ema = ModelWeightEMA([parameter], 0.99, parameter_names=["flat_parameter"])
+    parameter.data.fill_(4.0)
+    source_ema.update()
+
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 1)
+    monkeypatch.setattr(torch.distributed, "barrier", lambda: None)
+
+    source_manager = FSDPModelManager.__new__(FSDPModelManager)
+    source_manager._model_weight_ema = source_ema
+    source_manager._save_model_weight_ema(str(tmp_path))
+
+    target_parameter = nn.Parameter(torch.tensor([0.0]))
+    target_manager = FSDPModelManager.__new__(FSDPModelManager)
+    target_manager._model_weight_ema = ModelWeightEMA(
+        [target_parameter], 0.99, parameter_names=["flat_parameter"]
+    )
+    target_manager._load_model_weight_ema(str(tmp_path))
+
+    torch.testing.assert_close(
+        target_manager._model_weight_ema.shadows[0], source_ema.shadows[0]
+    )
+    assert target_manager._model_weight_ema.num_updates == 1

@@ -404,31 +404,39 @@ def test_export_metadata_carries_verified_fsdp_provenance_and_hashes(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "dataset,config_stem",
+    "method,dataset,config_stem",
     [
         (
+            "sft_full_lora_tacfield",
             "datas/replay_firm_tabero",
             "replay_firm_tabero_pi05_tacfield_sft_2gpu",
         ),
         (
+            "sft_full_lora_tacfield",
             "datas/replay_firm_tabero_xarm_gripper",
             "replay_firm_tabero_xarm_gripper_pi05_tacfield_sft_2gpu",
         ),
         (
+            "sft_full_lora_tacfield",
             "datas/replay_firm_tabero_xarm_gripper",
             "replay_firm_tabero_xarm_gripper_pi0_tacfield_sft_2gpu",
+        ),
+        (
+            "sft_full_lora_tacforce_tcn",
+            "datas/replay_firm_tabero_xarm_gripper_repaired_v1",
+            "replay_firm_tabero_xarm_gripper_repaired_v1_pi05_tacforce_tcn_sft_2gpu_gb16_30k",
         ),
     ],
 )
 def test_export_metadata_accepts_replay_firm_pi05_precision_contract(
-    tmp_path, dataset, config_stem
+    tmp_path, method, dataset, config_stem
 ):
     train_config = tmp_path / f"{config_stem}.yaml"
     train_config.write_text("actor: {}\n")
     checkpoint = tmp_path / "trainable_weights.pt"
     checkpoint_metadata = {
         "format": "trainable_weights",
-        "method": "sft_full_lora_tacfield",
+        "method": method,
         "dataset": dataset,
         "training_config": train_config.stem,
         "step": 20000,

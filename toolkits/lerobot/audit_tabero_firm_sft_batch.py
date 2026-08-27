@@ -17,31 +17,38 @@ def _shape(value) -> list[int]:
     return list(value.shape)
 
 
-def audit_batch(dataset_path: Path, norm_stats_path: Path) -> dict:
+def audit_batch(
+    dataset_path: Path,
+    norm_stats_path: Path,
+    config_name: str = "pi0_lora_tacfield_tabero",
+    model_path: str = "/data/home/sim6g/code/tabero/models/pi0_base",
+    tactile_input_key: str = "tactile_marker_motion",
+) -> dict:
     info = json.loads((dataset_path / "meta" / "info.json").read_text())
     first_parquet = sorted((dataset_path / "data").rglob("*.parquet"))[0]
     raw = pq.read_table(
         first_parquet,
-        columns=["state", "actions", "tactile_marker_motion"],
+        columns=["state", "actions", tactile_input_key],
     ).slice(0, 1)
     raw_shapes = {
         key: list(info["features"][key]["shape"])
-        for key in ("state", "actions", "tactile_marker_motion")
+        for key in ("state", "actions", tactile_input_key)
     }
     for key, expected in raw_shapes.items():
         actual = raw.column(key)[0].as_py()
-        if key == "tactile_marker_motion":
-            actual_shape = [len(actual), len(actual[0]), len(actual[0][0])]
-        else:
-            actual_shape = [len(actual)]
+        actual_shape = []
+        nested = actual
+        while isinstance(nested, list):
+            actual_shape.append(len(nested))
+            nested = nested[0] if nested else None
         if actual_shape != expected:
             raise ValueError(
                 f"Raw {key} shape mismatch: expected={expected}, actual={actual_shape}"
             )
 
     config = get_openpi_config(
-        "pi0_lora_tacfield_tabero",
-        model_path="/data/home/sim6g/code/tabero/models/pi0_base",
+        config_name,
+        model_path=model_path,
         batch_size=1,
         repo_id=str(dataset_path),
         data_kwargs={"norm_stats_path": str(norm_stats_path)},
@@ -71,10 +78,12 @@ def audit_batch(dataset_path: Path, norm_stats_path: Path) -> dict:
         "actions": _shape(training_input["actions"]),
         "tactile_prefix": _shape(training_input["tactile_prefix"]),
     }
+    tactile_history = config.model.tactile_prefix_history
+    tactile_feature_dim = config.model.tactile_prefix_dim_in // tactile_history
     expected_training_input_shapes = {
         "state": [7],
-        "actions": [50, 13],
-        "tactile_prefix": [9, 396],
+        "actions": [config.model.action_horizon, config.model.effective_action_dim],
+        "tactile_prefix": [tactile_history, tactile_feature_dim],
     }
     if training_input_shapes != expected_training_input_shapes:
         raise ValueError(
@@ -94,8 +103,8 @@ def audit_batch(dataset_path: Path, norm_stats_path: Path) -> dict:
     }
     expected_model_shapes = {
         "state": [32],
-        "actions": [50, 32],
-        "tactile_prefix": [9, 396],
+        "actions": [config.model.action_horizon, config.model.action_dim],
+        "tactile_prefix": [tactile_history, tactile_feature_dim],
     }
     if model_shapes != expected_model_shapes:
         raise ValueError(
@@ -108,6 +117,9 @@ def audit_batch(dataset_path: Path, norm_stats_path: Path) -> dict:
         raise ValueError("Model action padding dimensions 13:32 must be zero.")
     return {
         "dataset": str(dataset_path),
+        "config_name": config_name,
+        "model_path": model_path,
+        "tactile_input_key": tactile_input_key,
         "raw_frame": raw_shapes,
         "training_input": training_input_shapes,
         "model": model_shapes,
@@ -122,9 +134,21 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset-path", type=Path, required=True)
     parser.add_argument("--norm-stats-path", type=Path, required=True)
+    parser.add_argument("--config-name", default="pi0_lora_tacfield_tabero")
+    parser.add_argument(
+        "--model-path",
+        default="/data/home/sim6g/code/tabero/models/pi0_base",
+    )
+    parser.add_argument("--tactile-input-key", default="tactile_marker_motion")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    result = audit_batch(args.dataset_path.resolve(), args.norm_stats_path.resolve())
+    result = audit_batch(
+        args.dataset_path.resolve(),
+        args.norm_stats_path.resolve(),
+        config_name=args.config_name,
+        model_path=args.model_path,
+        tactile_input_key=args.tactile_input_key,
+    )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result, indent=2))

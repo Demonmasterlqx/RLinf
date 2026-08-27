@@ -15,11 +15,12 @@
 import os
 import warnings
 from collections.abc import Mapping
+from contextlib import nullcontext
 from typing import ContextManager, Union
 
 import torch
 import torch.nn as nn
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
 from torch.distributed.tensor import DTensor
 from torch.optim import Optimizer
@@ -32,6 +33,7 @@ from rlinf.hybrid_engines.fsdp import (
     FSDP,
     FSDPModule,
 )
+from rlinf.hybrid_engines.fsdp.model_weight_ema import ModelWeightEMA
 from rlinf.hybrid_engines.fsdp.strategy.base import FSDPStrategyBase
 from rlinf.hybrid_engines.fsdp.utils import (
     create_device_mesh,
@@ -111,6 +113,7 @@ class FSDPModelManager:
         self.bucket_capacity = cfg.get("sync_bucket_capacity", 128 * 1024 * 1024)
 
         self.param_names_need_sync: list[str] = None
+        self._model_weight_ema: ModelWeightEMA | None = None
 
     def _create_amp_context(self) -> ContextManager:
         """
@@ -347,6 +350,7 @@ class FSDPModelManager:
         self.optimizer = self.build_optimizer(
             model=self.model, enable_critic_warmup=self.critic_warmup_steps > 0
         )
+        self._initialize_model_weight_ema()
 
         self.lr_scheduler = self.build_lr_scheduler(
             optimizer=self.optimizer, optim_config=self._cfg.optim
@@ -416,6 +420,102 @@ class FSDPModelManager:
             )
         )
 
+    def _optimizer_parameter_entries(self) -> list[tuple[str, nn.Parameter]]:
+        """Return unique optimizer parameters and their stable wrapped names."""
+        model_names = {
+            id(parameter): self._normalize_fsdp_param_name(name)
+            for name, parameter in self.model.named_parameters()
+        }
+        entries = []
+        seen = set()
+        for group in self.optimizer.param_groups:
+            for parameter in group["params"]:
+                parameter_id = id(parameter)
+                if parameter_id in seen:
+                    continue
+                seen.add(parameter_id)
+                fallback_name = f"optimizer_parameter_{len(entries)}"
+                entries.append(
+                    (model_names.get(parameter_id, fallback_name), parameter)
+                )
+        return entries
+
+    def _initialize_model_weight_ema(self) -> None:
+        decay = self._cfg.get("model_weight_ema_decay", None)
+        if decay is None:
+            self._model_weight_ema = None
+            return
+        if self.critic_warmup_steps > 0:
+            raise ValueError(
+                "model_weight_ema_decay is incompatible with optimizer replacement "
+                "during critic warmup."
+            )
+        entries = self._optimizer_parameter_entries()
+        self._model_weight_ema = ModelWeightEMA(
+            (parameter for _, parameter in entries),
+            decay,
+            parameter_names=[name for name, _ in entries],
+        )
+        self._logger.info(
+            "[FSDP] Initialized FP32 model EMA decay=%s local_parameter_shards=%d",
+            self._model_weight_ema.decay,
+            len(entries),
+        )
+
+    @staticmethod
+    def _model_weight_ema_path(checkpoint_path: str, rank: int) -> str:
+        return os.path.join(
+            checkpoint_path,
+            "model_weight_ema",
+            f"rank_{rank:05d}.pt",
+        )
+
+    def _save_model_weight_ema(self, checkpoint_path: str) -> None:
+        if self._model_weight_ema is None:
+            return
+        rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
+        state_path = self._model_weight_ema_path(checkpoint_path, rank)
+        os.makedirs(os.path.dirname(state_path), exist_ok=True)
+        torch.save(
+            {
+                "rank": rank,
+                "world_size": world_size,
+                "state": self._model_weight_ema.state_dict(),
+            },
+            state_path,
+        )
+        torch.distributed.barrier()
+
+    def _load_model_weight_ema(self, checkpoint_path: str) -> None:
+        ema_dir = os.path.join(checkpoint_path, "model_weight_ema")
+        if self._model_weight_ema is None:
+            if os.path.isdir(ema_dir):
+                raise ValueError(
+                    "Checkpoint contains model-weight EMA state, but "
+                    "actor.model_weight_ema_decay is disabled."
+                )
+            return
+
+        rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
+        state_path = self._model_weight_ema_path(checkpoint_path, rank)
+        if not os.path.isfile(state_path):
+            raise FileNotFoundError(
+                f"Model EMA checkpoint shard is missing: {state_path}"
+            )
+        payload = torch.load(state_path, map_location="cpu", weights_only=True)
+        if set(payload) != {"rank", "world_size", "state"}:
+            raise ValueError("Model EMA rank checkpoint has an invalid schema.")
+        if payload["rank"] != rank or payload["world_size"] != world_size:
+            raise ValueError(
+                "Model EMA distributed topology mismatch: "
+                f"checkpoint rank/world_size={payload['rank']}/{payload['world_size']}, "
+                f"runtime={rank}/{world_size}."
+            )
+        self._model_weight_ema.load_state_dict(payload["state"])
+        torch.distributed.barrier()
+
     def _save_trainable_model_weights(self, save_path: str, step: int) -> None:
         """Save LoRA/expert trainable tensors without optimizer state."""
         if not self._cfg.fsdp_config.get("save_trainable_model_weights", False):
@@ -430,40 +530,46 @@ class FSDPModelManager:
                 "save_trainable_model_weights=True but no trainable parameters were found."
             )
 
-        if isinstance(self.model, FSDP):
-            full_state_dict = self.get_model_state_dict(
-                cpu_offload=True, full_state_dict=True
-            )
-            if rank == 0:
-                normalized_full_state_dict = {}
-                for name, value in full_state_dict.items():
-                    normalized_name = self._normalize_fsdp_param_name(name)
-                    if normalized_name not in trainable_param_name_set:
+        ema_context = (
+            self._model_weight_ema.apply_to_parameters()
+            if getattr(self, "_model_weight_ema", None) is not None
+            else nullcontext()
+        )
+        with ema_context:
+            if isinstance(self.model, FSDP):
+                full_state_dict = self.get_model_state_dict(
+                    cpu_offload=True, full_state_dict=True
+                )
+                if rank == 0:
+                    normalized_full_state_dict = {}
+                    for name, value in full_state_dict.items():
+                        normalized_name = self._normalize_fsdp_param_name(name)
+                        if normalized_name not in trainable_param_name_set:
+                            continue
+                        if isinstance(value, DTensor):
+                            value = value.full_tensor()
+                        normalized_full_state_dict[normalized_name] = (
+                            value.detach().cpu().contiguous().clone()
+                        )
+                    state_dict = {
+                        name: normalized_full_state_dict[name]
+                        for name in trainable_param_names
+                        if name in normalized_full_state_dict
+                    }
+            elif rank == 0:
+                state_dict = {}
+                for name, param in self.model.named_parameters():
+                    if not param.requires_grad or "_flat_param" in name:
                         continue
+                    name = self._normalize_fsdp_param_name(name)
+                    if name not in trainable_param_name_set:
+                        continue
+                    value = param
                     if isinstance(value, DTensor):
                         value = value.full_tensor()
-                    normalized_full_state_dict[normalized_name] = (
-                        value.detach().cpu().contiguous().clone()
-                    )
-                state_dict = {
-                    name: normalized_full_state_dict[name]
-                    for name in trainable_param_names
-                    if name in normalized_full_state_dict
-                }
-        elif rank == 0:
-            state_dict = {}
-            for name, param in self.model.named_parameters():
-                if not param.requires_grad or "_flat_param" in name:
-                    continue
-                name = self._normalize_fsdp_param_name(name)
-                if name not in trainable_param_name_set:
-                    continue
-                value = param
-                if isinstance(value, DTensor):
-                    value = value.full_tensor()
-                state_dict[name] = value.detach().cpu().contiguous().clone()
-        else:
-            state_dict = None
+                    state_dict[name] = value.detach().cpu().contiguous().clone()
+            else:
+                state_dict = None
 
         if rank == 0:
             if not state_dict:
@@ -484,6 +590,10 @@ class FSDPModelManager:
                 "trainable_checkpoint_metadata", None
             )
             if configured_metadata is not None:
+                if isinstance(configured_metadata, DictConfig):
+                    configured_metadata = OmegaConf.to_container(
+                        configured_metadata, resolve=True
+                    )
                 if not isinstance(configured_metadata, Mapping):
                     raise ValueError(
                         "fsdp_config.trainable_checkpoint_metadata must be a mapping"
@@ -500,6 +610,17 @@ class FSDPModelManager:
                 metadata = dict(configured_metadata) | metadata
                 metadata["global_step"] = step
                 metadata["is_final"] = step == target_global_step
+            if getattr(self, "_model_weight_ema", None) is not None:
+                configured_variant = metadata.get("weight_variant")
+                if configured_variant not in (None, "ema"):
+                    raise ValueError(
+                        "EMA trainable export requires weight_variant='ema'."
+                    )
+                metadata.update(
+                    weight_variant="ema",
+                    model_weight_ema_decay=self._model_weight_ema.decay,
+                    model_weight_ema_num_updates=self._model_weight_ema.num_updates,
+                )
             torch.save(
                 {
                     "model": state_dict,
@@ -530,6 +651,7 @@ class FSDPModelManager:
         self._strategy.load_checkpoint(
             self.model, self.optimizer, self.lr_scheduler, load_path
         )
+        self._load_model_weight_ema(load_path)
 
     def save_checkpoint(self, save_path: str, step: int = 0) -> None:
         """
@@ -557,6 +679,7 @@ class FSDPModelManager:
             ),
             checkpoint_format=self._cfg.fsdp_config.get("checkpoint_format", "dcp"),
         )
+        self._save_model_weight_ema(save_path)
         self._save_trainable_model_weights(save_path, step)
 
         if restore_weight_offload:
@@ -621,6 +744,8 @@ class FSDPModelManager:
             )
         else:
             self.grad_scaler.step(optimizer=self.optimizer)
+            if self._model_weight_ema is not None:
+                self._model_weight_ema.update()
 
         self.grad_scaler.update()
 

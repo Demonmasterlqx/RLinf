@@ -63,6 +63,10 @@ DROP_EXACT_KEYS = {
 PIRL_ACTION_EXPERT_LORA_TENSOR_COUNT = 126
 BUNDLE_FORMAT = "tabero_rlinf_openpi_lora_bundle"
 BUNDLE_FORMAT_VERSION = 1
+TABERO_SFT_METHODS = {
+    "sft_full_lora_tacfield",
+    "sft_full_lora_tacforce_tcn",
+}
 
 
 def _is_action_expert_lora_weight(key: str) -> bool:
@@ -677,10 +681,11 @@ def _build_export_metadata(
         "method": method,
         "training_config": expected_training_config,
     }
-    if method not in {"pirl", "sft_full_lora_tacfield"}:
+    if method not in {"pirl", *TABERO_SFT_METHODS}:
         raise ValueError(
-            "OpenPI checkpoint provenance method must be 'pirl' or "
-            f"'sft_full_lora_tacfield', got {method!r}"
+            "OpenPI checkpoint provenance method must be 'pirl', "
+            "'sft_full_lora_tacfield', or 'sft_full_lora_tacforce_tcn', "
+            f"got {method!r}"
         )
     for field, expected in required.items():
         actual = checkpoint_meta.get(field)
@@ -703,17 +708,17 @@ def _build_export_metadata(
     task_id = checkpoint_meta.get("task_id")
     if method == "pirl" and (type(task_id) is not int or task_id not in range(10)):
         raise ValueError("piRL checkpoint provenance task_id must be in [0, 9]")
-    if method == "sft_full_lora_tacfield":
+    if method in TABERO_SFT_METHODS:
         dataset = checkpoint_meta.get("dataset")
         if dataset not in {
             "datas/tabero_firm",
             "datas/replay_firm_tabero",
             "datas/replay_firm_tabero_xarm_gripper",
+            "datas/replay_firm_tabero_xarm_gripper_repaired_v1",
         }:
             raise ValueError(
-                "Tabero SFT checkpoint provenance dataset must be "
-                "'datas/tabero_firm', 'datas/replay_firm_tabero', or "
-                "'datas/replay_firm_tabero_xarm_gripper'."
+                "Tabero SFT checkpoint provenance dataset is unsupported: "
+                f"{dataset!r}."
             )
         if dataset == "datas/tabero_firm":
             if checkpoint_meta.get("training_precision") != "fp32":
@@ -790,7 +795,7 @@ def _build_export_metadata(
         "training_precision": checkpoint_meta.get("training_precision"),
         "export_precision": (
             checkpoint_meta.get("export_precision", "bf16")
-            if method == "sft_full_lora_tacfield"
+            if method in TABERO_SFT_METHODS
             else None
         ),
         "frozen_parameter_precision": checkpoint_meta.get("frozen_parameter_precision"),
@@ -1046,7 +1051,7 @@ def export_checkpoint(
 
         for lora_spec in lora_specs:
             lora_spec.assign_module(lora_spec.module.merge_and_unload())
-        is_tabero_sft = checkpoint_meta.get("method") == "sft_full_lora_tacfield"
+        is_tabero_sft = checkpoint_meta.get("method") in TABERO_SFT_METHODS
         if not is_tabero_sft:
             model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
         model_path = output_path / "model.safetensors"
