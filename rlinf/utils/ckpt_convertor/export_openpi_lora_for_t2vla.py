@@ -66,6 +66,7 @@ BUNDLE_FORMAT_VERSION = 1
 TABERO_SFT_METHODS = {
     "sft_full_lora_tacfield",
     "sft_full_lora_tacforce_tcn",
+    "sft_full_lora_tacimg",
 }
 
 
@@ -579,9 +580,18 @@ def _validate_tabero_sft_export_schema(
     model_path: str | Path,
     base_model_path: str | Path,
     *,
-    expected_tcn_tensor_count: int = 16,
+    method: str,
 ) -> dict[str, int]:
-    """Validate the base-plus-TacField schema used by Pi0 and Pi0.5 SFT."""
+    """Validate the merged deployment schema for a Tabero SFT method."""
+    if method == "sft_full_lora_tacimg":
+        expected_extra_tensor_count = 0
+        allowed_extra_prefixes: tuple[str, ...] = ()
+    elif method in {"sft_full_lora_tacfield", "sft_full_lora_tacforce_tcn"}:
+        expected_extra_tensor_count = 16
+        allowed_extra_prefixes = ("tactile_prefix_encoder.",)
+    else:
+        raise ValueError(f"Unsupported Tabero SFT export method: {method!r}")
+
     with (
         safe_open(_checkpoint_path(model_path), framework="pt", device="cpu") as model,
         safe_open(
@@ -593,7 +603,9 @@ def _validate_tabero_sft_export_schema(
         missing = sorted(base_keys - model_keys)
         extra = sorted(model_keys - base_keys)
         invalid_extra = sorted(
-            key for key in extra if not key.startswith("tactile_prefix_encoder.")
+            key
+            for key in extra
+            if not any(key.startswith(prefix) for prefix in allowed_extra_prefixes)
         )
         shape_mismatches = sorted(
             (
@@ -609,13 +621,14 @@ def _validate_tabero_sft_export_schema(
         missing
         or invalid_extra
         or shape_mismatches
-        or len(extra) != expected_tcn_tensor_count
+        or len(extra) != expected_extra_tensor_count
         or dtypes != {"BF16"}
     ):
         raise ValueError(
             "Tabero SFT export must preserve every fixed-base key and shape, "
-            f"add exactly {expected_tcn_tensor_count} tactile-prefix tensors, "
+            f"contain exactly {expected_extra_tensor_count} method-specific extra tensors, "
             "and contain only BF16 tensors; "
+            f"method={method!r}, "
             f"base_count={len(base_keys)}, model_count={len(model_keys)}, "
             f"extra_count={len(extra)}, missing={missing[:10]}, "
             f"invalid_extra={invalid_extra[:10]}, "
@@ -715,6 +728,7 @@ def _build_export_metadata(
             "datas/replay_firm_tabero",
             "datas/replay_firm_tabero_xarm_gripper",
             "datas/replay_firm_tabero_xarm_gripper_repaired_v1",
+            "datas/realworld_replayed_task820_firm",
         }:
             raise ValueError(
                 "Tabero SFT checkpoint provenance dataset is unsupported: "
@@ -1068,6 +1082,7 @@ def export_checkpoint(
             _validate_tabero_sft_export_schema(
                 model_path,
                 str(model_cfg.model_path),
+                method=checkpoint_meta["method"],
             )
             reference_model_path = model_cfg.get("export_reference_model_path")
             if reference_model_path is not None:

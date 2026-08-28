@@ -312,7 +312,9 @@ def test_tabero_sft_schema_is_base_plus_exact_tcn_and_not_fixed_total(tmp_path):
     }
     save_file({**base_tensors, **tcn_tensors}, model)
 
-    counts = exporter._validate_tabero_sft_export_schema(model, base)
+    counts = exporter._validate_tabero_sft_export_schema(
+        model, base, method="sft_full_lora_tacfield"
+    )
 
     assert counts == {
         "base_tensor_count": 2,
@@ -358,7 +360,53 @@ def test_tabero_sft_schema_rejects_invalid_pi05_export(tmp_path, mutation, match
     save_file(tensors, model)
 
     with pytest.raises(ValueError, match=match):
-        exporter._validate_tabero_sft_export_schema(model, base)
+        exporter._validate_tabero_sft_export_schema(
+            model, base, method="sft_full_lora_tacfield"
+        )
+
+
+def test_tabero_tacimg_schema_matches_fixed_base_exactly(tmp_path):
+    base = tmp_path / "pi05_base"
+    base.mkdir()
+    base_tensors = {
+        "base.weight": torch.ones((2, 2), dtype=torch.bfloat16),
+        "base.bias": torch.ones(2, dtype=torch.bfloat16),
+    }
+    save_file(base_tensors, base / "model.safetensors")
+    model = tmp_path / "model.safetensors"
+    save_file(base_tensors, model)
+
+    counts = exporter._validate_tabero_sft_export_schema(
+        model, base, method="sft_full_lora_tacimg"
+    )
+
+    assert counts == {
+        "base_tensor_count": 2,
+        "tactile_prefix_tensor_count": 0,
+        "model_tensor_count": 2,
+    }
+
+
+def test_tabero_tacimg_schema_rejects_extra_tensors(tmp_path):
+    base = tmp_path / "pi05_base"
+    base.mkdir()
+    base_tensors = {"base.weight": torch.ones(2, dtype=torch.bfloat16)}
+    save_file(base_tensors, base / "model.safetensors")
+    model = tmp_path / "model.safetensors"
+    save_file(
+        {
+            **base_tensors,
+            "tactile_prefix_encoder.weight": torch.ones(
+                1, dtype=torch.bfloat16
+            ),
+        },
+        model,
+    )
+
+    with pytest.raises(ValueError, match="extra_count=1"):
+        exporter._validate_tabero_sft_export_schema(
+            model, base, method="sft_full_lora_tacimg"
+        )
 
 
 def test_trainable_sidecar_rejects_frozen_base_or_missing_tcn():
@@ -425,6 +473,11 @@ def test_export_metadata_carries_verified_fsdp_provenance_and_hashes(tmp_path):
             "sft_full_lora_tacforce_tcn",
             "datas/replay_firm_tabero_xarm_gripper_repaired_v1",
             "replay_firm_tabero_xarm_gripper_repaired_v1_pi05_tacforce_tcn_sft_2gpu_gb16_30k",
+        ),
+        (
+            "sft_full_lora_tacimg",
+            "datas/realworld_replayed_task820_firm",
+            "realworld_replayed_task820_firm_pi05_tacimg_sft_2gpu_gb32_mb16_gc_on_ema099_force0001_30k",
         ),
     ],
 )

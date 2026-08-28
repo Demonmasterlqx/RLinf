@@ -47,6 +47,39 @@ def test_model_weight_ema_updates_in_fp32_and_temporarily_applies_weights():
     torch.testing.assert_close(parameter.float(), torch.tensor([3.0]))
 
 
+def test_model_weight_ema_cpu_shadows_preserve_state_and_live_weights():
+    parameter = nn.Parameter(torch.tensor([1.0, 2.0], dtype=torch.bfloat16))
+    ema = ModelWeightEMA(
+        [parameter],
+        0.5,
+        parameter_names=["weight"],
+        shadow_device="cpu",
+    )
+
+    assert ema.shadow_device == torch.device("cpu")
+    assert ema.shadows[0].device.type == "cpu"
+
+    parameter.data.copy_(torch.tensor([3.0, 6.0], dtype=torch.bfloat16))
+    ema.update()
+    torch.testing.assert_close(ema.shadows[0], torch.tensor([2.0, 4.0]))
+
+    state = ema.state_dict()
+    restored_parameter = nn.Parameter(torch.tensor([7.0, 8.0]))
+    restored = ModelWeightEMA(
+        [restored_parameter],
+        0.5,
+        parameter_names=["weight"],
+        shadow_device="cpu",
+    )
+    restored.load_state_dict(state)
+
+    assert restored.num_updates == 1
+    torch.testing.assert_close(restored.shadows[0], torch.tensor([2.0, 4.0]))
+    with restored.apply_to_parameters():
+        torch.testing.assert_close(restored_parameter, torch.tensor([2.0, 4.0]))
+    torch.testing.assert_close(restored_parameter, torch.tensor([7.0, 8.0]))
+
+
 def test_model_weight_ema_state_restore_is_strict():
     source_parameter = nn.Parameter(torch.tensor([1.0, 2.0]))
     source = ModelWeightEMA([source_parameter], 0.9, parameter_names=["flat_parameter"])
@@ -71,6 +104,25 @@ def test_model_weight_ema_state_restore_is_strict():
     )
     with pytest.raises(ValueError, match="topology"):
         wrong_name.load_state_dict(source.state_dict())
+
+
+def test_fsdp_model_manager_initializes_cpu_ema_and_releases_cuda_cache(monkeypatch):
+    manager = FSDPModelManager.__new__(FSDPModelManager)
+    manager.model = nn.Linear(2, 1)
+    manager.optimizer = torch.optim.SGD(manager.model.parameters(), lr=0.1)
+    manager._cfg = OmegaConf.create({"model_weight_ema_decay": 0.99})
+    manager.critic_warmup_steps = 0
+    manager._logger = _Logger()
+    empty_cache_calls = []
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: empty_cache_calls.append(1))
+
+    manager._initialize_model_weight_ema()
+
+    assert manager._model_weight_ema is not None
+    assert all(
+        shadow.device.type == "cpu" for shadow in manager._model_weight_ema.shadows
+    )
+    assert empty_cache_calls == [1]
 
 
 def test_normalize_fsdp_param_name_strips_wrappers():

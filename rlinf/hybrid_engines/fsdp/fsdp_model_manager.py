@@ -455,9 +455,12 @@ class FSDPModelManager:
             (parameter for _, parameter in entries),
             decay,
             parameter_names=[name for name, _ in entries],
+            shadow_device="cpu",
         )
+        torch.cuda.empty_cache()
         self._logger.info(
-            "[FSDP] Initialized FP32 model EMA decay=%s local_parameter_shards=%d",
+            "[FSDP] Initialized FP32 model EMA decay=%s local_parameter_shards=%d "
+            "shadow_device=cpu and released unused CUDA cache",
             self._model_weight_ema.decay,
             len(entries),
         )

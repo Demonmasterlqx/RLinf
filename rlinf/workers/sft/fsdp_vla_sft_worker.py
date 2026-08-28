@@ -157,6 +157,13 @@ class FSDPVlaSftWorker(FSDPSftWorker):
         raise NotImplementedError("eval is not supported for embodied sft right now.")
 
     def get_train_model_output(self, batch: Any) -> tuple[torch.Tensor, dict[str, Any]]:
+        if not getattr(self, "_released_cuda_cache_before_first_forward", False):
+            torch.cuda.empty_cache()
+            self._released_cuda_cache_before_first_forward = True
+            self._logger.info(
+                "[FSDP] Released unused CUDA cache immediately before first VLA "
+                "training forward"
+            )
         with self.amp_context:
             output = self.model(forward_type=ForwardType.SFT, data=batch)
 

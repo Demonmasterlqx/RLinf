@@ -31,6 +31,7 @@ class ModelWeightEMA:
         decay: float,
         *,
         parameter_names: Sequence[str] | None = None,
+        shadow_device: torch.device | str | None = None,
     ) -> None:
         if isinstance(decay, bool) or not isinstance(decay, (float, int)):
             raise TypeError("Model EMA decay must be a float in [0, 1).")
@@ -55,8 +56,13 @@ class ModelWeightEMA:
         if len(set(parameter_names)) != len(parameter_names):
             raise ValueError("Model EMA parameter names must be unique.")
         self.parameter_names = tuple(parameter_names)
+        self.shadow_device = (
+            torch.device(shadow_device) if shadow_device is not None else None
+        )
         self.shadows = tuple(
-            parameter.detach().to(dtype=torch.float32).clone()
+            parameter.detach()
+            .to(device=self.shadow_device, dtype=torch.float32)
+            .clone()
             for parameter in self.parameters
         )
         self.num_updates = 0

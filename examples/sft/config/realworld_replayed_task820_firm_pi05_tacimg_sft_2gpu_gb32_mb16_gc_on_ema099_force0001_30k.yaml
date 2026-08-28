@@ -1,0 +1,166 @@
+defaults:
+  - model/pi0_5@actor.model
+  - hybrid_engines/fsdp@actor.fsdp_config
+  - override hydra/job_logging: stdout
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor: 5-6
+
+runner:
+  task_type: sft
+  logger:
+    log_path: ${oc.env:REPLAY_FIRM_TACIMG_PI05_RUN_DIR,/data/home/sim6g/code/tabero/results/realworld_replayed_task820_firm_pi05_tacimg_rlinf_sft_2gpu_gb32_mb16_gc_on_ema099_force0001_30k}
+    project_name: tabero-rlinf
+    experiment_name: ${oc.env:REPLAY_FIRM_TACIMG_PI05_RUN_NAME,pi05-tacimg-task820-firm-gb32-mb16-gc-on-ema099-force0001-30k}
+    logger_backends: [tensorboard, wandb]
+  checkpoint_root: ${oc.env:REPLAY_FIRM_TACIMG_PI05_CHECKPOINT_ROOT,/data/home/sim6g/code/tabero/results/realworld_replayed_task820_firm_pi05_tacimg_rlinf_sft_2gpu_gb32_mb16_gc_on_ema099_force0001_30k/checkpoints}
+  resume_dir: null
+  max_epochs: -1
+  max_steps: 30000
+  val_check_interval: -1
+  save_interval: 1000
+
+data:
+  train_data_paths:
+    - dataset_path: /data/home/sim6g/code/tabero/datas/realworld_replayed_task820_firm
+      weight: 1.0
+
+actor:
+  group_name: ActorGroup
+  training_backend: fsdp
+  micro_batch_size: 16
+  global_batch_size: 32
+  seed: 42
+  model_weight_ema_decay: 0.99
+
+  model:
+    model_type: openpi
+    model_path: /data/home/sim6g/code/tabero/models/pi05_base_pytorch
+    precision: fp32
+    frozen_parameter_precision: bf16
+    trainable_parameter_precision: fp32
+    is_lora: true
+    lora_rank: 32
+    paligemma_lora_rank: 16
+    action_expert_lora_rank: 32
+    paligemma_lora_exclude_modules: ".*vision_tower.*"
+    lora_path: null
+    lora_target: both
+    freeze_non_lora: true
+    extra_trainable_modules:
+      - paligemma_with_expert.paligemma.base_model.model.model.vision_tower
+      - action_in_proj
+      - time_mlp_in
+      - time_mlp_out
+      - action_out_proj
+    export_norm_asset_id: pi05_horizon50_tacimg_task820_firm
+    num_action_chunks: 50
+    action_dim: 13
+    add_value_head: false
+    num_steps: 10
+
+    openpi_data:
+      norm_stats_path: ${oc.env:REPLAY_FIRM_TACIMG_PI05_NORM_STATS,/data/home/sim6g/code/tabero/datas/realworld_replayed_task820_firm/meta/openpi_norm_stats/pi05_horizon50_tacimg_task820_firm/norm_stats.json}
+
+    openpi:
+      config_name: pi05_lora_tacimg_realworld_replayed_task820_force
+      pi05: true
+      action_horizon: 50
+      discrete_state_input: true
+      num_images_in_input: 3
+      train_expert_only: false
+      action_chunk: 50
+      action_env_dim: 13
+      effective_action_dim: 13
+      tactile_type: expert_his_c_fut
+      tactile_dim: 6
+      tactile_dim_in: 0
+      tactile_streams: []
+      tactile_loss_weight: 0.001
+      padding_loss_weight: 1.0
+      expert_his_c_fut_loss_mode: weighted_full
+      num_steps: 10
+
+  optim:
+    lr: 2.5e-5
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-8
+    weight_decay: 1.0e-10
+    clip_grad: 1.0
+    total_training_steps: 30000
+    lr_warmup_steps: 10000
+    lr_decay_steps: 1000000
+    lr_scheduler: openpi_cosine
+    num_cycles: 0.5
+    min_lr: 2.5e-6
+
+  fsdp_config:
+    strategy: fsdp
+    sharding_strategy: full_shard
+    use_orig_params: false
+    cpu_offload: false
+    gradient_checkpointing: true
+    limit_all_gathers: true
+    save_full_model_weights: false
+    save_trainable_model_weights: true
+    checkpoint_format: dcp
+    trainable_checkpoint_metadata:
+      method: sft_full_lora_tacimg
+      dataset: datas/realworld_replayed_task820_firm
+      model_family: pi05
+      base_model: models/pi05_base_pytorch
+      openpi_config_name: pi05_lora_tacimg_realworld_replayed_task820_force
+      deployment_config_name: pi05_lora_tacimg_realworld_replayed_task820_force
+      action_horizon: 50
+      execution_steps: 10
+      control_hz: 20
+      policy_horizon_seconds: 2.5
+      execution_horizon_seconds: 0.5
+      effective_action_dim: 13
+      tactile_input: tactile_image
+      num_images_in_input: 3
+      excluded_tactile_inputs: [tactile_gripper_force, tactile_marker_motion]
+      action_loss_weight: 1.0
+      future_force_loss_weight: 0.001
+      padding_loss_weight: 1.0
+      loss_mode: weighted_full
+      gripper_coordinate: xarm_positive_open
+      frozen_parameter_precision: bf16
+      trainable_parameter_precision: fp32
+      compute_precision: bf16_amp
+      export_precision: bf16
+      paligemma_lora_rank: 16
+      action_expert_lora_rank: 32
+      freeze_non_lora: true
+      trainable_siglip: true
+      siglip_lora: false
+      model_weight_ema_decay: 0.99
+      weight_variant: ema
+      training_config: realworld_replayed_task820_firm_pi05_tacimg_sft_2gpu_gb32_mb16_gc_on_ema099_force0001_30k
+      target_global_step: 30000
+    mixed_precision:
+      param_dtype: null
+      reduce_dtype: null
+      buffer_dtype: null
+    amp_autocast:
+      enabled: true
+      precision: bf16
+    grad_scaler:
+      enabled: false
+
+reward:
+  use_reward_model: false
+
+critic:
+  use_critic_model: false
