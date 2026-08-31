@@ -48,9 +48,9 @@ class TaberoTacImgInputs(transforms.DataTransformFn):
     model_type: _model.ModelType
 
     def __call__(self, data: dict) -> dict:
-        base_image = _parse_image(data["image"])
-        wrist_image = _parse_image(data["wrist_image"])
-        tactile_image = _parse_image(data["tactile_image"])
+        base_image = stretch_camera_image_to_224(data["image"])
+        wrist_image = stretch_camera_image_to_224(data["wrist_image"])
+        tactile_image = stretch_camera_image_to_224(data["tactile_image"])
 
         inputs = {
             "state": data["state"],

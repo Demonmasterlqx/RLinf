@@ -1271,6 +1271,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
     def obs_processor(self, env_obs):
         is_tabero_config = (
             "tabero" in self.config.config_name
+            or "tacimg" in self.config.config_name
             or self.config.config_name == "pi05_lora_tacforce_tcn_real"
         )
         if is_tabero_config:

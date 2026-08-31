@@ -51,6 +51,8 @@ from rlinf.utils.placement import (
     PlacementMode,
 )
 from rlinf.utils.tabero_ppo_boundary import (
+    TABERO_PI05_TACFIELD_CONFIG_NAME,
+    TABERO_PI05_TACIMG_CONFIG_NAME,
     TABERO_PPO_BOUNDARY_CONTRACTS,
     TABERO_PPO_CHECKPOINT_METADATA_KEY,
     TABERO_PPO_DEFAULT_RESET_TRANSITION_BOUNDARY_SEMANTICS,
@@ -847,6 +849,70 @@ def validate_megatron_cfg(cfg: DictConfig) -> DictConfig:
     return cfg
 
 
+def _validate_tabero_realworld_action_filter_contract(
+    cfg,
+    checkpoint_metadata,
+) -> str:
+    """Validate the opt-in action filter and return its auditable metadata."""
+
+    enabled_by_split = {}
+    required_enabled_params = {
+        "transition_steps": 3,
+        "max_position_step_m": 0.008,
+        "max_position_delta_change_m": 0.006,
+        "max_orientation_step_deg": 2.0,
+        "max_orientation_delta_change_deg": 1.5,
+    }
+    for split_name in ("train", "eval"):
+        init_params = cfg.env[split_name].get("init_params", {})
+        action_filter_cfg = init_params.get("action_filter")
+        if action_filter_cfg is None:
+            enabled = False
+        else:
+            if not hasattr(action_filter_cfg, "get"):
+                raise ValueError(
+                    "RealWorld Tabero PI0.5 PiRL requires "
+                    f"env.{split_name}.init_params.action_filter to be a mapping."
+                )
+            enabled = action_filter_cfg.get("enabled", False)
+        if not isinstance(enabled, bool):
+            raise ValueError(
+                "RealWorld Tabero PI0.5 PiRL requires "
+                f"env.{split_name}.init_params.action_filter.enabled to be boolean; "
+                f"got {enabled!r}."
+            )
+        enabled_by_split[split_name] = enabled
+        if enabled:
+            for key, expected in required_enabled_params.items():
+                actual = action_filter_cfg.get(key)
+                if actual != expected:
+                    raise ValueError(
+                        "RealWorld Tabero PI0.5 PiRL enabled action filter requires "
+                        f"env.{split_name}.init_params.action_filter.{key}="
+                        f"{expected!r}; got {actual!r}."
+                    )
+
+    if enabled_by_split["train"] != enabled_by_split["eval"]:
+        raise ValueError(
+            "RealWorld Tabero PI0.5 PiRL requires train and eval to use the "
+            "same action_filter.enabled state; got "
+            f"train={enabled_by_split['train']!r}, "
+            f"eval={enabled_by_split['eval']!r}."
+        )
+
+    expected_metadata = (
+        "xarm_sim_action_chunk_filter_v1" if enabled_by_split["train"] else "disabled"
+    )
+    actual_metadata = checkpoint_metadata.get("action_filter")
+    if actual_metadata != expected_metadata:
+        raise ValueError(
+            "RealWorld Tabero PI0.5 PiRL requires auditable "
+            "actor.fsdp_config.trainable_checkpoint_metadata.action_filter="
+            f"{expected_metadata!r}; got {actual_metadata!r}."
+        )
+    return expected_metadata
+
+
 def _validate_tabero_realworld_pi05_pirl_contract(cfg, model_cfg) -> None:
     """Fail before Ray starts when the RealWorld PI0.5 PiRL contract drifts."""
 
@@ -883,12 +949,10 @@ def _validate_tabero_realworld_pi05_pirl_contract(cfg, model_cfg) -> None:
         )
 
     openpi_cfg = model_cfg.get("openpi", {})
-    required_openpi_values = {
-        "config_name": "pi05_lora_tacfield_tabero_xarm_gripper",
+    config_name = openpi_cfg.get("config_name")
+    common_openpi_values = {
         "pi05": True,
-        "action_horizon": 10,
         "discrete_state_input": True,
-        "num_images_in_input": 2,
         "train_expert_only": True,
         "action_chunk": 10,
         "action_env_dim": 13,
@@ -896,11 +960,6 @@ def _validate_tabero_realworld_pi05_pirl_contract(cfg, model_cfg) -> None:
         "tactile_type": "expert_his_c_fut",
         "tactile_dim": 6,
         "tactile_dim_in": 0,
-        "tactile_prefix_dim_in": 9 * 440 * 2,
-        "tactile_prefix_history": 8,
-        "tactile_prefix_encoder_type": "tcn",
-        "tactile_prefix_use_reference_frame": True,
-        "tactile_prefix_diff_from_reference": False,
         "num_steps": 10,
         "add_value_head": True,
         "joint_logprob": False,
@@ -908,6 +967,39 @@ def _validate_tabero_realworld_pi05_pirl_contract(cfg, model_cfg) -> None:
         "detach_critic_input": True,
         "use_dsrl": False,
     }
+    if config_name == TABERO_PI05_TACFIELD_CONFIG_NAME:
+        tactile_kind = "tacfield"
+        required_openpi_values = {
+            **common_openpi_values,
+            "config_name": TABERO_PI05_TACFIELD_CONFIG_NAME,
+            "action_horizon": 10,
+            "num_images_in_input": 2,
+            "tactile_prefix_dim_in": 9 * 440 * 2,
+            "tactile_prefix_history": 8,
+            "tactile_prefix_encoder_type": "tcn",
+            "tactile_prefix_use_reference_frame": True,
+            "tactile_prefix_diff_from_reference": False,
+        }
+        expected_tactile_streams = ["tactile_prefix"]
+    elif config_name == TABERO_PI05_TACIMG_CONFIG_NAME:
+        tactile_kind = "tacimg"
+        required_openpi_values = {
+            **common_openpi_values,
+            "config_name": TABERO_PI05_TACIMG_CONFIG_NAME,
+            "action_horizon": 50,
+            "num_images_in_input": 3,
+            "tactile_prefix_dim_in": None,
+            "tactile_prefix_history": None,
+            "tactile_prefix_encoder_type": None,
+            "tactile_prefix_use_reference_frame": None,
+            "tactile_prefix_diff_from_reference": None,
+        }
+        expected_tactile_streams = []
+    else:
+        raise ValueError(
+            "RealWorld Tabero PI0.5 PiRL requires a supported TacField or TacImg "
+            f"OpenPI config; got {config_name!r}."
+        )
     for key, expected in required_openpi_values.items():
         actual = openpi_cfg.get(key)
         if actual != expected:
@@ -916,9 +1008,10 @@ def _validate_tabero_realworld_pi05_pirl_contract(cfg, model_cfg) -> None:
                 f"actor.model.openpi.{key}={expected!r}; got {actual!r}."
             )
     tactile_streams = openpi_cfg.get("tactile_streams")
-    if tactile_streams is None or list(tactile_streams) != ["tactile_prefix"]:
+    if tactile_streams is None or list(tactile_streams) != expected_tactile_streams:
         raise ValueError(
-            "RealWorld Tabero PI0.5 PiRL requires exactly one tactile_prefix stream."
+            "RealWorld Tabero PI0.5 PiRL tactile stream contract mismatch: "
+            f"expected {expected_tactile_streams!r}, got {tactile_streams!r}."
         )
 
     openpi_data_cfg = model_cfg.get("openpi_data")
@@ -968,6 +1061,10 @@ def _validate_tabero_realworld_pi05_pirl_contract(cfg, model_cfg) -> None:
     checkpoint_metadata = (
         cfg.actor.get("fsdp_config", {}).get("trainable_checkpoint_metadata", {}) or {}
     )
+    action_filter_metadata = _validate_tabero_realworld_action_filter_contract(
+        cfg,
+        checkpoint_metadata,
+    )
     required_checkpoint_metadata = {
         "method": "pirl",
         "task_domain": "realworld",
@@ -979,7 +1076,7 @@ def _validate_tabero_realworld_pi05_pirl_contract(cfg, model_cfg) -> None:
         "reset_source": "task_config_default_reset",
         "policy_gripper_sign_bridge": False,
         "gripper_coordinate": expected_gripper_coordinate,
-        "action_filter": "xarm_sim_action_chunk_filter_v1",
+        "action_filter": action_filter_metadata,
         "camera_preprocess": "stretch_480x640_to_224x224_inter_area",
         "model_family": "pi05",
         "openpi_config_name": expected_config_name,
@@ -988,18 +1085,37 @@ def _validate_tabero_realworld_pi05_pirl_contract(cfg, model_cfg) -> None:
         "base_model_sha256": checkpoint_contract.get("expected_model_sha256"),
         "base_norm_stats_sha256": checkpoint_contract.get("expected_norm_stats_sha256"),
         "base_checkpoint_require_final": require_final,
-        "action_horizon": 10,
+        "action_horizon": 50 if tactile_kind == "tacimg" else 10,
+        "execution_horizon": 10,
         "effective_action_dim": 13,
         "state_dim": 7,
-        "camera_count": 2,
-        "tactile_prefix_dim_in": 9 * 440 * 2,
-        "tactile_prefix_history": 8,
-        "combined_marker_count": 440,
+        "camera_count": 3 if tactile_kind == "tacimg" else 2,
         "target_global_step": cfg.runner.get("max_epochs"),
         "tabero_ppo_transition_boundary_semantics": (
             TABERO_PPO_DEFAULT_RESET_TRANSITION_BOUNDARY_SEMANTICS
         ),
     }
+    if tactile_kind == "tacfield":
+        required_checkpoint_metadata.update(
+            {
+                "tactile_input": "tactile_prefix",
+                "tactile_prefix_dim_in": 9 * 440 * 2,
+                "tactile_prefix_history": 8,
+                "combined_marker_count": 440,
+            }
+        )
+    else:
+        required_checkpoint_metadata.update(
+            {
+                "tactile_input": "tactile_image",
+                "tactile_image_history": 8,
+                "tactile_mosaic_layout": "left_2x4_then_right_2x4",
+                "excluded_tactile_inputs": [
+                    "tactile_gripper_force",
+                    "tactile_marker_motion",
+                ],
+            }
+        )
     for key, expected in required_checkpoint_metadata.items():
         actual = checkpoint_metadata.get(key)
         if actual != expected:
@@ -1021,7 +1137,7 @@ def _validate_tabero_realworld_pi05_pirl_contract(cfg, model_cfg) -> None:
         or cfg.actor.get("global_batch_size") != 1
     ):
         raise ValueError(
-            "A non-final PI0.5 TacField checkpoint is restricted to a one-update, "
+            "A non-final PI0.5 tactile checkpoint is restricted to a one-update, "
             "single-environment PiRL smoke run."
         )
 
@@ -1038,6 +1154,8 @@ def _validate_tabero_realworld_pi05_pirl_contract(cfg, model_cfg) -> None:
         "marker_history_len": 8,
         "combined_marker_count": 440,
     }
+    if tactile_kind == "tacimg":
+        expected_env_values["tactile_image_history_len"] = 8
     for split_name in ("train", "eval"):
         init_params = cfg.env[split_name].get("init_params", {})
         for key, expected in expected_env_values.items():
@@ -1058,24 +1176,6 @@ def _validate_tabero_realworld_pi05_pirl_contract(cfg, model_cfg) -> None:
                 "RealWorld Tabero PI0.5 PiRL requires eight consecutive success "
                 "steps and terminal_reward=1.0."
             )
-        action_filter_cfg = init_params.get("action_filter", {})
-        required_action_filter = {
-            "enabled": True,
-            "transition_steps": 3,
-            "max_position_step_m": 0.008,
-            "max_position_delta_change_m": 0.006,
-            "max_orientation_step_deg": 2.0,
-            "max_orientation_delta_change_deg": 1.5,
-        }
-        for key, expected in required_action_filter.items():
-            actual = action_filter_cfg.get(key)
-            if actual != expected:
-                raise ValueError(
-                    "RealWorld Tabero PI0.5 PiRL requires "
-                    f"env.{split_name}.init_params.action_filter.{key}="
-                    f"{expected!r}; got {actual!r}."
-                )
-
         camera_cfg = init_params.get("camera_preprocess", {})
         required_camera_preprocess = {
             "source_height": 480,
@@ -1163,19 +1263,23 @@ def validate_embodied_cfg(cfg):
                 "cannot be declared by an embodied-eval-only config."
             )
         openpi_cfg = model_cfg.get("openpi", {})
-        expected_openpi_config = (
-            "pi05_lora_tacfield_tabero_xarm_gripper"
+        expected_openpi_configs = (
+            {
+                TABERO_PI05_TACFIELD_CONFIG_NAME,
+                TABERO_PI05_TACIMG_CONFIG_NAME,
+            }
             if ppo_boundary_semantics
             == TABERO_PPO_DEFAULT_RESET_TRANSITION_BOUNDARY_SEMANTICS
-            else "pi0_lora_tacfield_tabero"
+            else {"pi0_lora_tacfield_tabero"}
         )
         if (
             model_type != SupportedModel.OPENPI
-            or openpi_cfg.get("config_name") != expected_openpi_config
+            or openpi_cfg.get("config_name") not in expected_openpi_configs
         ):
             raise ValueError(
                 "Tabero PPO transition boundary semantics requires the Tabero tactile "
-                f"OpenPI model configuration {expected_openpi_config!r}."
+                "OpenPI model configuration in "
+                f"{sorted(expected_openpi_configs)!r}."
             )
         required_ppo_values = {
             "adv_type": "gae",

@@ -1,0 +1,47 @@
+defaults:
+  - isaaclab_pi05_pirl_realworld_tabero_tacimg_task6_2gpu_100step
+  - _self_
+
+cluster:
+  component_placement:
+    actor: "6"
+    rollout: "1"
+    env: "1"
+
+runner:
+  max_epochs: 1
+  save_interval: 1
+
+algorithm:
+  normalize_advantages: false
+
+env:
+  train:
+    rollout_epoch: 1
+    total_num_envs: 1
+    max_steps_per_rollout_epoch: 300
+    max_episode_steps: 300
+  eval:
+    rollout_epoch: 1
+    total_num_envs: 1
+    max_steps_per_rollout_epoch: 300
+    max_episode_steps: 300
+
+rollout:
+  model:
+    model_path: /data/home/sim6g/code/tabero/results/2026-08-27_20-41-38_realworld_replayed_task820_firm_pi05_tacimg_rlinf_sft_2gpu_gb32_mb16_gc_on_noema_force0001_30k_no_shard_baseline_original_gc/exports/step_23000
+
+actor:
+  micro_batch_size: 1
+  global_batch_size: 1
+  model:
+    model_path: /data/home/sim6g/code/tabero/results/2026-08-27_20-41-38_realworld_replayed_task820_firm_pi05_tacimg_rlinf_sft_2gpu_gb32_mb16_gc_on_noema_force0001_30k_no_shard_baseline_original_gc/exports/step_23000
+    tabero_pi05_checkpoint_contract:
+      expected_model_sha256: 9b506e72d643fb2df78f8aa1fd0f730d52df10566d247f6f2ea4a5010f1e6c15
+      expected_norm_stats_sha256: 6b8751c3699f3a00a7c4a0335ab20bf629e2c63cfebb9c43b8473fd60490d88b
+      require_final: false
+  fsdp_config:
+    trainable_checkpoint_metadata:
+      base_checkpoint_require_final: false
+      training_config: isaaclab_pi05_pirl_realworld_tabero_tacimg_task6_2gpu_smoke
+      target_global_step: 1

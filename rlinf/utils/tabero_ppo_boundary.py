@@ -42,6 +42,8 @@ TABERO_PPO_BOUNDARY_CONTRACTS = {
     },
 }
 TABERO_PPO_CHECKPOINT_METADATA_KEY = "tabero_ppo_transition_boundary_semantics"
+TABERO_PI05_TACFIELD_CONFIG_NAME = "pi05_lora_tacfield_tabero_xarm_gripper"
+TABERO_PI05_TACIMG_CONFIG_NAME = "pi05_lora_tacimg_realworld_replayed_task820_force"
 
 
 def _load_json_mapping(path: Path, *, label: str) -> dict[str, Any]:
@@ -142,7 +144,7 @@ def validate_tabero_pi05_pirl_deployment_checkpoint(
     expected_gripper_coordinate: str,
     require_final: bool,
 ) -> dict[str, Any]:
-    """Validate a local merged PI0.5 TacField checkpoint before Ray starts.
+    """Validate a local merged PI0.5 tactile checkpoint before Ray starts.
 
     This gate deliberately verifies the model and normalization files rather
     than accepting a directory name as checkpoint provenance. A non-final SFT
@@ -174,6 +176,92 @@ def validate_tabero_pi05_pirl_deployment_checkpoint(
     expected_gripper_coordinate = _validate_expected_string(
         expected_gripper_coordinate, field="expected_gripper_coordinate"
     )
+    if expected_config_name == TABERO_PI05_TACFIELD_CONFIG_NAME:
+        export_method = "sft_full_lora_tacfield"
+        source_metadata_contract = {
+            "dataset": expected_dataset,
+            "model_family": "pi05",
+            "openpi_config_name": expected_config_name,
+            "deployment_config_name": expected_config_name,
+            "action_horizon": 10,
+            "effective_action_dim": 13,
+            "tactile_prefix_dim_in": 9 * 440 * 2,
+            "tactile_prefix_history": 8,
+            "gripper_coordinate": expected_gripper_coordinate,
+        }
+        model_config_contract = {
+            "action_dim": 32,
+            "action_horizon": 10,
+            "pi05": True,
+            "discrete_state_input": True,
+            "config_name": expected_config_name,
+            "num_images_in_input": 2,
+            "action_chunk": 10,
+            "action_env_dim": 13,
+            "num_steps": 10,
+            "tactile_type": "expert_his_c_fut",
+            "tactile_dim": 6,
+            "tactile_dim_in": 0,
+            "effective_action_dim": 13,
+            "tactile_prefix_dim_in": 9 * 440 * 2,
+            "tactile_prefix_history": 8,
+            "tactile_prefix_encoder_type": "tcn",
+            "tactile_prefix_use_reference_frame": True,
+            "tactile_prefix_diff_from_reference": False,
+            "tactile_streams": ["tactile_prefix"],
+        }
+        norm_dimensions = {
+            "state": 7,
+            "actions": 13,
+            "tactile_prefix": 440 * 2,
+        }
+        tactile_input = "tactile_prefix"
+    elif expected_config_name == TABERO_PI05_TACIMG_CONFIG_NAME:
+        export_method = "sft_full_lora_tacimg"
+        source_metadata_contract = {
+            "dataset": expected_dataset,
+            "model_family": "pi05",
+            "openpi_config_name": expected_config_name,
+            "deployment_config_name": expected_config_name,
+            "action_horizon": 50,
+            "execution_steps": 10,
+            "effective_action_dim": 13,
+            "tactile_input": "tactile_image",
+            "num_images_in_input": 3,
+            "excluded_tactile_inputs": [
+                "tactile_gripper_force",
+                "tactile_marker_motion",
+            ],
+            "gripper_coordinate": expected_gripper_coordinate,
+        }
+        model_config_contract = {
+            "action_dim": 32,
+            "action_horizon": 50,
+            "pi05": True,
+            "discrete_state_input": True,
+            "config_name": expected_config_name,
+            "num_images_in_input": 3,
+            "action_chunk": 50,
+            "action_env_dim": 13,
+            "num_steps": 10,
+            "tactile_type": "expert_his_c_fut",
+            "tactile_dim": 6,
+            "tactile_dim_in": 0,
+            "effective_action_dim": 13,
+            "tactile_prefix_dim_in": None,
+            "tactile_prefix_history": None,
+            "tactile_prefix_encoder_type": None,
+            "tactile_prefix_use_reference_frame": None,
+            "tactile_prefix_diff_from_reference": None,
+            "tactile_streams": [],
+        }
+        norm_dimensions = {"state": 7, "actions": 13}
+        tactile_input = "tactile_image"
+    else:
+        raise ValueError(
+            "Tabero PiRL expected_config_name is not a supported tactile PI0.5 "
+            f"contract: {expected_config_name!r}."
+        )
 
     checkpoint_dir = Path(model_path).expanduser().resolve()
     if not checkpoint_dir.is_dir():
@@ -221,7 +309,7 @@ def validate_tabero_pi05_pirl_deployment_checkpoint(
         export_metadata,
         {
             "format": "t2vla_openpi_pytorch_merged_lora",
-            "method": "sft_full_lora_tacfield",
+            "method": export_method,
             "dataset": expected_dataset,
         },
         label="export metadata",
@@ -233,17 +321,7 @@ def validate_tabero_pi05_pirl_deployment_checkpoint(
         )
     _require_exact_values(
         source_metadata,
-        {
-            "dataset": expected_dataset,
-            "model_family": "pi05",
-            "openpi_config_name": expected_config_name,
-            "deployment_config_name": expected_config_name,
-            "action_horizon": 10,
-            "effective_action_dim": 13,
-            "tactile_prefix_dim_in": 9 * 440 * 2,
-            "tactile_prefix_history": 8,
-            "gripper_coordinate": expected_gripper_coordinate,
-        },
+        source_metadata_contract,
         label="source checkpoint metadata",
     )
     is_final = export_metadata.get("is_final")
@@ -271,27 +349,7 @@ def validate_tabero_pi05_pirl_deployment_checkpoint(
 
     _require_exact_values(
         model_config,
-        {
-            "action_dim": 32,
-            "action_horizon": 10,
-            "pi05": True,
-            "discrete_state_input": True,
-            "config_name": expected_config_name,
-            "num_images_in_input": 2,
-            "action_chunk": 10,
-            "action_env_dim": 13,
-            "num_steps": 10,
-            "tactile_type": "expert_his_c_fut",
-            "tactile_dim": 6,
-            "tactile_dim_in": 0,
-            "effective_action_dim": 13,
-            "tactile_prefix_dim_in": 9 * 440 * 2,
-            "tactile_prefix_history": 8,
-            "tactile_prefix_encoder_type": "tcn",
-            "tactile_prefix_use_reference_frame": True,
-            "tactile_prefix_diff_from_reference": False,
-            "tactile_streams": ["tactile_prefix"],
-        },
+        model_config_contract,
         label="model config",
     )
 
@@ -300,14 +358,7 @@ def validate_tabero_pi05_pirl_deployment_checkpoint(
         raise ValueError(
             "Tabero PiRL normalization file must contain a norm_stats mapping."
         )
-    for name, expected_dim in {
-        "state": 7,
-        "actions": 13,
-        # TaberoTacFieldInputs keeps history as the leading axis and flattens
-        # each marker frame to 440 * 2. OpenPI Normalize broadcasts this
-        # per-frame statistic across all nine reference/history frames.
-        "tactile_prefix": 440 * 2,
-    }.items():
+    for name, expected_dim in norm_dimensions.items():
         stats = norm_stats.get(name)
         if not isinstance(stats, Mapping):
             raise ValueError(f"Tabero PiRL normalization is missing mapping {name!r}.")
@@ -325,6 +376,7 @@ def validate_tabero_pi05_pirl_deployment_checkpoint(
         "norm_asset_id": expected_norm_asset_id,
         "dataset": expected_dataset,
         "gripper_coordinate": expected_gripper_coordinate,
+        "tactile_input": tactile_input,
     }
 
 

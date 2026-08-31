@@ -36,6 +36,10 @@ from omegaconf import open_dict
 from rlinf.envs.isaaclab.utils import quat2axisangle_torch
 
 from ..isaaclab_env import IsaaclabBaseEnv
+from .tabero_force_reward import (
+    make_trajectory_force_success_reward_term,
+    validate_force_bonus_cfg,
+)
 
 REALWORLD_ENV_ID = "Isaac-RealWorld-GentleGrasp-XarmUmi-Hybrid-Tactile-v0"
 REALWORLD_TASK_SUITE = "gentle_grasp"
@@ -46,10 +50,17 @@ REALWORLD_ACTION_DIM = 13
 REALWORLD_ACTION_HORIZON = 10
 REALWORLD_MARKER_HISTORY_LEN = 8
 REALWORLD_COMBINED_MARKERS = 440
+REALWORLD_TACTILE_IMAGE_HISTORY_LEN = 8
 REALWORLD_CHUNK_BOUNDARY_MODE = "terminal_safe_v1"
 
 _TERMINAL_RAW_OBSERVATION_KEY = "_realworld_terminal_raw_observation"
 _TERMINAL_OBSERVATION_MASK_KEY = "_realworld_terminal_observation_mask"
+_TERMINAL_FORCE_MEAN_KEY = "_realworld_terminal_force_mean"
+_TERMINAL_FORCE_COUNT_KEY = "_realworld_terminal_force_count"
+_TERMINAL_FORCE_BONUS_KEY = "_realworld_terminal_force_bonus"
+_EPISODE_FORCE_MEAN_KEY = "trajectory_mean_measured_squeeze"
+_EPISODE_FORCE_COUNT_KEY = "force_valid_sample_count"
+_EPISODE_FORCE_BONUS_KEY = "force_bonus"
 _EXECUTED_CHUNK_ACTIONS_KEY = "_tabero_executed_chunk_actions"
 _RAW_CHUNK_ACTIONS_KEY = "_tabero_raw_chunk_actions"
 
@@ -168,10 +179,25 @@ def _make_consecutive_success_term(manager_term_base_cls: type) -> type:
 def _terminal_success_reward(
     env: Any,
     success_term_name: str = "success",
+    failure_term_names: tuple[str, ...] = (),
 ) -> torch.Tensor:
     success = env.termination_manager.get_term(success_term_name).to(dtype=torch.bool)
-    success &= ~env.termination_manager.time_outs.to(dtype=torch.bool)
+    invalid = env.termination_manager.time_outs.to(dtype=torch.bool).clone()
+    for term_name in failure_term_names:
+        invalid |= env.termination_manager.get_term(term_name).to(dtype=torch.bool)
+    success &= ~invalid
     return success.to(dtype=torch.float32) / float(env.step_dt)
+
+
+def _termination_term_items(terminations_cfg: Any) -> list[tuple[str, Any]]:
+    terms: list[tuple[str, Any]] = []
+    for name in dir(terminations_cfg):
+        if name.startswith("_"):
+            continue
+        term = getattr(terminations_cfg, name, None)
+        if term is not None and hasattr(term, "func"):
+            terms.append((name, term))
+    return terms
 
 
 class _TerminalObservationCapture:
@@ -184,6 +210,33 @@ class _TerminalObservationCapture:
         self._captured_mask = torch.zeros(
             env.num_envs, device=env.device, dtype=torch.bool
         )
+        self._captured_force_mean = torch.full(
+            (env.num_envs,), float("nan"), device=env.device, dtype=torch.float32
+        )
+        self._captured_force_count = torch.zeros(
+            env.num_envs, device=env.device, dtype=torch.int64
+        )
+        self._captured_force_bonus = torch.zeros(
+            env.num_envs, device=env.device, dtype=torch.float32
+        )
+        self._force_reward_term = None
+        reward_manager = getattr(env, "reward_manager", None)
+        if reward_manager is not None and "success" in getattr(
+            reward_manager, "active_terms", ()
+        ):
+            try:
+                reward_term = reward_manager.get_term_cfg("success").func
+            except (AttributeError, KeyError, ValueError):
+                reward_term = None
+            if reward_term is not None and all(
+                hasattr(reward_term, field)
+                for field in (
+                    "trajectory_mean_force",
+                    "valid_sample_count",
+                    "current_force_bonus",
+                )
+            ):
+                self._force_reward_term = reward_term
         original_reset_idx = env._reset_idx
 
         def capture_then_reset(env_ids: Any) -> None:
@@ -203,6 +256,16 @@ class _TerminalObservationCapture:
                         capture_mask,
                     )
                 self._captured_mask |= capture_mask
+                if self._force_reward_term is not None:
+                    self._captured_force_mean[indices] = (
+                        self._force_reward_term.trajectory_mean_force[indices]
+                    )
+                    self._captured_force_count[indices] = (
+                        self._force_reward_term.valid_sample_count[indices]
+                    )
+                    self._captured_force_bonus[indices] = (
+                        self._force_reward_term.current_force_bonus[indices]
+                    )
             original_reset_idx(indices)
 
         env._reset_idx = capture_then_reset
@@ -214,11 +277,17 @@ class _TerminalObservationCapture:
     def reset(self, seed=None, env_ids=None):
         self._captured_observation = None
         self._captured_mask.zero_()
+        self._captured_force_mean.fill_(float("nan"))
+        self._captured_force_count.zero_()
+        self._captured_force_bonus.zero_()
         return self._env.reset(seed=seed, env_ids=env_ids)
 
     def step(self, action: torch.Tensor):
         self._captured_observation = None
         self._captured_mask.zero_()
+        self._captured_force_mean.fill_(float("nan"))
+        self._captured_force_count.zero_()
+        self._captured_force_bonus.zero_()
         self._capture_enabled = True
         try:
             obs, reward, terminated, truncated, infos = self._env.step(action)
@@ -227,6 +296,10 @@ class _TerminalObservationCapture:
         infos = dict(infos or {})
         infos[_TERMINAL_RAW_OBSERVATION_KEY] = self._captured_observation
         infos[_TERMINAL_OBSERVATION_MASK_KEY] = self._captured_mask.clone()
+        if self._force_reward_term is not None:
+            infos[_TERMINAL_FORCE_MEAN_KEY] = self._captured_force_mean.clone()
+            infos[_TERMINAL_FORCE_COUNT_KEY] = self._captured_force_count.clone()
+            infos[_TERMINAL_FORCE_BONUS_KEY] = self._captured_force_bonus.clone()
         return obs, reward, terminated, truncated, infos
 
     def close(self) -> None:
@@ -863,6 +936,175 @@ class _RealWorldMarkerHistory:
         return result
 
 
+class _RealWorldTactileImageHistory:
+    """Build the dataset-compatible 4x4 tactile RGB history mosaic."""
+
+    def __init__(self, num_envs: int) -> None:
+        self.num_envs = int(num_envs)
+        self._history: torch.Tensor | None = None
+        self._initialized: torch.Tensor | None = None
+        self._resize_weights: dict[
+            tuple[int, int, str], tuple[torch.Tensor, torch.Tensor]
+        ] = {}
+
+    def reset(self, env_ids: torch.Tensor | None = None) -> None:
+        if self._initialized is None:
+            return
+        assert self._history is not None
+        if env_ids is None:
+            self._initialized.zero_()
+            self._history.zero_()
+            return
+        indices = torch.as_tensor(
+            env_ids, device=self._initialized.device, dtype=torch.long
+        )
+        self._initialized[indices] = False
+        self._history[indices] = 0
+
+    def _allocate(self, current: torch.Tensor) -> None:
+        expected_shape = (
+            self.num_envs,
+            2,
+            REALWORLD_TACTILE_IMAGE_HISTORY_LEN,
+            current.shape[2],
+            current.shape[3],
+            3,
+        )
+        if (
+            self._history is not None
+            and tuple(self._history.shape) == expected_shape
+            and self._history.device == current.device
+            and self._history.dtype == current.dtype
+        ):
+            return
+        self._history = torch.zeros(
+            expected_shape, device=current.device, dtype=current.dtype
+        )
+        self._initialized = torch.zeros(
+            self.num_envs, device=current.device, dtype=torch.bool
+        )
+
+    @staticmethod
+    def _area_weights(
+        source_size: int,
+        target_size: int,
+        *,
+        device: torch.device,
+    ) -> torch.Tensor:
+        scale = source_size / target_size
+        target_start = (
+            torch.arange(target_size, device=device, dtype=torch.float32) * scale
+        )
+        target_end = target_start + scale
+        source_start = torch.arange(source_size, device=device, dtype=torch.float32)
+        overlap = torch.minimum(target_end[:, None], source_start[None] + 1.0)
+        overlap -= torch.maximum(target_start[:, None], source_start[None])
+        return overlap.clamp_(min=0).div_(scale)
+
+    def _resize_to_cell(self, tactile_rgb: torch.Tensor) -> torch.Tensor:
+        cell_height = REALWORLD_CAMERA_TARGET_HW[0] // 4
+        cell_width = REALWORLD_CAMERA_TARGET_HW[1] // 4
+        source_height = int(tactile_rgb.shape[2])
+        source_width = int(tactile_rgb.shape[3])
+        cache_key = (source_height, source_width, str(tactile_rgb.device))
+        weights = self._resize_weights.get(cache_key)
+        if weights is None:
+            weights = (
+                self._area_weights(
+                    source_height, cell_height, device=tactile_rgb.device
+                ),
+                self._area_weights(source_width, cell_width, device=tactile_rgb.device),
+            )
+            self._resize_weights[cache_key] = weights
+        height_weights, width_weights = weights
+        images = tactile_rgb.permute(0, 1, 4, 2, 3).to(dtype=torch.float32)
+        resized = torch.einsum("oh,nfchw->nfcow", height_weights, images)
+        resized = torch.einsum("pw,nfcow->nfcop", width_weights, resized)
+        return (
+            resized.round()
+            .clamp_(0, 255)
+            .to(dtype=torch.uint8)
+            .permute(0, 1, 3, 4, 2)
+            .contiguous()
+        )
+
+    def update(
+        self,
+        tactile_rgb: torch.Tensor,
+        update_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if (
+            tactile_rgb.ndim != 5
+            or tuple(tactile_rgb.shape[:2]) != (self.num_envs, 2)
+            or tactile_rgb.shape[-1] != 3
+        ):
+            raise ValueError(
+                "RealWorld gripper_tactile_rgb must have shape (N, 2, H, W, 3); "
+                f"got {tuple(tactile_rgb.shape)}."
+            )
+        if tactile_rgb.dtype != torch.uint8:
+            raise ValueError(
+                "RealWorld gripper_tactile_rgb must use uint8 RGB pixels; "
+                f"got {tactile_rgb.dtype}."
+            )
+
+        cell_height = REALWORLD_CAMERA_TARGET_HW[0] // 4
+        cell_width = REALWORLD_CAMERA_TARGET_HW[1] // 4
+        current = self._resize_to_cell(tactile_rgb)
+        self._allocate(current)
+        assert self._history is not None
+        assert self._initialized is not None
+
+        if update_mask is None:
+            update_mask = torch.ones(
+                self.num_envs, device=current.device, dtype=torch.bool
+            )
+        else:
+            update_mask = torch.as_tensor(
+                update_mask, device=current.device, dtype=torch.bool
+            )
+            if update_mask.shape != (self.num_envs,):
+                raise ValueError(
+                    "RealWorld tactile image update mask must have shape "
+                    f"({self.num_envs},); got {tuple(update_mask.shape)}."
+                )
+
+        new_envs = ~self._initialized & update_mask
+        if new_envs.any():
+            self._history[new_envs] = current[new_envs, :, None].expand(
+                -1, -1, REALWORLD_TACTILE_IMAGE_HISTORY_LEN, -1, -1, -1
+            )
+            self._initialized[new_envs] = True
+
+        existing_envs = self._initialized & update_mask & ~new_envs
+        if existing_envs.any():
+            self._history[existing_envs] = torch.roll(
+                self._history[existing_envs], shifts=-1, dims=2
+            )
+            self._history[existing_envs, :, -1] = current[existing_envs]
+
+        mosaic = torch.zeros(
+            (
+                self.num_envs,
+                REALWORLD_CAMERA_TARGET_HW[0],
+                REALWORLD_CAMERA_TARGET_HW[1],
+                3,
+            ),
+            device=current.device,
+            dtype=torch.uint8,
+        )
+        for finger_index in range(2):
+            for history_index in range(REALWORLD_TACTILE_IMAGE_HISTORY_LEN):
+                row = history_index // 2
+                column = history_index % 2 + 2 * finger_index
+                mosaic[
+                    :,
+                    row * cell_height : (row + 1) * cell_height,
+                    column * cell_width : (column + 1) * cell_width,
+                ] = self._history[:, finger_index, history_index]
+        return mosaic
+
+
 class IsaaclabRealWorldTaberoTacFieldEnv(IsaaclabBaseEnv):
     """Independent RLinf wrapper for XArm UMI GentleGrasp Task 6."""
 
@@ -921,6 +1163,18 @@ class IsaaclabRealWorldTaberoTacFieldEnv(IsaaclabBaseEnv):
                 "RealWorld wrapper requires marker_history_len=8 and "
                 f"combined_marker_count=440; got {history_len} and {marker_count}."
             )
+        tactile_image_history_len = int(
+            _cfg_get(
+                init_params,
+                "tactile_image_history_len",
+                REALWORLD_TACTILE_IMAGE_HISTORY_LEN,
+            )
+        )
+        if tactile_image_history_len != REALWORLD_TACTILE_IMAGE_HISTORY_LEN:
+            raise ValueError(
+                "RealWorld wrapper requires tactile_image_history_len=8; "
+                f"got {tactile_image_history_len}."
+            )
 
         chunk_boundary_mode = str(
             _cfg_get(
@@ -961,6 +1215,9 @@ class IsaaclabRealWorldTaberoTacFieldEnv(IsaaclabBaseEnv):
             raise ValueError("RealWorld required_consecutive_steps must be positive.")
         if not torch.isfinite(torch.tensor(terminal_reward)) or terminal_reward <= 0:
             raise ValueError("RealWorld terminal_reward must be finite and positive.")
+        force_bonus = validate_force_bonus_cfg(
+            _cfg_get(success_cfg, "force_bonus", None), terminal_reward
+        )
 
         policy_gripper_sign_bridge = _cfg_get(
             init_params, "policy_gripper_sign_bridge", False
@@ -988,29 +1245,35 @@ class IsaaclabRealWorldTaberoTacFieldEnv(IsaaclabBaseEnv):
             )
 
         action_filter_cfg = _cfg_get(init_params, "action_filter")
-        if (
-            action_filter_cfg is None
-            or _cfg_get(action_filter_cfg, "enabled") is not True
-        ):
+        action_filter_enabled = _cfg_get(action_filter_cfg, "enabled", False)
+        if not isinstance(action_filter_enabled, bool):
             raise ValueError(
-                "RealWorld Task 6 PiRL requires action_filter.enabled=true."
+                "RealWorld init_params.action_filter.enabled must be boolean."
             )
-        self._action_filter = _RealWorldActionChunkFilter(
-            num_envs,
-            transition_steps=int(_cfg_get(action_filter_cfg, "transition_steps", 0)),
-            max_position_step_m=float(
-                _cfg_get(action_filter_cfg, "max_position_step_m", 0.0)
-            ),
-            max_position_delta_change_m=float(
-                _cfg_get(action_filter_cfg, "max_position_delta_change_m", 0.0)
-            ),
-            max_orientation_step_deg=float(
-                _cfg_get(action_filter_cfg, "max_orientation_step_deg", 0.0)
-            ),
-            max_orientation_delta_change_deg=float(
-                _cfg_get(action_filter_cfg, "max_orientation_delta_change_deg", 0.0)
-            ),
-        )
+        self._action_filter: _RealWorldActionChunkFilter | None = None
+        if action_filter_enabled:
+            self._action_filter = _RealWorldActionChunkFilter(
+                num_envs,
+                transition_steps=int(
+                    _cfg_get(action_filter_cfg, "transition_steps", 0)
+                ),
+                max_position_step_m=float(
+                    _cfg_get(action_filter_cfg, "max_position_step_m", 0.0)
+                ),
+                max_position_delta_change_m=float(
+                    _cfg_get(action_filter_cfg, "max_position_delta_change_m", 0.0)
+                ),
+                max_orientation_step_deg=float(
+                    _cfg_get(action_filter_cfg, "max_orientation_step_deg", 0.0)
+                ),
+                max_orientation_delta_change_deg=float(
+                    _cfg_get(
+                        action_filter_cfg,
+                        "max_orientation_delta_change_deg",
+                        0.0,
+                    )
+                ),
+            )
 
         camera_preprocess_cfg = _cfg_get(init_params, "camera_preprocess")
         actual_camera_contract = {
@@ -1045,12 +1308,14 @@ class IsaaclabRealWorldTaberoTacFieldEnv(IsaaclabBaseEnv):
         self._reset_source = reset_source
         self._required_success_steps = required_success_steps
         self._terminal_reward = terminal_reward
+        self._force_bonus = force_bonus
         self._task_description, self._success_goals = _load_task_contract(
             self._config_dir,
             target_object=target_object,
             task_description=configured_task_description,
         )
         self._marker_history = _RealWorldMarkerHistory(num_envs)
+        self._tactile_image_history = _RealWorldTactileImageHistory(num_envs)
 
         with open_dict(cfg):
             cfg.init_params.task_description = self._task_description
@@ -1135,11 +1400,57 @@ class IsaaclabRealWorldTaberoTacFieldEnv(IsaaclabBaseEnv):
                     "success_params": raw_success_params,
                     "required_steps": self._required_success_steps,
                 }
+                failure_term_names = tuple(
+                    name
+                    for name, term in _termination_term_items(
+                        isaac_env_cfg.terminations
+                    )
+                    if name != "success" and not bool(getattr(term, "time_out", False))
+                )
+                reward_params: dict[str, Any] = {
+                    "success_term_name": "success",
+                    "failure_term_names": failure_term_names,
+                }
+                reward_weight = float(self.cfg.reward_coef) * self._terminal_reward
+                reward_func = _terminal_success_reward
+                if self._force_bonus["enabled"]:
+                    force_term_cfg = getattr(
+                        getattr(isaac_env_cfg.observations, "policy", None),
+                        "gripper_net_force",
+                        None,
+                    )
+                    force_reader = getattr(force_term_cfg, "func", None)
+                    if force_reader is None:
+                        raise ValueError(
+                            "RealWorld force bonus requires policy.gripper_net_force."
+                        )
+                    reward_params.update(
+                        {
+                            "direct_force_reader": force_reader,
+                            "direct_force_params": dict(
+                                getattr(force_term_cfg, "params", {}) or {}
+                            ),
+                            "terminal_reward": self._terminal_reward,
+                            "coefficient": self._force_bonus["coefficient"],
+                            "epsilon": self._force_bonus["epsilon"],
+                            "max_bonus": self._force_bonus["max_bonus"],
+                            "min_valid_samples": self._force_bonus[
+                                "min_valid_samples"
+                            ],
+                            "contact_epsilon": self._force_bonus[
+                                "contact_epsilon"
+                            ],
+                        }
+                    )
+                    reward_func = make_trajectory_force_success_reward_term(
+                        ManagerTermBase
+                    )
+                    reward_weight = float(self.cfg.reward_coef)
                 isaac_env_cfg.rewards = {
                     "success": RewTerm(
-                        func=_terminal_success_reward,
-                        weight=float(self.cfg.reward_coef) * self._terminal_reward,
-                        params={"success_term_name": "success"},
+                        func=reward_func,
+                        weight=reward_weight,
+                        params=reward_params,
                     )
                 }
                 isaac_env_cfg.seed = self.seed
@@ -1191,6 +1502,7 @@ class IsaaclabRealWorldTaberoTacFieldEnv(IsaaclabBaseEnv):
 
     def reset(self, seed=None, env_ids: torch.Tensor | None = None):
         self._marker_history.reset(env_ids)
+        self._tactile_image_history.reset(env_ids)
         update_mask = None
         target_env_ids = None
         if env_ids is not None:
@@ -1207,7 +1519,8 @@ class IsaaclabRealWorldTaberoTacFieldEnv(IsaaclabBaseEnv):
         else:
             raw_obs, _ = self.env.reset(seed=seed, env_ids=target_env_ids)
         obs = self._wrap_obs(raw_obs, marker_update_mask=update_mask)
-        self._action_filter.reset(obs["states"], env_ids=target_env_ids)
+        if self._action_filter is not None:
+            self._action_filter.reset(obs["states"], env_ids=target_env_ids)
         self._reset_metrics(target_env_ids)
         return obs, {}
 
@@ -1228,7 +1541,11 @@ class IsaaclabRealWorldTaberoTacFieldEnv(IsaaclabBaseEnv):
         raw_chunk_actions = self._validate_actions(
             chunk_actions, expected_rank=3
         ).clone()
-        chunk_actions = self._action_filter.filter(raw_chunk_actions)
+        chunk_actions = (
+            raw_chunk_actions.clone()
+            if self._action_filter is None
+            else self._action_filter.filter(raw_chunk_actions)
+        )
         active_mask = torch.ones(self.num_envs, device=self.device, dtype=torch.bool)
         first_done_step = torch.full(
             (self.num_envs,), -1, device=self.device, dtype=torch.long
@@ -1348,6 +1665,9 @@ class IsaaclabRealWorldTaberoTacFieldEnv(IsaaclabBaseEnv):
             device=self.device,
             dtype=torch.bool,
         )
+        terminal_force_mean = raw_infos.pop(_TERMINAL_FORCE_MEAN_KEY, None)
+        terminal_force_count = raw_infos.pop(_TERMINAL_FORCE_COUNT_KEY, None)
+        terminal_force_bonus = raw_infos.pop(_TERMINAL_FORCE_BONUS_KEY, None)
         if captured_mask.shape != (self.num_envs,):
             raise RuntimeError(
                 "RealWorld terminal observation mask has invalid shape "
@@ -1387,6 +1707,19 @@ class IsaaclabRealWorldTaberoTacFieldEnv(IsaaclabBaseEnv):
         newly_done = terminations | truncations
         reward = torch.where(active_mask, reward, 0.0)
         infos = self._record_metrics(reward, terminations, {})
+        if terminal_force_mean is not None:
+            terminal_force_mean = torch.as_tensor(
+                terminal_force_mean, device=self.device, dtype=torch.float32
+            ).reshape(self.num_envs)
+            terminal_force_count = torch.as_tensor(
+                terminal_force_count, device=self.device, dtype=torch.int64
+            ).reshape(self.num_envs)
+            terminal_force_bonus = torch.as_tensor(
+                terminal_force_bonus, device=self.device, dtype=torch.float32
+            ).reshape(self.num_envs)
+            infos["episode"][_EPISODE_FORCE_MEAN_KEY] = terminal_force_mean
+            infos["episode"][_EPISODE_FORCE_COUNT_KEY] = terminal_force_count
+            infos["episode"][_EPISODE_FORCE_BONUS_KEY] = terminal_force_bonus
         if newly_done.any():
             infos["final_observation"] = _clone_nested(obs)
             infos["final_info"] = {"episode": _clone_nested(infos["episode"])}
@@ -1461,6 +1794,7 @@ class IsaaclabRealWorldTaberoTacFieldEnv(IsaaclabBaseEnv):
             "eef_pose",
             "gripper_pos",
             "gripper_marker_motion",
+            "gripper_tactile_rgb",
         }
         missing = sorted(required_keys.difference(policy_obs))
         if missing:
@@ -1492,6 +1826,10 @@ class IsaaclabRealWorldTaberoTacFieldEnv(IsaaclabBaseEnv):
             "task_descriptions": [self._task_description] * self.num_envs,
             "tactile_marker_motion": self._marker_history.update(
                 policy_obs["gripper_marker_motion"],
+                update_mask=marker_update_mask,
+            ),
+            "tactile_images": self._tactile_image_history.update(
+                policy_obs["gripper_tactile_rgb"],
                 update_mask=marker_update_mask,
             ),
         }

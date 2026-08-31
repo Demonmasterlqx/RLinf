@@ -9,21 +9,21 @@ from omegaconf import OmegaConf
 from openpi.models import model as _model
 
 from rlinf.models.embodiment.openpi.dataconfig import get_openpi_config
+from rlinf.models.embodiment.openpi.openpi_action_model import (
+    OpenPi0ForRLActionPrediction,
+)
 from rlinf.models.embodiment.openpi.policies.tabero_policy import TaberoTacImgInputs
 from rlinf.workers.sft.fsdp_vla_sft_worker import FSDPVlaSftWorker
 
 CONFIG_PATH = (
-    Path(__file__).resolve().parents[2]
-    / "examples/sft/config/"
+    Path(__file__).resolve().parents[2] / "examples/sft/config/"
     "realworld_replayed_task820_firm_pi05_tacimg_sft_2gpu_"
     "gb32_mb16_gc_on_ema099_force0001_30k.yaml"
 )
 
 
 def test_pi05_tacimg_registry_and_transform_contract():
-    config = get_openpi_config(
-        "pi05_lora_tacimg_realworld_replayed_task820_force"
-    )
+    config = get_openpi_config("pi05_lora_tacimg_realworld_replayed_task820_force")
 
     assert config.model.model_type == _model.ModelType.PI05
     assert config.model.action_horizon == 50
@@ -38,8 +38,8 @@ def test_pi05_tacimg_registry_and_transform_contract():
 
     transformed = TaberoTacImgInputs(model_type=config.model.model_type)(
         {
-            "image": np.zeros((224, 224, 3), dtype=np.uint8),
-            "wrist_image": np.ones((224, 224, 3), dtype=np.uint8),
+            "image": np.zeros((480, 640, 3), dtype=np.uint8),
+            "wrist_image": np.ones((480, 640, 3), dtype=np.uint8),
             "tactile_image": np.full((224, 224, 3), 2, dtype=np.uint8),
             "tactile_gripper_force": np.ones((8, 6), dtype=np.float32),
             "tactile_marker_motion": np.ones((9, 440, 2), dtype=np.float32),
@@ -54,10 +54,38 @@ def test_pi05_tacimg_registry_and_transform_contract():
         "right_wrist_0_rgb",
     )
     assert all(bool(value) for value in transformed["image_mask"].values())
+    assert all(value.shape == (224, 224, 3) for value in transformed["image"].values())
     assert transformed["actions"].shape == (50, 13)
     assert "tactile_prefix" not in transformed
     assert "tactile_gripper_force" not in transformed
     assert "tactile_marker_motion" not in transformed
+
+
+def test_pi05_tacimg_rl_obs_processor_maps_realworld_environment_keys():
+    model = OpenPi0ForRLActionPrediction.__new__(OpenPi0ForRLActionPrediction)
+    model.config = SimpleNamespace(
+        config_name="pi05_lora_tacimg_realworld_replayed_task820_force"
+    )
+    env_obs = {
+        "main_images": torch.zeros(1, 480, 640, 3, dtype=torch.uint8),
+        "wrist_images": torch.zeros(1, 480, 640, 3, dtype=torch.uint8),
+        "tactile_images": torch.zeros(1, 224, 224, 3, dtype=torch.uint8),
+        "states": torch.zeros(1, 7),
+        "task_descriptions": ["pick up the Vitasoy and put it into the basket"],
+    }
+
+    processed = model.obs_processor(env_obs)
+
+    assert set(processed) == {
+        "image",
+        "wrist_image",
+        "tactile_image",
+        "state",
+        "prompt",
+    }
+    assert processed["image"] is env_obs["main_images"]
+    assert processed["wrist_image"] is env_obs["wrist_images"]
+    assert processed["tactile_image"] is env_obs["tactile_images"]
 
 
 def test_pi05_tacimg_yaml_contract(monkeypatch):

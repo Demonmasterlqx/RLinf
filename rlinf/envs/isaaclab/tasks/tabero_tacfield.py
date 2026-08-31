@@ -31,6 +31,12 @@ from omegaconf import open_dict
 from rlinf.envs.isaaclab.utils import quat2axisangle_torch
 
 from ..isaaclab_env import IsaaclabBaseEnv
+from .tabero_force_reward import (
+    make_trajectory_force_success_reward_term as _shared_make_trajectory_force_success_reward_term,
+)
+from .tabero_force_reward import (
+    validate_force_bonus_cfg as _shared_validate_force_bonus_cfg,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1003,6 +1009,12 @@ def _make_trajectory_force_success_reward_term(manager_term_base_cls: type) -> t
 
     TrajectoryForceSuccessRewardTerm.__name__ = "TrajectoryForceSuccessRewardTerm"
     return TrajectoryForceSuccessRewardTerm
+
+
+_validate_force_bonus_cfg = _shared_validate_force_bonus_cfg
+_make_trajectory_force_success_reward_term = (
+    _shared_make_trajectory_force_success_reward_term
+)
 
 
 def _termination_term_items(terminations_cfg: Any) -> list[tuple[str, Any]]:

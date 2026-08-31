@@ -23,7 +23,7 @@ runner:
   logger:
     log_path: /data/home/sim6g/code/tabero/results
     project_name: tabero-rlinf
-    experiment_name: ${oc.env:REALWORLD_TABERO_PIRL_RUN_ID}
+    experiment_name: ${oc.env:REALWORLD_TABERO_TACIMG_PIRL_RUN_ID}
     logger_backends: [tensorboard, wandb]
   max_epochs: 100
   max_steps: -1
@@ -66,11 +66,35 @@ env:
     total_num_envs: 8
     max_steps_per_rollout_epoch: 300
     max_episode_steps: 300
+    init_params:
+      tactile_image_history_len: 8
+      success:
+        required_consecutive_steps: 8
+        terminal_reward: 1.0
+        force_bonus:
+          enabled: true
+          coefficient: 20.0
+          epsilon: 1.0
+          max_bonus: 1.0
+          min_valid_samples: 4
+          contact_epsilon: 1.0
   eval:
     rollout_epoch: 1
     total_num_envs: 1
     max_steps_per_rollout_epoch: 300
     max_episode_steps: 300
+    init_params:
+      tactile_image_history_len: 8
+      success:
+        required_consecutive_steps: 8
+        terminal_reward: 1.0
+        force_bonus:
+          enabled: true
+          coefficient: 20.0
+          epsilon: 1.0
+          max_bonus: 1.0
+          min_valid_samples: 4
+          contact_epsilon: 1.0
     video_cfg:
       video_base_dir: ${runner.logger.log_path}/${runner.logger.experiment_name}/video/eval
 
@@ -80,7 +104,7 @@ rollout:
   enable_offload: true
   pipeline_stage_num: 1
   model:
-    model_path: ${oc.env:REALWORLD_TABERO_PI05_CHECKPOINT}
+    model_path: ${oc.env:REALWORLD_TABERO_TACIMG_PI05_CHECKPOINT}
     precision: ${actor.model.precision}
 
 actor:
@@ -92,7 +116,7 @@ actor:
   enable_offload: false
   combine_reference_model: true
   model:
-    model_path: ${oc.env:REALWORLD_TABERO_PI05_CHECKPOINT}
+    model_path: ${oc.env:REALWORLD_TABERO_TACIMG_PI05_CHECKPOINT}
     model_type: openpi
     precision: null
     frozen_parameter_precision: bf16
@@ -110,19 +134,19 @@ actor:
     add_value_head: true
     checkpoint_load_allowed_missing_prefixes: [value_head.]
     tabero_pi05_checkpoint_contract:
-      expected_model_sha256: ${oc.env:REALWORLD_TABERO_PI05_MODEL_SHA256}
-      expected_norm_stats_sha256: ${oc.env:REALWORLD_TABERO_PI05_NORM_STATS_SHA256}
-      expected_config_name: pi05_lora_tacfield_tabero_xarm_gripper
-      expected_norm_asset_id: replay_firm_tabero_xarm_gripper
-      expected_dataset: datas/replay_firm_tabero_xarm_gripper
+      expected_model_sha256: ${oc.env:REALWORLD_TABERO_TACIMG_PI05_MODEL_SHA256}
+      expected_norm_stats_sha256: ${oc.env:REALWORLD_TABERO_TACIMG_PI05_NORM_STATS_SHA256}
+      expected_config_name: pi05_lora_tacimg_realworld_replayed_task820_force
+      expected_norm_asset_id: pi05_horizon50_tacimg_task820_firm
+      expected_dataset: datas/realworld_replayed_task820_firm
       expected_gripper_coordinate: xarm_positive_open
       require_final: true
     openpi:
-      config_name: pi05_lora_tacfield_tabero_xarm_gripper
+      config_name: pi05_lora_tacimg_realworld_replayed_task820_force
       pi05: true
-      action_horizon: 10
+      action_horizon: 50
       discrete_state_input: true
-      num_images_in_input: 2
+      num_images_in_input: 3
       noise_level: 0.5
       action_chunk: 10
       num_steps: 10
@@ -138,13 +162,13 @@ actor:
       tactile_type: expert_his_c_fut
       tactile_dim: 6
       tactile_dim_in: 0
-      tactile_prefix_dim_in: 7920
-      tactile_prefix_history: 8
-      tactile_prefix_encoder_type: tcn
-      tactile_prefix_use_reference_frame: true
-      tactile_prefix_diff_from_reference: false
-      tactile_streams: [tactile_prefix]
-      tactile_loss_weight: 0.0
+      tactile_prefix_dim_in: null
+      tactile_prefix_history: null
+      tactile_prefix_encoder_type: null
+      tactile_prefix_use_reference_frame: null
+      tactile_prefix_diff_from_reference: null
+      tactile_streams: []
+      tactile_loss_weight: 0.001
       use_dsrl: false
   optim:
     lr: 1.0e-6
@@ -185,6 +209,8 @@ actor:
       task_domain: realworld
       task_suite: gentle_grasp
       task_id: 6
+      success_scene_task_id: 6
+      semantic_task_ids: [0, 2, 4]
       target_object: target_object_1
       task_description: "pick up the Vitasoy and put it into the basket"
       control_mode: hybrid_tactile
@@ -194,22 +220,24 @@ actor:
       action_filter: disabled
       camera_preprocess: stretch_480x640_to_224x224_inter_area
       model_family: pi05
-      openpi_config_name: pi05_lora_tacfield_tabero_xarm_gripper
-      dataset: datas/replay_firm_tabero_xarm_gripper
-      normalization_asset_id: replay_firm_tabero_xarm_gripper
+      openpi_config_name: pi05_lora_tacimg_realworld_replayed_task820_force
+      dataset: datas/realworld_replayed_task820_firm
+      normalization_asset_id: pi05_horizon50_tacimg_task820_firm
       base_model_sha256: ${actor.model.tabero_pi05_checkpoint_contract.expected_model_sha256}
       base_norm_stats_sha256: ${actor.model.tabero_pi05_checkpoint_contract.expected_norm_stats_sha256}
       base_checkpoint_require_final: ${actor.model.tabero_pi05_checkpoint_contract.require_final}
-      action_horizon: 10
+      action_horizon: 50
       execution_horizon: 10
       effective_action_dim: 13
       state_dim: 7
-      camera_count: 2
-      tactile_input: tactile_prefix
-      tactile_prefix_dim_in: 7920
-      tactile_prefix_history: 8
-      combined_marker_count: 440
-      training_config: isaaclab_pi05_pirl_realworld_tabero_task6_2gpu_100step
+      camera_count: 3
+      tactile_input: tactile_image
+      tactile_image_history: 8
+      tactile_mosaic_layout: left_2x4_then_right_2x4
+      excluded_tactile_inputs: [tactile_gripper_force, tactile_marker_motion]
+      reward_contract: binary_success_plus_inverse_measured_force_v1
+      force_reward_source: policy_gripper_net_force
+      training_config: isaaclab_pi05_pirl_realworld_tabero_tacimg_task6_2gpu_100step
       target_global_step: 100
       tabero_ppo_transition_boundary_semantics: terminal_observation_first_done_prefix_logprob_default_reset_v1
 

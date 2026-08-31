@@ -33,12 +33,7 @@ init_params:
   # replay_firm_tabero_xarm_gripper uses the native XArm positive-open coordinate.
   policy_gripper_sign_bridge: false
   action_filter:
-    enabled: true
-    transition_steps: 3
-    max_position_step_m: 0.008
-    max_position_delta_change_m: 0.006
-    max_orientation_step_deg: 2.0
-    max_orientation_delta_change_deg: 1.5
+    enabled: false
   camera_preprocess:
     source_height: 480
     source_width: 640

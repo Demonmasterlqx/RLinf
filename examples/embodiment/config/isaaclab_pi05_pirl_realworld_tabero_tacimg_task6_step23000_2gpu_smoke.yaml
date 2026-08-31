@@ -1,0 +1,49 @@
+defaults:
+  - isaaclab_pi05_pirl_realworld_tabero_tacimg_task6_2gpu_100step
+  - _self_
+
+# This source export is non-final (step 23000 of 30000), so this preset is
+# intentionally restricted to a one-global-step connectivity smoke.
+cluster:
+  component_placement:
+    actor: "6"
+    rollout: "3"
+    env: "3"
+
+runner:
+  max_epochs: 1
+  save_interval: 1
+
+algorithm:
+  normalize_advantages: false
+
+env:
+  train:
+    rollout_epoch: 1
+    total_num_envs: 1
+    max_steps_per_rollout_epoch: 300
+    max_episode_steps: 300
+  eval:
+    rollout_epoch: 1
+    total_num_envs: 1
+    max_steps_per_rollout_epoch: 300
+    max_episode_steps: 300
+
+rollout:
+  model:
+    model_path: /data/home/sim6g/code/tabero/models/pi05_realworld_replayed_task820_23000_lora
+
+actor:
+  micro_batch_size: 1
+  global_batch_size: 1
+  model:
+    model_path: /data/home/sim6g/code/tabero/models/pi05_realworld_replayed_task820_23000_lora
+    tabero_pi05_checkpoint_contract:
+      expected_model_sha256: 9b506e72d643fb2df78f8aa1fd0f730d52df10566d247f6f2ea4a5010f1e6c15
+      expected_norm_stats_sha256: 6b8751c3699f3a00a7c4a0335ab20bf629e2c63cfebb9c43b8473fd60490d88b
+      require_final: false
+  fsdp_config:
+    trainable_checkpoint_metadata:
+      base_checkpoint_require_final: false
+      training_config: isaaclab_pi05_pirl_realworld_tabero_tacimg_task6_step23000_2gpu_smoke
+      target_global_step: 1
