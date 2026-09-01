@@ -14,7 +14,10 @@
 
 """Episode-boundary contract for Tabero tactile DSRL transitions."""
 
-DSRL_TRANSITION_BOUNDARY_SEMANTICS = (
-    "terminal_observation_first_done_hdf5_reset_v1"
-)
+DSRL_TRANSITION_BOUNDARY_SEMANTICS = "terminal_observation_first_done_hdf5_reset_v1"
 TABERO_DSRL_CHUNK_BOUNDARY_MODE = "terminal_safe_hdf5_v1"
+
+REALWORLD_TACIMG_DSRL_TRANSITION_BOUNDARY_SEMANTICS = (
+    "terminal_observation_first_done_default_reset_v1"
+)
+REALWORLD_TACIMG_DSRL_CHUNK_BOUNDARY_MODE = "terminal_safe_v1"

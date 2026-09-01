@@ -40,8 +40,8 @@ from rlinf.scheduler import Channel, Cluster, CommMapper, Worker
 from rlinf.utils.data_iter_utils import split_list
 from rlinf.utils.distributed import masked_stats, normalize_from_stats
 from rlinf.utils.dsrl_replay import (
-    DSRL_REPLAY_SEMANTICS,
     compact_tabero_dsrl_observation,
+    is_compact_dsrl_replay_semantics,
 )
 from rlinf.utils.dsrl_reward import summarize_dsrl_chunk_rewards
 from rlinf.utils.metric_utils import compute_split_num
@@ -228,13 +228,13 @@ class EnvWorker(Worker):
         self.enable_rlt = (
             OmegaConf.select(self.cfg, "algorithm.loss_type", default="") == "rlt_ac"
         )
-        self.compact_dsrl_replay = (
-            OmegaConf.select(
-                self.cfg,
-                "algorithm.dsrl_replay_semantics",
-                default=None,
-            )
-            == DSRL_REPLAY_SEMANTICS
+        self.dsrl_replay_semantics = OmegaConf.select(
+            self.cfg,
+            "algorithm.dsrl_replay_semantics",
+            default=None,
+        )
+        self.compact_dsrl_replay = is_compact_dsrl_replay_semantics(
+            self.dsrl_replay_semantics
         )
 
         self.reward_mode = self.cfg.get("reward", {}).get("reward_mode", "per_step")
@@ -1341,8 +1341,14 @@ class EnvWorker(Worker):
                             else env_output.obs
                         )
                         if self.compact_dsrl_replay:
-                            curr_obs = compact_tabero_dsrl_observation(curr_obs)
-                            next_obs = compact_tabero_dsrl_observation(next_obs)
+                            curr_obs = compact_tabero_dsrl_observation(
+                                curr_obs,
+                                replay_semantics=self.dsrl_replay_semantics,
+                            )
+                            next_obs = compact_tabero_dsrl_observation(
+                                next_obs,
+                                replay_semantics=self.dsrl_replay_semantics,
+                            )
                         self.rollout_results[stage_id].append_transitions(
                             curr_obs, next_obs
                         )

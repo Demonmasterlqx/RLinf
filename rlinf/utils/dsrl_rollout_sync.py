@@ -18,6 +18,11 @@ from types import MappingProxyType
 
 import torch
 
+from rlinf.utils.dsrl_observation import (
+    DSRL_OBSERVATION_SEMANTICS,
+    REALWORLD_TACIMG_DSRL_OBSERVATION_SEMANTICS,
+)
+
 DSRL_ROLLOUT_SYNC_PREFIXES = (
     "dsrl_action_noise_net.",
     "actor_image_encoder.",
@@ -80,6 +85,27 @@ DSRL_ROLLOUT_SYNC_MANIFEST_V2: Mapping[str, tuple[int, ...]] = MappingProxyType(
 DSRL_ROLLOUT_SYNC_TENSOR_COUNT = len(DSRL_ROLLOUT_SYNC_MANIFEST_V2)
 DSRL_ROLLOUT_SYNC_PARAMETER_COUNT = 2_319_840
 
+REALWORLD_TACIMG_DSRL_ROLLOUT_SYNC_PREFIXES = (
+    "dsrl_action_noise_net.",
+    "actor_image_encoder.",
+    "actor_state_encoder.",
+)
+REALWORLD_TACIMG_DSRL_ROLLOUT_SYNC_MANIFEST_V2: Mapping[str, tuple[int, ...]] = (
+    MappingProxyType(
+        {
+            name: shape
+            for name, shape in DSRL_ROLLOUT_SYNC_MANIFEST_V2.items()
+            if not name.startswith("actor_tactile_encoder.")
+        }
+    )
+)
+REALWORLD_TACIMG_DSRL_ROLLOUT_SYNC_TENSOR_COUNT = len(
+    REALWORLD_TACIMG_DSRL_ROLLOUT_SYNC_MANIFEST_V2
+)
+REALWORLD_TACIMG_DSRL_ROLLOUT_SYNC_PARAMETER_COUNT = sum(
+    prod(shape) for shape in REALWORLD_TACIMG_DSRL_ROLLOUT_SYNC_MANIFEST_V2.values()
+)
+
 assert DSRL_ROLLOUT_SYNC_TENSOR_COUNT == 48
 assert (
     sum(prod(shape) for shape in DSRL_ROLLOUT_SYNC_MANIFEST_V2.values())
@@ -87,16 +113,60 @@ assert (
 )
 
 
+def get_dsrl_rollout_sync_contract(
+    observation_semantics: str,
+) -> dict[str, object]:
+    """Return the selective rollout-sync contract for an observation schema."""
+
+    if observation_semantics == DSRL_OBSERVATION_SEMANTICS:
+        return {
+            "prefixes": DSRL_ROLLOUT_SYNC_PREFIXES,
+            "manifest": DSRL_ROLLOUT_SYNC_MANIFEST_V2,
+            "tensor_count": DSRL_ROLLOUT_SYNC_TENSOR_COUNT,
+            "parameter_count": DSRL_ROLLOUT_SYNC_PARAMETER_COUNT,
+        }
+    if observation_semantics == REALWORLD_TACIMG_DSRL_OBSERVATION_SEMANTICS:
+        return {
+            "prefixes": REALWORLD_TACIMG_DSRL_ROLLOUT_SYNC_PREFIXES,
+            "manifest": REALWORLD_TACIMG_DSRL_ROLLOUT_SYNC_MANIFEST_V2,
+            "tensor_count": REALWORLD_TACIMG_DSRL_ROLLOUT_SYNC_TENSOR_COUNT,
+            "parameter_count": REALWORLD_TACIMG_DSRL_ROLLOUT_SYNC_PARAMETER_COUNT,
+        }
+    raise ValueError(
+        f"Unsupported OpenPI DSRL observation semantics {observation_semantics!r}."
+    )
+
+
 def validate_dsrl_rollout_sync_config(actor_cfg) -> tuple[str, ...] | None:
     """Validate opt-in DSRL sync, or return ``None`` for the legacy path."""
     if "rollout_sync_prefixes" not in actor_cfg:
         return None
 
+    openpi_cfg = actor_cfg.get("model", {}).get("openpi", {})
+    use_tactile = openpi_cfg.get("dsrl_use_tactile")
+    num_images = openpi_cfg.get("dsrl_num_images")
+    if use_tactile is True:
+        observation_semantics = DSRL_OBSERVATION_SEMANTICS
+    elif use_tactile is False and num_images == 3:
+        observation_semantics = REALWORLD_TACIMG_DSRL_OBSERVATION_SEMANTICS
+    else:
+        raise ValueError(
+            "OpenPI DSRL selective rollout sync requires "
+            "actor.model.openpi.dsrl_use_tactile: true for the TacField "
+            "contract, or either the TacField "
+            "two-image/tactile-marker contract or the RealWorld TacImg "
+            "three-image/no-marker contract; got "
+            f"dsrl_num_images={num_images!r}, dsrl_use_tactile={use_tactile!r}."
+        )
+    expected_prefixes = tuple(
+        get_dsrl_rollout_sync_contract(observation_semantics)["prefixes"]
+    )
+
     configured_prefixes = tuple(actor_cfg.rollout_sync_prefixes)
-    if configured_prefixes != DSRL_ROLLOUT_SYNC_PREFIXES:
+    if configured_prefixes != expected_prefixes:
         raise ValueError(
             "OpenPI DSRL actor.rollout_sync_prefixes must contain exactly "
-            f"{list(DSRL_ROLLOUT_SYNC_PREFIXES)} in this order; got "
+            f"{list(expected_prefixes)} in this order; got "
             f"{list(configured_prefixes)}."
         )
 
@@ -105,13 +175,6 @@ def validate_dsrl_rollout_sync_config(actor_cfg) -> tuple[str, ...] | None:
         raise ValueError(
             "OpenPI DSRL selective rollout sync requires actor.training_backend: "
             f"fsdp; got {training_backend!r}."
-        )
-
-    openpi_cfg = actor_cfg.get("model", {}).get("openpi", {})
-    if openpi_cfg.get("dsrl_use_tactile") is not True:
-        raise ValueError(
-            "OpenPI DSRL selective rollout sync requires "
-            "actor.model.openpi.dsrl_use_tactile: true."
         )
 
     fsdp_cfg = actor_cfg.get("fsdp_config", {})
@@ -178,10 +241,14 @@ def filter_state_dict_by_prefix(
 
 def validate_dsrl_rollout_state_dict(
     state_dict: Mapping[str, torch.Tensor],
+    *,
+    observation_semantics: str = DSRL_OBSERVATION_SEMANTICS,
 ) -> None:
     """Require the versioned Tabero DSRL rollout synchronization manifest."""
+    contract = get_dsrl_rollout_sync_contract(observation_semantics)
+    manifest = contract["manifest"]
     actual_key_set = set(state_dict)
-    expected_key_set = set(DSRL_ROLLOUT_SYNC_MANIFEST_V2)
+    expected_key_set = set(manifest)
     missing_keys = sorted(expected_key_set - actual_key_set)
     unexpected_keys = sorted(actual_key_set - expected_key_set)
     shape_mismatches = {
@@ -189,7 +256,7 @@ def validate_dsrl_rollout_state_dict(
             "expected": expected_shape,
             "actual": tuple(state_dict[key].shape),
         }
-        for key, expected_shape in DSRL_ROLLOUT_SYNC_MANIFEST_V2.items()
+        for key, expected_shape in manifest.items()
         if key in state_dict and tuple(state_dict[key].shape) != expected_shape
     }
     if missing_keys or unexpected_keys or shape_mismatches:
@@ -203,11 +270,13 @@ def validate_dsrl_rollout_state_dict(
     tensor_count = len(state_dict)
     parameter_count = sum(tensor.numel() for tensor in state_dict.values())
     if (
-        tensor_count != DSRL_ROLLOUT_SYNC_TENSOR_COUNT
-        or parameter_count != DSRL_ROLLOUT_SYNC_PARAMETER_COUNT
+        tensor_count != contract["tensor_count"]
+        or parameter_count != contract["parameter_count"]
     ):
         raise ValueError(
-            "OpenPI DSRL rollout sync requires exactly 48 tensors and "
-            "2,319,840 parameters selected by actor.rollout_sync_prefixes; "
+            "OpenPI DSRL rollout sync requires exactly "
+            f"{contract['tensor_count']} tensors and "
+            f"{int(contract['parameter_count']):,} parameters selected by "
+            "actor.rollout_sync_prefixes; "
             f"got {tensor_count} tensors and {parameter_count:,} parameters."
         )

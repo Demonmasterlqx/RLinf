@@ -36,6 +36,7 @@ from rlinf.hybrid_engines.weight_syncer import WeightSyncer
 from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import BasePolicy
 from rlinf.scheduler import Channel, Cluster, Worker, split_channel_message
+from rlinf.utils.dsrl_observation import DSRL_OBSERVATION_SEMANTICS
 from rlinf.utils.dsrl_rollout_sync import (
     filter_state_dict_by_prefix,
     validate_dsrl_rollout_state_dict,
@@ -687,7 +688,12 @@ class MultiStepRolloutWorker(Worker):
         if prefixes is None:
             return state_dict
         state_dict = filter_state_dict_by_prefix(state_dict, prefixes)
-        validate_dsrl_rollout_state_dict(state_dict)
+        validate_dsrl_rollout_state_dict(
+            state_dict,
+            observation_semantics=self.algorithm_cfg.get(
+                "dsrl_observation_semantics", DSRL_OBSERVATION_SEMANTICS
+            ),
+        )
         return state_dict
 
     @Worker.timer("generate_one_epoch")

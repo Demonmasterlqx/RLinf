@@ -423,9 +423,10 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             self.config.dsrl_tactile_latent_dim if self.config.dsrl_use_tactile else 0
         )
         dsrl_num_images = int(getattr(self.config, "dsrl_num_images", 1))
-        if dsrl_num_images not in {1, 2}:
+        if dsrl_num_images not in {1, 2, 3}:
             raise ValueError(
-                f"OpenPI DSRL dsrl_num_images must be 1 or 2; got {dsrl_num_images}."
+                "OpenPI DSRL dsrl_num_images must be 1, 2, or 3; "
+                f"got {dsrl_num_images}."
             )
         state_side_dim = self.config.dsrl_state_latent_dim + tactile_latent_dim
         image_side_dim = self.config.dsrl_image_latent_dim * dsrl_num_images
@@ -1348,6 +1349,8 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
 
     def _sample_actions_with_inference_autocast(self, *args, **kwargs):
         """Run mixed-precision rollout inference with the synced projection dtype."""
+        if not hasattr(self, "action_in_proj"):
+            return self.sample_actions(*args, **kwargs)
         compute_dtype = self.action_in_proj.weight.dtype
         device_type = self.action_in_proj.weight.device.type
         enabled = device_type == "cuda" and compute_dtype in {
@@ -2057,12 +2060,20 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
     def _normalize_dsrl_obs(self, obs):
         """Normalize and validate the ordered DSRL image-view contract."""
         num_images = int(getattr(self.config, "dsrl_num_images", 1))
-        if num_images not in {1, 2}:
+        if num_images not in {1, 2, 3}:
             raise ValueError(
-                f"OpenPI DSRL dsrl_num_images must be 1 or 2; got {num_images}."
+                f"OpenPI DSRL dsrl_num_images must be 1, 2, or 3; got {num_images}."
             )
         if "dsrl_images" in obs:
-            if "images" in obs or "main_images" in obs or "wrist_images" in obs:
+            if any(
+                key in obs
+                for key in (
+                    "images",
+                    "main_images",
+                    "wrist_images",
+                    "tactile_images",
+                )
+            ):
                 raise ValueError(
                     "OpenPI DSRL compact replay observation cannot mix "
                     "'dsrl_images' with raw image fields."
@@ -2106,13 +2117,20 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                     "'main_images' key."
                 )
             images = [obs["main_images"]]
-            if num_images == 2:
+            if num_images >= 2:
                 if "wrist_images" not in obs or obs["wrist_images"] is None:
                     raise ValueError(
-                        "OpenPI DSRL dual-camera mode requires 'wrist_images'; "
+                        "OpenPI DSRL multi-image mode requires 'wrist_images'; "
                         f"available keys={list(obs.keys())}."
                     )
                 images.append(obs["wrist_images"])
+            if num_images == 3:
+                if "tactile_images" not in obs or obs["tactile_images"] is None:
+                    raise ValueError(
+                        "OpenPI DSRL three-image mode requires 'tactile_images'; "
+                        f"available keys={list(obs.keys())}."
+                    )
+                images.append(obs["tactile_images"])
             normalized = {
                 "images": images,
                 "states": obs["states"],
@@ -2137,11 +2155,11 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         if not isinstance(images, (list, tuple)):
             raise ValueError(
                 "OpenPI DSRL 'images' must be an ordered list/tuple in "
-                "main-to-wrist order."
+                "configured view order."
             )
         if len(images) != num_images:
             raise ValueError(
-                f"OpenPI DSRL expected {num_images} image views in main-to-wrist "
+                f"OpenPI DSRL expected {num_images} image views in configured "
                 f"order; got {len(images)}."
             )
 
@@ -2154,7 +2172,16 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             getattr(self.config, "config_name", None) == "pi0_lora_tacfield_tabero"
             and num_images == 2
         )
-        view_names = ("main", "wrist") if num_images == 2 else ("main",)
+        is_realworld_tacimg = (
+            getattr(self.config, "config_name", None)
+            == "pi05_lora_tacimg_realworld_replayed_task820_force"
+            and num_images == 3
+        )
+        view_names = {
+            1: ("main",),
+            2: ("main", "wrist"),
+            3: ("main", "wrist", "tactile"),
+        }[num_images]
         for view_name, image in zip(view_names, images, strict=True):
             if not torch.is_tensor(image) or image.ndim != 4:
                 actual = tuple(image.shape) if hasattr(image, "shape") else None
@@ -2184,6 +2211,19 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 if image.dtype != torch.uint8:
                     raise ValueError(
                         f"Tabero DSRL {view_name} image must use uint8; "
+                        f"got {image.dtype}."
+                    )
+            if is_realworld_tacimg:
+                expected_hw = (224, 224) if view_name == "tactile" else (480, 640)
+                expected_shape = (expected_batch, *expected_hw, 3)
+                if tuple(image.shape) != expected_shape:
+                    raise ValueError(
+                        f"RealWorld TacImg DSRL {view_name} image expected shape "
+                        f"{expected_shape}; got {tuple(image.shape)}."
+                    )
+                if image.dtype != torch.uint8:
+                    raise ValueError(
+                        f"RealWorld TacImg DSRL {view_name} image must use uint8; "
                         f"got {image.dtype}."
                     )
         return images

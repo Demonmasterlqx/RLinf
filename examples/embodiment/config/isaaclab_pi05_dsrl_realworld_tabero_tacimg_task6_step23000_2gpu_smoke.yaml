@@ -1,0 +1,33 @@
+defaults:
+  - isaaclab_pi05_dsrl_realworld_tabero_tacimg_task6_step23000_2gpu_100step
+  - _self_
+
+runner:
+  max_epochs: 1
+  save_interval: 1
+
+algorithm:
+  update_epoch: 1
+  replay_buffer:
+    min_buffer_size: 1
+  train_actor_steps: 1
+
+env:
+  train:
+    rollout_epoch: 1
+    total_num_envs: 1
+    max_steps_per_rollout_epoch: 300
+    max_episode_steps: 300
+  eval:
+    rollout_epoch: 1
+    total_num_envs: 1
+    max_steps_per_rollout_epoch: 300
+    max_episode_steps: 300
+
+actor:
+  micro_batch_size: 1
+  global_batch_size: 1
+  fsdp_config:
+    trainable_checkpoint_metadata:
+      training_config: isaaclab_pi05_dsrl_realworld_tabero_tacimg_task6_step23000_2gpu_smoke
+      target_global_step: 1

@@ -22,13 +22,18 @@ from typing import Any
 import torch
 from torch import nn
 
-from rlinf.utils.dsrl_observation import DSRL_OBSERVATION_SEMANTICS
+from rlinf.utils.dsrl_observation import (
+    DSRL_OBSERVATION_SEMANTICS,
+    REALWORLD_TACIMG_DSRL_OBSERVATION_SEMANTICS,
+)
 from rlinf.utils.dsrl_reward import DSRL_REWARD_SEMANTICS
 from rlinf.utils.dsrl_rollout_sync import (
     DSRL_ROLLOUT_SYNC_MANIFEST_V2,
     normalize_fsdp_parameter_name,
 )
-from rlinf.utils.dsrl_transition import DSRL_TRANSITION_BOUNDARY_SEMANTICS
+from rlinf.utils.dsrl_transition import (
+    DSRL_TRANSITION_BOUNDARY_SEMANTICS,
+)
 
 DSRL_TARGET_FORMAT = "tabero_dsrl_target"
 DSRL_TARGET_VERSION = 3
@@ -101,6 +106,25 @@ DSRL_TARGET_MANIFEST_V2: Mapping[str, tuple[int, ...]] = MappingProxyType(
     }
 )
 
+REALWORLD_TACIMG_DSRL_TRAINABLE_MANIFEST_V2: Mapping[str, tuple[int, ...]] = (
+    MappingProxyType(
+        {
+            name: shape
+            for name, shape in DSRL_TRAINABLE_MANIFEST_V2.items()
+            if "_tactile_encoder." not in name
+        }
+    )
+)
+REALWORLD_TACIMG_DSRL_TARGET_MANIFEST_V2: Mapping[str, tuple[int, ...]] = (
+    MappingProxyType(
+        {
+            name: shape
+            for name, shape in DSRL_TARGET_MANIFEST_V2.items()
+            if "_tactile_encoder." not in name
+        }
+    )
+)
+
 assert len(DSRL_TRAINABLE_MANIFEST_V2) == DSRL_TRAINABLE_TENSOR_COUNT
 assert (
     sum(prod(shape) for shape in DSRL_TRAINABLE_MANIFEST_V2.values())
@@ -108,6 +132,33 @@ assert (
 )
 assert len(DSRL_TARGET_MANIFEST_V2) == 172
 assert sum(prod(shape) for shape in DSRL_TARGET_MANIFEST_V2.values()) == 2_954_026
+
+
+def get_dsrl_checkpoint_contract(observation_semantics: str) -> dict[str, object]:
+    """Return trainable and target manifests for an observation contract."""
+
+    if observation_semantics == DSRL_OBSERVATION_SEMANTICS:
+        trainable_manifest = DSRL_TRAINABLE_MANIFEST_V2
+        target_manifest = DSRL_TARGET_MANIFEST_V2
+    elif observation_semantics == REALWORLD_TACIMG_DSRL_OBSERVATION_SEMANTICS:
+        trainable_manifest = REALWORLD_TACIMG_DSRL_TRAINABLE_MANIFEST_V2
+        target_manifest = REALWORLD_TACIMG_DSRL_TARGET_MANIFEST_V2
+    else:
+        raise ValueError(
+            f"Unsupported OpenPI DSRL observation semantics {observation_semantics!r}."
+        )
+    return {
+        "trainable_manifest": trainable_manifest,
+        "target_manifest": target_manifest,
+        "trainable_tensor_count": len(trainable_manifest),
+        "trainable_parameter_count": sum(
+            prod(shape) for shape in trainable_manifest.values()
+        ),
+        "target_tensor_count": len(target_manifest),
+        "target_parameter_count": sum(
+            prod(shape) for shape in target_manifest.values()
+        ),
+    }
 
 
 def _require_strict_int(
@@ -157,20 +208,25 @@ def select_target_parameters(model: nn.Module) -> dict[str, nn.Parameter]:
     return selected
 
 
-def select_compact_target_parameters(model: nn.Module) -> dict[str, nn.Parameter]:
+def select_compact_target_parameters(
+    model: nn.Module,
+    *,
+    observation_semantics: str = DSRL_OBSERVATION_SEMANTICS,
+) -> dict[str, nn.Parameter]:
     """Return target parameters matching the canonical DSRL critic/Q manifest."""
     selected = select_target_parameters(model)
-    expected_keys = set(DSRL_TARGET_MANIFEST_V2)
+    manifest = get_dsrl_checkpoint_contract(observation_semantics)["target_manifest"]
+    expected_keys = set(manifest)
     actual_keys = set(selected)
     missing_keys = sorted(expected_keys - actual_keys)
     unexpected_keys = sorted(actual_keys - expected_keys)
     shape_mismatches = {
         name: {
-            "expected": DSRL_TARGET_MANIFEST_V2[name],
+            "expected": manifest[name],
             "actual": tuple(selected[name].shape),
         }
         for name in expected_keys & actual_keys
-        if tuple(selected[name].shape) != DSRL_TARGET_MANIFEST_V2[name]
+        if tuple(selected[name].shape) != manifest[name]
     }
     if missing_keys or unexpected_keys or shape_mismatches:
         raise ValueError(
@@ -269,6 +325,8 @@ def build_compact_target_payload(
     step: int,
     rank: int,
     world_size: int,
+    observation_semantics: str = DSRL_OBSERVATION_SEMANTICS,
+    transition_boundary_semantics: str = DSRL_TRANSITION_BOUNDARY_SEMANTICS,
 ) -> dict[str, Any]:
     """Build and validate a v3 compact target payload from live tensors."""
     _require_strict_int(step, label="step", minimum=0)
@@ -314,8 +372,8 @@ def build_compact_target_payload(
             "rank": rank,
             "world_size": world_size,
             "reward_semantics": DSRL_REWARD_SEMANTICS,
-            "observation_semantics": DSRL_OBSERVATION_SEMANTICS,
-            "transition_boundary_semantics": DSRL_TRANSITION_BOUNDARY_SEMANTICS,
+            "observation_semantics": observation_semantics,
+            "transition_boundary_semantics": transition_boundary_semantics,
             "manifest_version": DSRL_TARGET_MANIFEST_VERSION,
             "tensor_count": len(model_state),
             "parameter_count": parameter_count,
@@ -334,6 +392,8 @@ def _validate_compact_metadata(
     world_size: int,
     model_state: Mapping[str, torch.Tensor],
     shadow_state: Mapping[str, torch.Tensor],
+    expected_observation_semantics: str,
+    expected_transition_boundary_semantics: str,
 ) -> None:
     if not isinstance(metadata, Mapping):
         raise ValueError("OpenPI DSRL compact target metadata must be a mapping.")
@@ -349,17 +409,17 @@ def _validate_compact_metadata(
             f"expected {DSRL_REWARD_SEMANTICS!r}, got {reward_semantics!r}."
         )
     observation_semantics = metadata.get("observation_semantics")
-    if observation_semantics != DSRL_OBSERVATION_SEMANTICS:
+    if observation_semantics != expected_observation_semantics:
         raise ValueError(
             "OpenPI DSRL compact target observation semantics mismatch: "
-            f"expected {DSRL_OBSERVATION_SEMANTICS!r}, got "
+            f"expected {expected_observation_semantics!r}, got "
             f"{observation_semantics!r}."
         )
     transition_semantics = metadata.get("transition_boundary_semantics")
-    if transition_semantics != DSRL_TRANSITION_BOUNDARY_SEMANTICS:
+    if transition_semantics != expected_transition_boundary_semantics:
         raise ValueError(
             "OpenPI DSRL compact target transition boundary semantics mismatch: "
-            f"expected {DSRL_TRANSITION_BOUNDARY_SEMANTICS!r}, got "
+            f"expected {expected_transition_boundary_semantics!r}, got "
             f"{transition_semantics!r}."
         )
     manifest_version = _require_strict_int(
@@ -416,7 +476,12 @@ def _copy_target_and_build_shadow(
     }
 
 
-def validate_target_payload_contract(payload: Any) -> None:
+def validate_target_payload_contract(
+    payload: Any,
+    *,
+    expected_observation_semantics: str = DSRL_OBSERVATION_SEMANTICS,
+    expected_transition_boundary_semantics: str = (DSRL_TRANSITION_BOUNDARY_SEMANTICS),
+) -> None:
     """Validate the non-tensor contract needed before any checkpoint restore."""
     if not isinstance(payload, Mapping):
         raise ValueError("OpenPI DSRL target checkpoint must be a mapping.")
@@ -440,17 +505,17 @@ def validate_target_payload_contract(payload: Any) -> None:
             f"expected {DSRL_REWARD_SEMANTICS!r}, got {reward_semantics!r}."
         )
     observation_semantics = metadata.get("observation_semantics")
-    if observation_semantics != DSRL_OBSERVATION_SEMANTICS:
+    if observation_semantics != expected_observation_semantics:
         raise ValueError(
             "OpenPI DSRL compact target observation semantics mismatch: "
-            f"expected {DSRL_OBSERVATION_SEMANTICS!r}, got "
+            f"expected {expected_observation_semantics!r}, got "
             f"{observation_semantics!r}."
         )
     transition_semantics = metadata.get("transition_boundary_semantics")
-    if transition_semantics != DSRL_TRANSITION_BOUNDARY_SEMANTICS:
+    if transition_semantics != expected_transition_boundary_semantics:
         raise ValueError(
             "OpenPI DSRL compact target transition boundary semantics mismatch: "
-            f"expected {DSRL_TRANSITION_BOUNDARY_SEMANTICS!r}, got "
+            f"expected {expected_transition_boundary_semantics!r}, got "
             f"{transition_semantics!r}."
         )
     manifest_version = _require_strict_int(
@@ -469,9 +534,15 @@ def restore_target_payload(
     *,
     rank: int,
     world_size: int,
+    observation_semantics: str = DSRL_OBSERVATION_SEMANTICS,
+    transition_boundary_semantics: str = DSRL_TRANSITION_BOUNDARY_SEMANTICS,
 ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
     """Validate/copy a current compact target and return shadow/receipt."""
-    validate_target_payload_contract(payload)
+    validate_target_payload_contract(
+        payload,
+        expected_observation_semantics=observation_semantics,
+        expected_transition_boundary_semantics=transition_boundary_semantics,
+    )
     _require_strict_int(rank, label="runtime rank", minimum=0)
     _require_strict_int(world_size, label="runtime world_size", minimum=1)
     runtime = select_target_parameters(target_model)
@@ -501,13 +572,15 @@ def restore_target_payload(
         world_size=world_size,
         model_state=model_state,
         shadow_state=shadow_state,
+        expected_observation_semantics=observation_semantics,
+        expected_transition_boundary_semantics=transition_boundary_semantics,
     )
     shadow = _copy_target_and_build_shadow(runtime, model_state, shadow_state)
     receipt = {
         "format": "compact_v3",
         "reward_semantics": DSRL_REWARD_SEMANTICS,
-        "observation_semantics": DSRL_OBSERVATION_SEMANTICS,
-        "transition_boundary_semantics": DSRL_TRANSITION_BOUNDARY_SEMANTICS,
+        "observation_semantics": observation_semantics,
+        "transition_boundary_semantics": transition_boundary_semantics,
         "tensor_count": len(model_state),
         "parameter_count": sum(tensor.numel() for tensor in model_state.values()),
         "shadow_tensor_count": len(shadow_state),
@@ -515,7 +588,11 @@ def restore_target_payload(
     return shadow, receipt
 
 
-def select_dsrl_trainable_state(model: nn.Module) -> dict[str, torch.Tensor]:
+def select_dsrl_trainable_state(
+    model: nn.Module,
+    *,
+    observation_semantics: str = DSRL_OBSERVATION_SEMANTICS,
+) -> dict[str, torch.Tensor]:
     """Collect and validate the canonical DSRL trainable sidecar tensors."""
     trainable = _normalized_named_parameters(model, requires_grad_only=True)
     disallowed = sorted(
@@ -526,28 +603,31 @@ def select_dsrl_trainable_state(model: nn.Module) -> dict[str, torch.Tensor]:
             "OpenPI DSRL trainable parameters must use only the allowed prefixes "
             f"{list(DSRL_TRAINABLE_PREFIXES)}; got {disallowed}."
         )
+    contract = get_dsrl_checkpoint_contract(observation_semantics)
+    manifest = contract["trainable_manifest"]
     tensor_count = len(trainable)
     parameter_count = sum(parameter.numel() for parameter in trainable.values())
     if (
-        tensor_count != DSRL_TRAINABLE_TENSOR_COUNT
-        or parameter_count != DSRL_TRAINABLE_PARAMETER_COUNT
+        tensor_count != contract["trainable_tensor_count"]
+        or parameter_count != contract["trainable_parameter_count"]
     ):
         raise ValueError(
-            "OpenPI DSRL trainable sidecar requires exactly 220 tensors and "
-            "5,273,866 parameters; got "
+            "OpenPI DSRL trainable sidecar requires exactly "
+            f"{contract['trainable_tensor_count']} tensors and "
+            f"{int(contract['trainable_parameter_count']):,} parameters; got "
             f"{tensor_count} tensors and {parameter_count:,} parameters."
         )
-    expected_keys = set(DSRL_TRAINABLE_MANIFEST_V2)
+    expected_keys = set(manifest)
     actual_keys = set(trainable)
     missing_keys = sorted(expected_keys - actual_keys)
     unexpected_keys = sorted(actual_keys - expected_keys)
     shape_mismatches = {
         name: {
-            "expected": DSRL_TRAINABLE_MANIFEST_V2[name],
+            "expected": manifest[name],
             "actual": tuple(trainable[name].shape),
         }
         for name in expected_keys & actual_keys
-        if tuple(trainable[name].shape) != DSRL_TRAINABLE_MANIFEST_V2[name]
+        if tuple(trainable[name].shape) != manifest[name]
     }
     if missing_keys or unexpected_keys or shape_mismatches:
         raise ValueError(

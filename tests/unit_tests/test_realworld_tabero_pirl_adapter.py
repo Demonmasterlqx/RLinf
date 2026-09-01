@@ -460,6 +460,7 @@ def test_reset_skips_disabled_action_filter_for_full_and_selected_resets():
         "isaaclab_pi05_pirl_realworld_tabero_task6_2gpu_smoke",
         "isaaclab_pi05_pirl_realworld_tabero_tacimg_task6_2gpu_100step",
         "isaaclab_pi05_pirl_realworld_tabero_tacimg_task6_2gpu_smoke",
+        "isaaclab_pi05_pirl_realworld_tabero_tacimg_task6_step23000_2gpu_100step",
         "isaaclab_pi05_pirl_realworld_tabero_tacimg_task6_step23000_2gpu_smoke",
     ],
 )
@@ -499,8 +500,7 @@ def test_step23000_tacimg_pirl_smoke_pins_models_artifact_and_scope():
         cfg = compose(config_name=config_name)
 
     expected_model_path = (
-        "/data/home/sim6g/code/tabero/models/"
-        "pi05_realworld_replayed_task820_23000_lora"
+        "/data/home/sim6g/code/tabero/models/pi05_realworld_replayed_task820_23000_lora"
     )
     assert cfg.actor.model.model_path == expected_model_path
     assert cfg.rollout.model.model_path == expected_model_path
@@ -524,6 +524,65 @@ def test_step23000_tacimg_pirl_smoke_pins_models_artifact_and_scope():
     assert metadata.target_global_step == 1
     assert metadata.action_filter == "disabled"
     assert validate_embodied_cfg(cfg) is cfg
+
+
+def test_step23000_tacimg_pirl_100step_explicitly_opts_into_non_final_base():
+    config_name = (
+        "isaaclab_pi05_pirl_realworld_tabero_tacimg_task6_step23000_2gpu_100step"
+    )
+    config_source = OmegaConf.load(RLINF_CONFIG_DIR / f"{config_name}.yaml")
+    defaults = OmegaConf.to_container(config_source.defaults, resolve=False)
+    assert "isaaclab_pi05_pirl_realworld_tabero_tacimg_task6_2gpu_100step" not in (
+        defaults
+    )
+    with initialize_config_dir(version_base="1.1", config_dir=str(RLINF_CONFIG_DIR)):
+        cfg = compose(config_name=config_name)
+
+    expected_model_path = (
+        "/data/home/sim6g/code/tabero/models/pi05_realworld_replayed_task820_23000_lora"
+    )
+    assert cfg.actor.model.model_path == expected_model_path
+    assert cfg.rollout.model.model_path == expected_model_path
+    checkpoint_contract = cfg.actor.model.tabero_pi05_checkpoint_contract
+    assert checkpoint_contract.require_final is False
+    assert checkpoint_contract.allow_non_final_formal_training is True
+    assert checkpoint_contract.expected_model_sha256 == (
+        "9b506e72d643fb2df78f8aa1fd0f730d52df10566d247f6f2ea4a5010f1e6c15"
+    )
+    assert cfg.runner.max_epochs == 100
+    assert cfg.runner.save_interval == 10
+    assert cfg.actor.micro_batch_size == 1
+    assert cfg.actor.global_batch_size == 16
+    assert cfg.actor.fsdp_config.gradient_checkpointing is False
+    assert cfg.env.train.total_num_envs == 8
+    assert cfg.env.train.rollout_epoch == 2
+    assert cfg.cluster.component_placement.actor == "1"
+    assert cfg.cluster.component_placement.rollout == "0"
+    assert cfg.cluster.component_placement.env == "0"
+    metadata = cfg.actor.fsdp_config.trainable_checkpoint_metadata
+    assert metadata.base_checkpoint_require_final is False
+    assert metadata.base_checkpoint_allow_non_final_formal_training is True
+    assert metadata.base_checkpoint_global_step == 23000
+    assert metadata.base_checkpoint_target_global_step == 30000
+    assert metadata.base_checkpoint_is_final is False
+    assert metadata.training_config == config_name
+    assert metadata.target_global_step == 100
+    assert metadata.action_filter == "disabled"
+    assert validate_embodied_cfg(cfg) is cfg
+
+
+def test_step23000_tacimg_pirl_100step_rejects_missing_non_final_opt_in():
+    config_name = (
+        "isaaclab_pi05_pirl_realworld_tabero_tacimg_task6_step23000_2gpu_100step"
+    )
+    with initialize_config_dir(version_base="1.1", config_dir=str(RLINF_CONFIG_DIR)):
+        cfg = compose(config_name=config_name)
+
+    cfg.actor.model.tabero_pi05_checkpoint_contract.allow_non_final_formal_training = (
+        False
+    )
+    with pytest.raises(ValueError, match="allow_non_final_formal_training=true"):
+        validate_embodied_cfg(cfg)
 
 
 def test_action_filter_contract_rejects_state_and_metadata_drift():
@@ -615,9 +674,7 @@ def test_tacimg_smoke_config_preserves_50_prediction_10_execution_contract():
     assert metadata.tactile_input == "tactile_image"
     assert metadata.success_scene_task_id == 6
     assert list(metadata.semantic_task_ids) == [0, 2, 4]
-    assert metadata.reward_contract == (
-        "binary_success_plus_inverse_measured_force_v1"
-    )
+    assert metadata.reward_contract == ("binary_success_plus_inverse_measured_force_v1")
     assert metadata.force_reward_source == "policy_gripper_net_force"
 
 

@@ -41,15 +41,19 @@ from rlinf.utils.distributed import all_reduce_dict
 from rlinf.utils.dsrl_checkpoint import (
     DSRL_TRAINABLE_CHECKPOINT_VERSION,
     DSRL_TRAINABLE_MANIFEST_VERSION,
-    DSRL_TRAINABLE_PARAMETER_COUNT,
     build_compact_target_payload,
+    get_dsrl_checkpoint_contract,
     restore_target_payload,
     select_compact_target_parameters,
     select_dsrl_trainable_state,
     validate_target_payload_contract,
 )
 from rlinf.utils.dsrl_observation import DSRL_OBSERVATION_SEMANTICS
-from rlinf.utils.dsrl_replay import DSRL_REPLAY_BACKEND, DSRL_REPLAY_SEMANTICS
+from rlinf.utils.dsrl_replay import (
+    DSRL_REPLAY_BACKEND,
+    DSRL_REPLAY_SEMANTICS,
+    is_compact_dsrl_replay_semantics,
+)
 from rlinf.utils.dsrl_reward import (
     DSRL_REWARD_AUDIT_FIELDS,
     DSRL_REWARD_SEMANTICS,
@@ -93,7 +97,27 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         """Return whether the approved tactile selective DSRL mode is active."""
         if not self.use_dsrl:
             return False
-        return validate_dsrl_rollout_sync_config(self.cfg.actor) is not None
+        return validate_dsrl_rollout_sync_config(
+            self.cfg.actor
+        ) is not None and is_compact_dsrl_replay_semantics(
+            self._dsrl_replay_semantics()
+        )
+
+    def _dsrl_observation_semantics(self) -> str:
+        return self.cfg.get("algorithm", {}).get(
+            "dsrl_observation_semantics", DSRL_OBSERVATION_SEMANTICS
+        )
+
+    def _dsrl_transition_boundary_semantics(self) -> str:
+        return self.cfg.get("algorithm", {}).get(
+            "dsrl_transition_boundary_semantics",
+            DSRL_TRANSITION_BOUNDARY_SEMANTICS,
+        )
+
+    def _dsrl_replay_semantics(self) -> str:
+        return self.cfg.get("algorithm", {}).get(
+            "dsrl_replay_semantics", DSRL_REPLAY_SEMANTICS
+        )
 
     def get_rollout_state_dict(self) -> dict:
         """Return only actor-side DSRL parameters for rollout synchronization."""
@@ -106,7 +130,10 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         if prefixes is None:
             return super().get_rollout_state_dict()
         state_dict = select_named_parameters_by_prefix(self.model, prefixes)
-        validate_dsrl_rollout_state_dict(state_dict)
+        validate_dsrl_rollout_state_dict(
+            state_dict,
+            observation_semantics=self._dsrl_observation_semantics(),
+        )
         if list(state_dict) != self.param_names_need_sync:
             raise ValueError(
                 "OpenPI DSRL rollout sync parameter names changed after FSDP "
@@ -168,7 +195,10 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             rollout_state_dict = select_named_parameters_by_prefix(
                 module, self._rollout_sync_prefixes
             )
-            validate_dsrl_rollout_state_dict(rollout_state_dict)
+            validate_dsrl_rollout_state_dict(
+                rollout_state_dict,
+                observation_semantics=self._dsrl_observation_semantics(),
+            )
             self.param_names_need_sync = list(rollout_state_dict)
         else:
             self.param_names_need_sync = collect_param_names_need_sync(module)
@@ -325,9 +355,9 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         # Initialize replay buffer
         seed = self.cfg.actor.get("seed", 1234)
         replay_cfg = self.cfg.algorithm.replay_buffer
-        use_compact_dsrl_replay = (
-            self.use_dsrl
-            and self.cfg.algorithm.get("dsrl_replay_semantics") == DSRL_REPLAY_SEMANTICS
+        replay_semantics = self._dsrl_replay_semantics()
+        use_compact_dsrl_replay = self.use_dsrl and is_compact_dsrl_replay_semantics(
+            replay_semantics
         )
         if use_compact_dsrl_replay:
             if replay_cfg.get("backend") != DSRL_REPLAY_BACKEND:
@@ -342,6 +372,11 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                     "checkpoint_shard_transitions", 4096
                 ),
                 max_resident_gib=replay_cfg.get("max_resident_gib", 12.0),
+                replay_semantics=replay_semantics,
+                observation_semantics=self._dsrl_observation_semantics(),
+                transition_boundary_semantics=(
+                    self._dsrl_transition_boundary_semantics()
+                ),
             )
         else:
             auto_save_path = replay_cfg.get("auto_save_path", None)
@@ -432,7 +467,10 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         enough memory to OOM the no-shard configuration.
         """
         if self._compact_dsrl_checkpointing_enabled():
-            target_parameters = select_compact_target_parameters(self.target_model)
+            target_parameters = select_compact_target_parameters(
+                self.target_model,
+                observation_semantics=self._dsrl_observation_semantics(),
+            )
             self._target_shadow_f32 = {
                 name: parameter.detach().float().clone()
                 for name, parameter in target_parameters.items()
@@ -465,7 +503,14 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         state_dict = None
         local_error = None
         try:
-            state_dict = select_dsrl_trainable_state(self.model)
+            observation_semantics = self._dsrl_observation_semantics()
+            if observation_semantics == DSRL_OBSERVATION_SEMANTICS:
+                state_dict = select_dsrl_trainable_state(self.model)
+            else:
+                state_dict = select_dsrl_trainable_state(
+                    self.model,
+                    observation_semantics=observation_semantics,
+                )
         except Exception as error:  # noqa: BLE001
             local_error = f"{type(error).__name__}: {error}"
 
@@ -492,16 +537,18 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                     "world_size": world_size,
                     "format": "trainable_weights",
                     "reward_semantics": DSRL_REWARD_SEMANTICS,
-                    "observation_semantics": DSRL_OBSERVATION_SEMANTICS,
+                    "observation_semantics": self._dsrl_observation_semantics(),
                     "transition_boundary_semantics": (
-                        DSRL_TRANSITION_BOUNDARY_SEMANTICS
+                        self._dsrl_transition_boundary_semantics()
                     ),
-                    "replay_semantics": DSRL_REPLAY_SEMANTICS,
+                    "replay_semantics": self._dsrl_replay_semantics(),
                     "checkpoint_version": DSRL_TRAINABLE_CHECKPOINT_VERSION,
                     "manifest_version": DSRL_TRAINABLE_MANIFEST_VERSION,
                     "parameter_count": len(state_dict),
                     "tensor_count": len(state_dict),
-                    "total_parameter_count": DSRL_TRAINABLE_PARAMETER_COUNT,
+                    "total_parameter_count": get_dsrl_checkpoint_contract(
+                        self._dsrl_observation_semantics()
+                    )["trainable_parameter_count"],
                 }
                 configured_metadata = self._cfg.fsdp_config.get(
                     "trainable_checkpoint_metadata", None
@@ -553,6 +600,8 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             step=step,
             rank=self._rank,
             world_size=torch.distributed.get_world_size(),
+            observation_semantics=self._dsrl_observation_semantics(),
+            transition_boundary_semantics=(self._dsrl_transition_boundary_semantics()),
         )
         torch.save(payload, save_path)
 
@@ -563,6 +612,8 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             self.target_model,
             rank=self._rank,
             world_size=torch.distributed.get_world_size(),
+            observation_semantics=self._dsrl_observation_semantics(),
+            transition_boundary_semantics=(self._dsrl_transition_boundary_semantics()),
         )
         self._logger.info(f"[FSDP] Restored OpenPI DSRL target: {receipt}")
         return receipt
@@ -594,25 +645,28 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                 f"expected {DSRL_REWARD_SEMANTICS!r}, got {actual_semantics!r}. "
                 "Legacy checkpoints cannot be resumed."
             )
+        expected_observation_semantics = self._dsrl_observation_semantics()
         observation_semantics = payload["metadata"].get("observation_semantics")
-        if observation_semantics != DSRL_OBSERVATION_SEMANTICS:
+        if observation_semantics != expected_observation_semantics:
             raise ValueError(
                 "OpenPI DSRL checkpoint observation semantics mismatch: "
-                f"expected {DSRL_OBSERVATION_SEMANTICS!r}, got "
+                f"expected {expected_observation_semantics!r}, got "
                 f"{observation_semantics!r}. Legacy checkpoints cannot be resumed."
             )
+        expected_transition_semantics = self._dsrl_transition_boundary_semantics()
         transition_semantics = payload["metadata"].get("transition_boundary_semantics")
-        if transition_semantics != DSRL_TRANSITION_BOUNDARY_SEMANTICS:
+        if transition_semantics != expected_transition_semantics:
             raise ValueError(
                 "OpenPI DSRL checkpoint transition boundary semantics mismatch: "
-                f"expected {DSRL_TRANSITION_BOUNDARY_SEMANTICS!r}, got "
+                f"expected {expected_transition_semantics!r}, got "
                 f"{transition_semantics!r}. Legacy checkpoints cannot be resumed."
             )
+        expected_replay_semantics = self._dsrl_replay_semantics()
         replay_semantics = payload["metadata"].get("replay_semantics")
-        if replay_semantics != DSRL_REPLAY_SEMANTICS:
+        if replay_semantics != expected_replay_semantics:
             raise ValueError(
                 "OpenPI DSRL checkpoint replay semantics mismatch: "
-                f"expected {DSRL_REPLAY_SEMANTICS!r}, got "
+                f"expected {expected_replay_semantics!r}, got "
                 f"{replay_semantics!r}. Legacy checkpoints cannot be resumed."
             )
         checkpoint_version = payload["metadata"].get("checkpoint_version")
@@ -638,6 +692,9 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         CompactDSRLReplayBuffer.validate_checkpoint_metadata(
             replay_path,
             expected_capacity=self.cfg.algorithm.replay_buffer.capacity_transitions,
+            expected_replay_semantics=expected_replay_semantics,
+            expected_observation_semantics=expected_observation_semantics,
+            expected_transition_boundary_semantics=expected_transition_semantics,
         )
         target_path = os.path.join(
             load_path,
@@ -651,7 +708,11 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                 f"{target_path}"
             )
         target_payload = torch.load(target_path, map_location="cpu", weights_only=True)
-        validate_target_payload_contract(target_payload)
+        validate_target_payload_contract(
+            target_payload,
+            expected_observation_semantics=expected_observation_semantics,
+            expected_transition_boundary_semantics=expected_transition_semantics,
+        )
 
     def soft_update_target_model(self, tau: Optional[float] = None):
         """Soft update target model parameters.
