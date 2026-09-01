@@ -656,6 +656,32 @@ def test_step23000_tacimg_pirl_2xa100_1000step_contract():
     assert validate_embodied_cfg(cfg) is cfg
 
 
+def test_openpi_gradient_checkpointing_bridge_is_non_reentrant(monkeypatch):
+    base_class = OpenPi0ForRLActionPrediction.__mro__[1]
+    enable_calls = []
+    monkeypatch.setattr(
+        base_class,
+        "gradient_checkpointing_enable",
+        lambda self: enable_calls.append(self),
+    )
+    policy = object.__new__(OpenPi0ForRLActionPrediction)
+
+    policy.gradient_checkpointing_enable(
+        gradient_checkpointing_kwargs={"use_reentrant": False}
+    )
+    assert enable_calls == [policy]
+
+    with pytest.raises(ValueError, match="only supports use_reentrant=false"):
+        policy.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": True}
+        )
+
+    with pytest.raises(ValueError, match="unsupported options"):
+        policy.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"preserve_rng_state": True}
+        )
+
+
 def test_action_filter_contract_rejects_state_and_metadata_drift():
     disabled_cfg = _action_filter_contract_cfg(
         {"enabled": False},

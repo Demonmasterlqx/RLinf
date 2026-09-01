@@ -265,6 +265,26 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
 
     config: OpenPi0Config
 
+    def gradient_checkpointing_enable(
+        self,
+        gradient_checkpointing_kwargs: dict[str, Any] | None = None,
+    ) -> None:
+        """Bridge RLinf's checkpoint kwargs to OpenPI's non-reentrant API."""
+
+        checkpoint_kwargs = gradient_checkpointing_kwargs or {}
+        unsupported_kwargs = set(checkpoint_kwargs) - {"use_reentrant"}
+        if unsupported_kwargs:
+            raise ValueError(
+                "OpenPI gradient checkpointing received unsupported options: "
+                f"{sorted(unsupported_kwargs)}."
+            )
+        if checkpoint_kwargs.get("use_reentrant", False):
+            raise ValueError(
+                "OpenPI PI0Pytorch gradient checkpointing only supports "
+                "use_reentrant=false."
+            )
+        super().gradient_checkpointing_enable()
+
     @property
     def _no_split_modules(self) -> list[str]:
         if self.config.train_expert_only:
