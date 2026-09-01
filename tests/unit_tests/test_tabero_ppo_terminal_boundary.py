@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
+import inspect
+
 import pytest
 import torch
 from omegaconf import OmegaConf
@@ -31,6 +34,7 @@ from rlinf.utils.tabero_ppo_boundary import (
     validate_tabero_ppo_checkpoint_boundary_metadata,
 )
 from rlinf.utils.utils import preprocess_embodied_batch
+from rlinf.workers.actor import fsdp_actor_worker
 from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
 
 
@@ -40,6 +44,52 @@ def _primitive_dones() -> torch.Tensor:
     dones[1, 0, 0] = True
     dones[1, 1, 2] = True
     return dones
+
+
+def test_actor_releases_previous_rollout_batch_before_receiving_next(
+    monkeypatch,
+):
+    actor = object.__new__(EmbodiedFSDPActor)
+    actor.rollout_batch = {"previous": torch.ones(1)}
+    actor.stage_num = 1
+    actor._component_placement = type(
+        "Placement",
+        (),
+        {"get_world_size": lambda self, group_name: 1},
+    )()
+    actor._process_received_rollout_batch = lambda batch: batch
+    events = []
+
+    class _ReceiveHandle:
+        async def async_wait(self):
+            assert actor.rollout_batch is None
+            events.append("receive")
+            return object()
+
+    class _InputChannel:
+        def get(self, async_op):
+            assert async_op is True
+            return _ReceiveHandle()
+
+    monkeypatch.setattr(
+        fsdp_actor_worker,
+        "clear_memory",
+        lambda sync: events.append(("clear_memory", sync)),
+    )
+    monkeypatch.setattr(
+        fsdp_actor_worker,
+        "convert_trajectories_to_batch",
+        lambda trajectories: {"current": torch.ones(len(trajectories))},
+    )
+
+    asyncio.run(
+        inspect.unwrap(EmbodiedFSDPActor.recv_rollout_trajectories)(
+            actor, _InputChannel()
+        )
+    )
+
+    assert events == [("clear_memory", False), "receive"]
+    assert set(actor.rollout_batch) == {"current"}
 
 
 def test_prefix_masks_keep_terminal_primitive_and_mask_all_later_actions():

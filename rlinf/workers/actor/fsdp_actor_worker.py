@@ -1220,6 +1220,12 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         Args:
             input_channel: The input channel to read from.
         """
+        # The previous batch is no longer needed once its actor update has
+        # completed.  Release it before receiving the next trajectories so a
+        # full old and new CPU batch do not coexist during component offload.
+        # Clearing first would leave ``self.rollout_batch`` live and caused the
+        # host-memory high-water mark to grow at every global step.
+        self.rollout_batch = None
         clear_memory(sync=False)
 
         send_num = self._component_placement.get_world_size("env") * self.stage_num

@@ -602,8 +602,7 @@ def test_step23000_tacimg_pirl_2xa100_1000step_contract():
         cfg = compose(config_name=config_name)
 
     expected_model_path = (
-        "/data/home/sim6g/code/tabero/models/"
-        "pi05_realworld_replayed_task820_23000_lora"
+        "/data/home/sim6g/code/tabero/models/pi05_realworld_replayed_task820_23000_lora"
     )
     assert cfg.actor.model.model_path == expected_model_path
     assert cfg.rollout.model.model_path == expected_model_path
@@ -612,7 +611,7 @@ def test_step23000_tacimg_pirl_2xa100_1000step_contract():
     assert cfg.runner.val_check_interval == -1
     assert cfg.env.train.total_num_envs == 32
     assert cfg.env.train.rollout_epoch == 2
-    assert cfg.actor.micro_batch_size == 1
+    assert cfg.actor.micro_batch_size == 8
     assert cfg.actor.global_batch_size == 16
     assert cfg.actor.enable_offload is True
     assert cfg.rollout.enable_offload is True
@@ -645,6 +644,9 @@ def test_step23000_tacimg_pirl_2xa100_1000step_contract():
     assert metadata.training_config == config_name
     assert metadata.target_global_step == 1000
     assert metadata.selected_total_num_envs == 32
+    assert metadata.micro_batch_size == 8
+    assert metadata.global_batch_size == 16
+    assert metadata.gradient_accumulation_steps == 1
     assert metadata.optimizer_updates_per_global_step == 120
     assert metadata.target_optimizer_updates == 120000
     assert metadata.actor_component_offload is True
@@ -652,6 +654,10 @@ def test_step23000_tacimg_pirl_2xa100_1000step_contract():
     assert metadata.fsdp_cpu_offload is False
     assert metadata.gradient_checkpointing is True
     assert metadata.gradient_checkpointing_use_reentrant is False
+    assert (
+        metadata.host_memory_release_contract
+        == "release_previous_rollout_batch_before_receive_v1"
+    )
     assert metadata.action_filter == "disabled"
     assert validate_embodied_cfg(cfg) is cfg
 

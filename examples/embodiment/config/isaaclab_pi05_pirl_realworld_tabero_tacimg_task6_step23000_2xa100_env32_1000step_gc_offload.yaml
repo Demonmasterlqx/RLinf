@@ -110,7 +110,7 @@ rollout:
 actor:
   group_name: ActorGroup
   training_backend: fsdp
-  micro_batch_size: 1
+  micro_batch_size: 8
   global_batch_size: 16
   seed: 42
   enable_offload: true
@@ -249,6 +249,9 @@ actor:
       training_config: isaaclab_pi05_pirl_realworld_tabero_tacimg_task6_step23000_2xa100_env32_1000step_gc_offload
       target_global_step: 1000
       selected_total_num_envs: 32
+      micro_batch_size: 8
+      global_batch_size: 16
+      gradient_accumulation_steps: 1
       optimizer_updates_per_global_step: 120
       target_optimizer_updates: 120000
       hardware: 2x_a100_pcie_40gb
@@ -261,8 +264,11 @@ actor:
       gradient_checkpointing: true
       gradient_checkpointing_use_reentrant: false
       capacity_reference_total_num_envs: 32
-      capacity_reference_global_steps: 1
-      capacity_reference_gradient_checkpointing: false
+      capacity_reference_global_steps: 3
+      capacity_reference_gradient_checkpointing: true
+      capacity_reference_micro_batch_size: 1
+      capacity_reference_exit_reason: cgroup_memory_guard_150gb
+      host_memory_release_contract: release_previous_rollout_batch_before_receive_v1
       tabero_ppo_transition_boundary_semantics: terminal_observation_first_done_prefix_logprob_default_reset_v1
 
 reward:
