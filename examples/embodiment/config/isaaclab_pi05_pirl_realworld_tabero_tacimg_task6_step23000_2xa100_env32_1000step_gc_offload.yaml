@@ -268,7 +268,7 @@ actor:
       capacity_reference_gradient_checkpointing: true
       capacity_reference_micro_batch_size: 1
       capacity_reference_exit_reason: cgroup_memory_guard_150gb
-      host_memory_release_contract: release_previous_rollout_batch_before_receive_v1
+      host_memory_release_contract: release_actor_batch_and_await_trajectory_send_v2
       tabero_ppo_transition_boundary_semantics: terminal_observation_first_done_prefix_logprob_default_reset_v1
 
 reward:

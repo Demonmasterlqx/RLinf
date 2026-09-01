@@ -656,7 +656,7 @@ def test_step23000_tacimg_pirl_2xa100_1000step_contract():
     assert metadata.gradient_checkpointing_use_reentrant is False
     assert (
         metadata.host_memory_release_contract
-        == "release_previous_rollout_batch_before_receive_v1"
+        == "release_actor_batch_and_await_trajectory_send_v2"
     )
     assert metadata.action_filter == "disabled"
     assert validate_embodied_cfg(cfg) is cfg
