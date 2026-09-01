@@ -462,6 +462,7 @@ def test_reset_skips_disabled_action_filter_for_full_and_selected_resets():
         "isaaclab_pi05_pirl_realworld_tabero_tacimg_task6_2gpu_smoke",
         "isaaclab_pi05_pirl_realworld_tabero_tacimg_task6_step23000_2gpu_100step",
         "isaaclab_pi05_pirl_realworld_tabero_tacimg_task6_step23000_2gpu_smoke",
+        "isaaclab_pi05_pirl_realworld_tabero_tacimg_task6_step23000_2xa100_env32_1000step_gc_offload",
     ],
 )
 def test_realworld_configs_disable_action_filter_by_default(config_name):
@@ -583,6 +584,76 @@ def test_step23000_tacimg_pirl_100step_rejects_missing_non_final_opt_in():
     )
     with pytest.raises(ValueError, match="allow_non_final_formal_training=true"):
         validate_embodied_cfg(cfg)
+
+
+def test_step23000_tacimg_pirl_2xa100_1000step_contract():
+    config_name = (
+        "isaaclab_pi05_pirl_realworld_tabero_tacimg_task6_step23000_"
+        "2xa100_env32_1000step_gc_offload"
+    )
+    config_source = OmegaConf.load(RLINF_CONFIG_DIR / f"{config_name}.yaml")
+    defaults = OmegaConf.to_container(config_source.defaults, resolve=False)
+    assert (
+        "isaaclab_pi05_pirl_realworld_tabero_tacimg_task6_step23000_2gpu_100step"
+        not in defaults
+    )
+
+    with initialize_config_dir(version_base="1.1", config_dir=str(RLINF_CONFIG_DIR)):
+        cfg = compose(config_name=config_name)
+
+    expected_model_path = (
+        "/data/home/sim6g/code/tabero/models/"
+        "pi05_realworld_replayed_task820_23000_lora"
+    )
+    assert cfg.actor.model.model_path == expected_model_path
+    assert cfg.rollout.model.model_path == expected_model_path
+    assert cfg.runner.max_epochs == 1000
+    assert cfg.runner.save_interval == 100
+    assert cfg.runner.val_check_interval == -1
+    assert cfg.env.train.total_num_envs == 32
+    assert cfg.env.train.rollout_epoch == 2
+    assert cfg.actor.micro_batch_size == 1
+    assert cfg.actor.global_batch_size == 16
+    assert cfg.actor.enable_offload is True
+    assert cfg.rollout.enable_offload is True
+    assert cfg.cluster.component_placement.actor == "0-1"
+    assert cfg.cluster.component_placement.rollout == "0-1"
+    assert cfg.cluster.component_placement.env == "0-1"
+
+    fsdp_cfg = cfg.actor.fsdp_config
+    assert fsdp_cfg.sharding_strategy == "no_shard"
+    assert fsdp_cfg.gradient_checkpointing is True
+    assert fsdp_cfg.gradient_checkpointing_use_reentrant is False
+    assert fsdp_cfg.cpu_offload is False
+    assert fsdp_cfg.offload_pin_memory is False
+    assert fsdp_cfg.amp_autocast.enabled is True
+    assert fsdp_cfg.amp_autocast.precision == "bf16"
+
+    assert cfg.actor.optim.lr == pytest.approx(1.0e-6)
+    assert cfg.actor.optim.value_lr == pytest.approx(1.0e-4)
+    assert cfg.actor.optim.lr_scheduler == "constant"
+    assert cfg.actor.optim.lr_warmup_steps == 0
+    assert cfg.actor.optim.total_training_steps == 1000
+
+    checkpoint_contract = cfg.actor.model.tabero_pi05_checkpoint_contract
+    assert checkpoint_contract.require_final is False
+    assert checkpoint_contract.allow_non_final_formal_training is True
+    assert checkpoint_contract.expected_model_sha256 == (
+        "9b506e72d643fb2df78f8aa1fd0f730d52df10566d247f6f2ea4a5010f1e6c15"
+    )
+    metadata = fsdp_cfg.trainable_checkpoint_metadata
+    assert metadata.training_config == config_name
+    assert metadata.target_global_step == 1000
+    assert metadata.selected_total_num_envs == 32
+    assert metadata.optimizer_updates_per_global_step == 120
+    assert metadata.target_optimizer_updates == 120000
+    assert metadata.actor_component_offload is True
+    assert metadata.rollout_component_offload is True
+    assert metadata.fsdp_cpu_offload is False
+    assert metadata.gradient_checkpointing is True
+    assert metadata.gradient_checkpointing_use_reentrant is False
+    assert metadata.action_filter == "disabled"
+    assert validate_embodied_cfg(cfg) is cfg
 
 
 def test_action_filter_contract_rejects_state_and_metadata_drift():
