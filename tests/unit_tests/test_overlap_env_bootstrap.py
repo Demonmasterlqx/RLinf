@@ -14,7 +14,7 @@
 
 import sys
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import torch
 from omegaconf import OmegaConf
@@ -225,6 +225,35 @@ class TestOverlapEnvBootstrap(unittest.TestCase):
         self.assertTrue(
             torch.equal(env_metrics["episode_len"][1], torch.tensor([7, 8]))
         )
+
+    def test_send_rollout_trajectories_waits_for_async_puts(self):
+        """Trajectory sends must finish before their source buffers are released."""
+        self.worker.actor_split_num = 2
+        trajectories = [MagicMock(), MagicMock()]
+        rollout_result = MagicMock()
+        rollout_result.to_splited_trajectories.return_value = trajectories
+
+        put_works = [
+            MagicMock(async_wait=AsyncMock()),
+            MagicMock(async_wait=AsyncMock()),
+        ]
+        channel = MagicMock()
+        channel.put.side_effect = put_works
+
+        import asyncio
+
+        asyncio.run(self.worker.send_rollout_trajectories(rollout_result, channel))
+
+        rollout_result.clear.assert_called_once_with()
+        self.assertEqual(
+            channel.put.call_args_list,
+            [
+                unittest.mock.call(trajectories[0], async_op=True),
+                unittest.mock.call(trajectories[1], async_op=True),
+            ],
+        )
+        for put_work in put_works:
+            put_work.async_wait.assert_awaited_once_with()
 
     def test_interact_records_metrics_only_on_final_chunk_when_not_auto_reset(self):
         """Non-auto-reset training should record episode metrics only once per rollout epoch."""

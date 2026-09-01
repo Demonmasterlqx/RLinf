@@ -1171,7 +1171,9 @@ class EnvWorker(Worker):
         )
         rollout_result.clear()
         for trajectory in trajectories:
-            channel.put(trajectory, async_op=True)
+            put_work = channel.put(trajectory, async_op=True)
+            if put_work is not None:
+                await put_work.async_wait()
         del trajectories
         gc.collect()
 
