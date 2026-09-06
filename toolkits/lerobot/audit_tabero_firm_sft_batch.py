@@ -1,4 +1,18 @@
 #!/usr/bin/env python3
+# Copyright 2026 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Audit raw and model-side shapes for the Tabero Firm OpenPI SFT pipeline."""
 
 from __future__ import annotations
@@ -79,11 +93,22 @@ def audit_batch(
         "tactile_prefix": _shape(training_input["tactile_prefix"]),
     }
     tactile_history = config.model.tactile_prefix_history
-    tactile_feature_dim = config.model.tactile_prefix_dim_in // tactile_history
+    tactile_steps = (
+        tactile_history + 1
+        if config.model.tactile_prefix_use_reference_frame
+        else tactile_history
+    )
+    if config.model.tactile_prefix_dim_in % tactile_steps != 0:
+        raise ValueError(
+            "TacField input dimension is not divisible by its effective history "
+            f"length: dim={config.model.tactile_prefix_dim_in}, "
+            f"steps={tactile_steps}"
+        )
+    tactile_feature_dim = config.model.tactile_prefix_dim_in // tactile_steps
     expected_training_input_shapes = {
         "state": [7],
         "actions": [config.model.action_horizon, config.model.effective_action_dim],
-        "tactile_prefix": [tactile_history, tactile_feature_dim],
+        "tactile_prefix": [tactile_steps, tactile_feature_dim],
     }
     if training_input_shapes != expected_training_input_shapes:
         raise ValueError(
@@ -104,7 +129,7 @@ def audit_batch(
     expected_model_shapes = {
         "state": [32],
         "actions": [config.model.action_horizon, config.model.action_dim],
-        "tactile_prefix": [tactile_history, tactile_feature_dim],
+        "tactile_prefix": [tactile_steps, tactile_feature_dim],
     }
     if model_shapes != expected_model_shapes:
         raise ValueError(

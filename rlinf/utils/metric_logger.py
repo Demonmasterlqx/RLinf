@@ -41,6 +41,12 @@ class MetricLogger:
         self.log_path = logger_cfg.get("log_path", "logs")
         self.project_name = logger_cfg.get("project_name", "rlinf")
         self.experiment_name = logger_cfg.get("experiment_name", "default")
+        log_start_step = logger_cfg.get("log_start_step", None)
+        self.log_start_step = (
+            int(log_start_step) if log_start_step is not None else None
+        )
+        if self.log_start_step is not None and self.log_start_step < 0:
+            raise ValueError("runner.logger.log_start_step must be non-negative")
         self.per_worker_log = bool(cfg.runner.get("per_worker_log", False))
         self.per_worker_log_root = cfg.runner.get(
             "per_worker_log_path", os.path.join(self.log_path, "worker_logs")
@@ -151,6 +157,8 @@ class MetricLogger:
         worker_group_name: str | None = None,
         rank: int | None = None,
     ):
+        if self.log_start_step is not None and int(step) < self.log_start_step:
+            return
         target_logger = self.logger
         if self.per_worker_log and worker_group_name is not None and rank is not None:
             target_logger = self._get_scoped_logger(

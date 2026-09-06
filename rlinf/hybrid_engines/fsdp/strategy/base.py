@@ -241,10 +241,19 @@ class FSDPStrategyBase(ABC):
                     from torch.distributed import checkpoint as dcp
 
                     dcp_save_path = os.path.join(save_path, "dcp_checkpoint")
-                    dcp.save(
-                        {"fsdp_checkpoint": training_state},
-                        checkpoint_id=dcp_save_path,
-                    )
+                    # DCP serializes its save plans as Python objects. Keep those
+                    # object collectives on CPU, matching the DCP load path below,
+                    # instead of staging them on CUDA through the default NCCL
+                    # process group.
+                    dcp_process_group = torch.distributed.new_group(backend="gloo")
+                    try:
+                        dcp.save(
+                            {"fsdp_checkpoint": training_state},
+                            checkpoint_id=dcp_save_path,
+                            process_group=dcp_process_group,
+                        )
+                    finally:
+                        torch.distributed.destroy_process_group(dcp_process_group)
                 else:
                     raise ValueError(
                         f"Unsupported checkpoint_format: {checkpoint_format}"

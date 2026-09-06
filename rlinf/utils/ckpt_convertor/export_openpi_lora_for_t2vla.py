@@ -245,6 +245,13 @@ def _copy_norm_stats(
     norm_stats_path: str | Path, output_dir: str | Path, asset_id: str
 ) -> None:
     """Install explicit dataset statistics into a deployable OpenPI export."""
+    asset_path = Path(asset_id)
+    if asset_path.is_absolute() or any(
+        part in {"", ".", ".."} for part in asset_path.parts
+    ):
+        raise ValueError(
+            f"Normalization asset id must be a safe relative path: {asset_id!r}"
+        )
     source = Path(norm_stats_path).expanduser().resolve()
     if source.is_dir():
         source = source / "norm_stats.json"
@@ -729,10 +736,11 @@ def _build_export_metadata(
             "datas/replay_firm_tabero_xarm_gripper",
             "datas/replay_firm_tabero_xarm_gripper_repaired_v1",
             "datas/realworld_replayed_task820_firm",
+            "datasets/realworld_replayed_task820_firm",
+            "datasets/realworld_replay_task820_firm_mixed",
         }:
             raise ValueError(
-                "Tabero SFT checkpoint provenance dataset is unsupported: "
-                f"{dataset!r}."
+                f"Tabero SFT checkpoint provenance dataset is unsupported: {dataset!r}."
             )
         if dataset == "datas/tabero_firm":
             if checkpoint_meta.get("training_precision") != "fp32":
@@ -991,6 +999,7 @@ def export_checkpoint(
     save_adapter: bool,
     allow_non_final: bool = False,
     bundle_dir: str | None = None,
+    norm_asset_aliases: tuple[str, ...] = (),
 ) -> None:
     model_cfg = _load_model_cfg(train_config_path)
     if not model_cfg.get("is_lora", False):
@@ -1092,12 +1101,16 @@ def export_checkpoint(
         norm_stats_source, norm_asset_id = _resolve_norm_stats_source(
             model_cfg, checkpoint_meta
         )
+        norm_asset_aliases = tuple(dict.fromkeys(norm_asset_aliases))
         if is_tabero_sft:
             if norm_stats_source is None:
                 raise ValueError(
                     "Tabero SFT export requires openpi_data.norm_stats_path."
                 )
             _copy_norm_stats(norm_stats_source, output_path, norm_asset_id)
+            for alias in norm_asset_aliases:
+                if alias != norm_asset_id:
+                    _copy_norm_stats(norm_stats_source, output_path, alias)
         if bundle_staging is not None and norm_stats_source is None:
             raise ValueError(
                 "LoRA bundle export requires actor.model.openpi_data.norm_stats_path."
@@ -1118,6 +1131,10 @@ def export_checkpoint(
             adapter_dirs=adapter_dir_names if save_adapter else [],
             allow_non_final=allow_non_final,
         )
+        if norm_stats_source is not None:
+            export_metadata["normalization_asset_id"] = norm_asset_id
+            export_metadata["normalization_asset_aliases"] = list(norm_asset_aliases)
+            export_metadata["norm_stats_sha256"] = _sha256_file(norm_stats_source)
         with (output_path / "export_meta.json").open("w", encoding="utf-8") as f:
             json.dump(export_metadata, f, indent=2)
 
@@ -1190,6 +1207,15 @@ def main() -> None:
             "intermediate evaluation while preserving is_final=false provenance."
         ),
     )
+    parser.add_argument(
+        "--norm_asset_alias",
+        action="append",
+        default=[],
+        help=(
+            "Additional checkpoint-local asset id that should contain the same "
+            "normalization statistics. May be repeated."
+        ),
+    )
     args = parser.parse_args()
 
     export_checkpoint(
@@ -1199,6 +1225,7 @@ def main() -> None:
         save_adapter=not args.no_save_adapter,
         allow_non_final=args.allow_non_final,
         bundle_dir=args.bundle_dir,
+        norm_asset_aliases=tuple(args.norm_asset_alias),
     )
 
 
