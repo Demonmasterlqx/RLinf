@@ -34,6 +34,9 @@ import torch
 from omegaconf import open_dict
 
 from rlinf.envs.isaaclab.utils import quat2axisangle_torch
+from rlinf.utils.tabero_ppo_boundary import (
+    TABERO_XARM_GRIPPER_TRAVEL_M,
+)
 
 from ..isaaclab_env import IsaaclabBaseEnv
 from .tabero_force_reward import (
@@ -63,6 +66,8 @@ _EPISODE_FORCE_COUNT_KEY = "force_valid_sample_count"
 _EPISODE_FORCE_BONUS_KEY = "force_bonus"
 _EXECUTED_CHUNK_ACTIONS_KEY = "_tabero_executed_chunk_actions"
 _RAW_CHUNK_ACTIONS_KEY = "_tabero_raw_chunk_actions"
+_EXECUTED_ACTION_KEY = "_tabero_executed_action"
+_CONTROLLER_DEBUG_KEY = "_tabero_controller_debug"
 
 REALWORLD_TARGET_PROMPTS = {
     "target_object_1": "pick up the Vitasoy and put it into the basket",
@@ -72,6 +77,53 @@ REALWORLD_TARGET_PROMPTS = {
 REALWORLD_BASKET_OBJECT = "target_object_4"
 REALWORLD_CAMERA_SOURCE_HW = (480, 640)
 REALWORLD_CAMERA_TARGET_HW = (224, 224)
+
+
+def map_xarm_sim_gripper_observation_to_model(
+    gripper_position: torch.Tensor,
+) -> torch.Tensor:
+    """Map XArm metres ``0=open, travel=closed`` to model units ``0=closed, 1=open``."""
+
+    position = torch.as_tensor(gripper_position)
+    if not position.is_floating_point() or not torch.isfinite(position).all():
+        raise ValueError("XArm gripper observations must be finite floating point.")
+    closing_fraction = torch.clamp(
+        position.abs() / TABERO_XARM_GRIPPER_TRAVEL_M, 0.0, 1.0
+    )
+    return 1.0 - closing_fraction
+
+
+def map_model_gripper_unit_to_xarm_sim(
+    gripper_unit: torch.Tensor,
+) -> torch.Tensor:
+    """Map model units ``0=closed, 1=open`` to XArm metres ``0=open, travel=closed``."""
+
+    unit = torch.as_tensor(gripper_unit)
+    if not unit.is_floating_point() or not torch.isfinite(unit).all():
+        raise ValueError("Model gripper actions must be finite floating point.")
+    return (1.0 - torch.clamp(unit, 0.0, 1.0)) * TABERO_XARM_GRIPPER_TRAVEL_M
+
+
+def map_model_actions_to_xarm_sim(
+    actions: torch.Tensor,
+    *,
+    gripper_index: int = 6,
+) -> torch.Tensor:
+    """Copy model-space actions and convert only their gripper coordinate."""
+
+    action_tensor = torch.as_tensor(actions)
+    if action_tensor.ndim < 1 or not 0 <= gripper_index < action_tensor.shape[-1]:
+        raise ValueError(
+            "Actions must contain the requested gripper coordinate; "
+            f"got shape {tuple(action_tensor.shape)} and index {gripper_index}."
+        )
+    if not action_tensor.is_floating_point() or not torch.isfinite(action_tensor).all():
+        raise ValueError("Model actions must be finite floating point.")
+    mapped = action_tensor.clone()
+    mapped[..., gripper_index] = map_model_gripper_unit_to_xarm_sim(
+        mapped[..., gripper_index]
+    )
+    return mapped
 
 
 def _clone_nested(value: Any) -> Any:
@@ -296,6 +348,13 @@ class _TerminalObservationCapture:
         infos = dict(infos or {})
         infos[_TERMINAL_RAW_OBSERVATION_KEY] = self._captured_observation
         infos[_TERMINAL_OBSERVATION_MASK_KEY] = self._captured_mask.clone()
+        try:
+            action_term = self._env.action_manager.get_term("arm_action")
+            controller_debug = getattr(action_term, "debug_info", {})
+        except (AttributeError, KeyError, ValueError):
+            controller_debug = {}
+        if controller_debug:
+            infos[_CONTROLLER_DEBUG_KEY] = controller_debug
         if self._force_reward_term is not None:
             infos[_TERMINAL_FORCE_MEAN_KEY] = self._captured_force_mean.clone()
             infos[_TERMINAL_FORCE_COUNT_KEY] = self._captured_force_count.clone()
@@ -441,8 +500,6 @@ def _camera_rgb_observation(env: Any, camera_name: str) -> torch.Tensor:
 
 def _validate_hybrid_action_cfg(
     isaac_env_cfg: Any,
-    *,
-    require_policy_gripper_sign_bridge: bool,
 ) -> None:
     actions_cfg = getattr(isaac_env_cfg, "actions", None)
     arm_action = getattr(actions_cfg, "arm_action", None)
@@ -452,17 +509,13 @@ def _validate_hybrid_action_cfg(
         getattr(base_class, "__name__", "")
         for base_class in getattr(action_class, "__mro__", ())
     }
-    if "ForcePositionAction" not in action_mro_names:
-        raise ValueError(
-            "RealWorld Task 6 requires the 13D ForcePositionAction controller."
-        )
-    if require_policy_gripper_sign_bridge and (
-        getattr(action_class, "__name__", None)
-        != "XarmPolicyGripperSignBridgeForcePositionAction"
+    if (
+        "ForcePositionAction" not in action_mro_names
+        or getattr(action_class, "__name__", None) != "ForcePositionAction"
     ):
         raise ValueError(
-            "RealWorld legacy Tabero normalization requires the XArm policy "
-            "gripper sign bridge action term."
+            "RealWorld Task 6 requires the exact 13D ForcePositionAction "
+            "controller without a legacy gripper bridge."
         )
     if gripper_action is not None:
         raise ValueError(
@@ -472,19 +525,9 @@ def _validate_hybrid_action_cfg(
     controller_cfg = getattr(ik_cfg, "controller", None)
     if bool(getattr(controller_cfg, "use_relative_mode", True)):
         raise ValueError("RealWorld Hybrid control requires absolute EEF poses.")
-    if require_policy_gripper_sign_bridge:
-        observations_cfg = getattr(isaac_env_cfg, "observations", None)
-        policy_cfg = getattr(observations_cfg, "policy", None)
-        gripper_pos_cfg = getattr(policy_cfg, "gripper_pos", None)
-        gripper_pos_func = getattr(gripper_pos_cfg, "func", None)
-        if getattr(gripper_pos_func, "__name__", None) != "policy_gripper_pos":
-            raise ValueError(
-                "RealWorld legacy Tabero normalization requires the policy "
-                "gripper sign bridge observation term."
-            )
-
-
-def _build_state(policy_obs: dict[str, torch.Tensor]) -> torch.Tensor:
+def _build_state(
+    policy_obs: dict[str, torch.Tensor],
+) -> torch.Tensor:
     eef_pose = policy_obs.get("eef_pose")
     gripper_pos = policy_obs.get("gripper_pos")
     if eef_pose is None or tuple(eef_pose.shape[1:]) != (7,):
@@ -501,9 +544,10 @@ def _build_state(policy_obs: dict[str, torch.Tensor]) -> torch.Tensor:
     position = eef_pose[:, :3]
     quaternion_xyzw = eef_pose[:, 3:7][:, [1, 2, 3, 0]]
     axis_angle = quat2axisangle_torch(quaternion_xyzw)
-    gripper_scalar = (
+    gripper_scalar_sim = (
         gripper_pos[:, None] if gripper_pos.ndim == 1 else gripper_pos[:, :1]
     )
+    gripper_scalar = map_xarm_sim_gripper_observation_to_model(gripper_scalar_sim)
     state = torch.cat([position, axis_angle, gripper_scalar], dim=1).to(
         dtype=torch.float32
     )
@@ -1219,20 +1263,6 @@ class IsaaclabRealWorldTaberoTacFieldEnv(IsaaclabBaseEnv):
             _cfg_get(success_cfg, "force_bonus", None), terminal_reward
         )
 
-        policy_gripper_sign_bridge = _cfg_get(
-            init_params, "policy_gripper_sign_bridge", False
-        )
-        if not isinstance(policy_gripper_sign_bridge, bool):
-            raise ValueError(
-                "RealWorld init_params.policy_gripper_sign_bridge must be boolean."
-            )
-        if policy_gripper_sign_bridge:
-            raise ValueError(
-                "RealWorld XArm-gripper PiRL requires "
-                "policy_gripper_sign_bridge=false; use a dedicated legacy preset "
-                "for negative-open checkpoints."
-            )
-
         target_object = str(_cfg_get(init_params, "target_object", "")).strip()
         configured_task_description = str(
             _cfg_get(init_params, "task_description", "")
@@ -1303,7 +1333,14 @@ class IsaaclabRealWorldTaberoTacFieldEnv(IsaaclabBaseEnv):
         self._config_dir = _required_directory(init_params, "realworld_config_dir")
         self._assets_dir = _required_directory(init_params, "realworld_assets_dir")
         self._tactile_backend = tactile_backend
-        self._policy_gripper_sign_bridge = policy_gripper_sign_bridge
+        diagnostics_path = str(
+            _cfg_get(init_params, "gripper_diagnostics_path", "")
+        ).strip()
+        self._gripper_diagnostics_path = (
+            Path(diagnostics_path).expanduser().resolve()
+            if diagnostics_path
+            else None
+        )
         self._target_object = target_object
         self._reset_source = reset_source
         self._required_success_steps = required_success_steps
@@ -1357,20 +1394,7 @@ class IsaaclabRealWorldTaberoTacFieldEnv(IsaaclabBaseEnv):
                 isaac_env_cfg = load_cfg_from_registry(
                     self.isaaclab_env_id, "env_cfg_entry_point"
                 )
-                if not hasattr(isaac_env_cfg, "policy_gripper_sign_bridge"):
-                    raise ValueError(
-                        "Tabero_X RealWorld EnvCfg does not expose "
-                        "policy_gripper_sign_bridge."
-                    )
-                isaac_env_cfg.policy_gripper_sign_bridge = (
-                    self._policy_gripper_sign_bridge
-                )
-                _validate_hybrid_action_cfg(
-                    isaac_env_cfg,
-                    require_policy_gripper_sign_bridge=(
-                        self._policy_gripper_sign_bridge
-                    ),
-                )
+                _validate_hybrid_action_cfg(isaac_env_cfg)
                 success_term_cfg = getattr(
                     getattr(isaac_env_cfg, "terminations", None),
                     "success",
@@ -1576,6 +1600,7 @@ class IsaaclabRealWorldTaberoTacFieldEnv(IsaaclabBaseEnv):
             obs, reward, step_terminations, step_truncations, infos = (
                 self._terminal_safe_step(actions, active_mask=active_mask)
             )
+            executed_action = infos.pop(_EXECUTED_ACTION_KEY)
             latest_hold_state = infos.pop("_realworld_hold_state")
             terminal_capture = infos.pop("_realworld_terminal_capture")
             newly_done = (step_terminations | step_truncations) & active_mask
@@ -1591,7 +1616,7 @@ class IsaaclabRealWorldTaberoTacFieldEnv(IsaaclabBaseEnv):
             rewards.append(reward)
             terminations.append(step_terminations)
             truncations.append(step_truncations)
-            executed_actions.append(actions)
+            executed_actions.append(executed_action)
 
         chunk_rewards = torch.stack(rewards, dim=1)
         chunk_terminations = torch.stack(terminations, dim=1)
@@ -1649,13 +1674,15 @@ class IsaaclabRealWorldTaberoTacFieldEnv(IsaaclabBaseEnv):
                 f"({self.num_envs},); got {tuple(active_mask.shape)}."
             )
 
+        executed_actions = map_model_actions_to_xarm_sim(actions)
         raw_obs, reward, raw_terminations, raw_truncations, raw_infos = self.env.step(
-            actions
+            executed_actions
         )
         reward = reward.clone()
         raw_terminations = raw_terminations.clone().to(dtype=torch.bool)
         raw_truncations = raw_truncations.clone().to(dtype=torch.bool)
         raw_infos = dict(raw_infos or {})
+        controller_debug = raw_infos.pop(_CONTROLLER_DEBUG_KEY, {})
         captured_raw_obs = raw_infos.pop(_TERMINAL_RAW_OBSERVATION_KEY, None)
         captured_mask = torch.as_tensor(
             raw_infos.pop(
@@ -1727,9 +1754,58 @@ class IsaaclabRealWorldTaberoTacFieldEnv(IsaaclabBaseEnv):
             infos["_final_observation"] = newly_done.clone()
             infos["_elapsed_steps"] = newly_done.clone()
 
+        infos[_EXECUTED_ACTION_KEY] = executed_actions
         infos["_realworld_hold_state"] = _build_state(raw_obs["policy"])
+        if controller_debug:
+            infos[_CONTROLLER_DEBUG_KEY] = controller_debug
+        self._append_gripper_diagnostics(
+            actions=actions,
+            executed_actions=executed_actions,
+            hold_state=infos["_realworld_hold_state"],
+            active_mask=active_mask,
+            controller_debug=controller_debug,
+        )
         infos["_realworld_terminal_capture"] = terminal_capture_mask.clone()
         return obs, reward, terminations, truncations, infos
+
+    def _append_gripper_diagnostics(
+        self,
+        *,
+        actions: torch.Tensor,
+        executed_actions: torch.Tensor,
+        hold_state: torch.Tensor,
+        active_mask: torch.Tensor,
+        controller_debug: dict[str, Any],
+    ) -> None:
+        path = getattr(self, "_gripper_diagnostics_path", None)
+        if path is None:
+            return
+
+        def values(value: Any) -> Any:
+            if isinstance(value, torch.Tensor):
+                return value.detach().to(device="cpu").tolist()
+            if hasattr(value, "tolist"):
+                return value.tolist()
+            return value
+
+        measured_q = (
+            1.0 - hold_state[:, 6].clamp(0.0, 1.0)
+        ) * TABERO_XARM_GRIPPER_TRAVEL_M
+        record = {
+            "primitive_step": values(self._elapsed_steps),
+            "active": values(active_mask),
+            "policy_u": values(actions[:, 6]),
+            "sim_q": values(executed_actions[:, 6]),
+            "measured_q": values(measured_q),
+            "d_pred": values(controller_debug.get("d_pred")),
+            "d_cmd": values(controller_debug.get("d_cmd")),
+            "target_squeeze": values(controller_debug.get("f_sq_pred")),
+            "measured_squeeze": values(controller_debug.get("f_sq_meas")),
+            "measured_squeeze_raw": values(controller_debug.get("f_sq_meas_raw")),
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as file:
+            file.write(json.dumps(record, allow_nan=False) + "\n")
 
     @staticmethod
     def _build_hold_actions(

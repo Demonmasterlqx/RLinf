@@ -1,0 +1,23 @@
+defaults:
+  - isaaclab_pi05_pirl_realworld_tabero_tacimg_task6_step23000_uniform_randomization_shared_sim_smoke
+  - _self_
+
+runner:
+  logger:
+    experiment_name: ${oc.env:REALWORLD_TABERO_WIDE_LIGHT_RUN_ID}
+
+env:
+  train:
+    init_params:
+      realworld_config_dir: /home_shared/rashare/qixuan/Tabero/RLinf/examples/embodiment/config/env/realworld_profiles/gentle_grasp_task6_wide_light_randomization
+  eval:
+    init_params:
+      realworld_config_dir: /home_shared/rashare/qixuan/Tabero/RLinf/examples/embodiment/config/env/realworld_profiles/gentle_grasp_task6_wide_light_randomization
+
+actor:
+  fsdp_config:
+    trainable_checkpoint_metadata:
+      training_config: isaaclab_pi05_pirl_realworld_tabero_tacimg_task6_step23000_wide_light_randomization_shared_sim_smoke
+      randomization_profile: gentle_grasp_task6_wide_light_randomization
+      light_intensity_range: [400.0, 4000.0]
+      fill_light_intensity_range: [40.0, 1200.0]

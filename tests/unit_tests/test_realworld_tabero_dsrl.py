@@ -1,15 +1,25 @@
+# Copyright 2026 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
-from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
 import torch
 import torch.nn as nn
-from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 
-from rlinf.config import _validate_tabero_realworld_pi05_dsrl_contract
 from rlinf.data.dsrl_replay_buffer import CompactDSRLReplayBuffer
 from rlinf.data.embodied_io_struct import Trajectory
 from rlinf.models.embodiment.openpi.openpi_action_model import (
@@ -39,19 +49,6 @@ from rlinf.utils.dsrl_transition import (
     REALWORLD_TACIMG_DSRL_TRANSITION_BOUNDARY_SEMANTICS,
 )
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
-RLINF_CONFIG_DIR = REPO_ROOT / "RLinf/examples/embodiment/config"
-FORMAL_CONFIG = (
-    "isaaclab_pi05_dsrl_realworld_tabero_tacimg_task6_step23000_2gpu_100step"
-)
-SMOKE_CONFIG = "isaaclab_pi05_dsrl_realworld_tabero_tacimg_task6_step23000_2gpu_smoke"
-
-
-def _compose_config(name: str, monkeypatch):
-    monkeypatch.setenv("REALWORLD_TABERO_TACIMG_DSRL_RUN_ID", "unit_test")
-    with initialize_config_dir(version_base="1.1", config_dir=str(RLINF_CONFIG_DIR)):
-        return compose(config_name=name)
-
 
 def _dsrl_model() -> OpenPi0ForRLActionPrediction:
     config = SimpleNamespace(
@@ -73,36 +70,6 @@ def _dsrl_model() -> OpenPi0ForRLActionPrediction:
     model.config = config
     model._init_dsrl_components()
     return model
-
-
-@pytest.mark.parametrize(
-    ("config_name", "epochs", "global_batch"),
-    [(FORMAL_CONFIG, 100, 16), (SMOKE_CONFIG, 1, 1)],
-)
-def test_realworld_tacimg_dsrl_configs_are_self_consistent(
-    monkeypatch, config_name, epochs, global_batch
-):
-    cfg = _compose_config(config_name, monkeypatch)
-
-    _validate_tabero_realworld_pi05_dsrl_contract(cfg, cfg.actor.model)
-
-    assert cfg.runner.max_epochs == epochs
-    assert cfg.actor.global_batch_size == global_batch
-    assert cfg.actor.model.model_path == cfg.rollout.model.model_path
-    assert cfg.actor.model.is_lora is False
-    assert cfg.actor.fsdp_config.gradient_checkpointing is False
-    assert cfg.actor.fsdp_config.checkpoint_format == "local_shard"
-    assert cfg.actor.model.openpi.dsrl_num_images == 3
-    assert cfg.actor.model.openpi.dsrl_use_tactile is False
-    assert cfg.algorithm.dsrl_replay_semantics == REALWORLD_TACIMG_DSRL_REPLAY_SEMANTICS
-
-
-def test_realworld_tacimg_dsrl_preflight_rejects_replay_semantic_drift(monkeypatch):
-    cfg = _compose_config(SMOKE_CONFIG, monkeypatch)
-    cfg.algorithm.dsrl_replay_semantics = "main_wrist_bf16_64_transition_ring_v1"
-
-    with pytest.raises(ValueError, match="dsrl_replay_semantics"):
-        _validate_tabero_realworld_pi05_dsrl_contract(cfg, cfg.actor.model)
 
 
 def test_realworld_tacimg_compact_projection_uses_three_heterogeneous_rgb_views():

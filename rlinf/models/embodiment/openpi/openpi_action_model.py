@@ -595,10 +595,19 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         return observation
 
     def _preprocess_observation_with_tactile(self, observation, *, train=True):
-        images, img_masks, lang_tokens, lang_masks, state = (
-            self._preprocess_observation(observation, train=train)
-        )
-        tactile_prefix = getattr(observation, "tactile_prefix", None)
+        result = self._preprocess_observation(observation, train=train)
+        if len(result) == 5:
+            images, img_masks, lang_tokens, lang_masks, state = result
+            tactile_prefix = getattr(observation, "tactile_prefix", None)
+        elif len(result) == 6:
+            images, img_masks, lang_tokens, lang_masks, state, tactile_prefix = result
+            if tactile_prefix is None:
+                tactile_prefix = getattr(observation, "tactile_prefix", None)
+        else:
+            raise RuntimeError(
+                "OpenPI preprocessing must return five or six items; "
+                f"got {len(result)}."
+            )
         return images, img_masks, lang_tokens, lang_masks, state, tactile_prefix
 
     def input_transform(self, obs: dict, transpose=True):

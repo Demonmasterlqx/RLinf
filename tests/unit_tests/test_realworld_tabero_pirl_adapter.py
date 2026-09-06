@@ -1,3 +1,17 @@
+# Copyright 2026 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
 import hashlib
@@ -15,15 +29,20 @@ from omegaconf import OmegaConf
 
 from rlinf.config import (
     _validate_tabero_realworld_action_filter_contract,
-    validate_embodied_cfg,
+    _validate_tabero_realworld_gripper_checkpoint_metadata,
+    _validate_tabero_realworld_pi05_pirl_contract,
 )
 from rlinf.envs.isaaclab.isaaclab_env import IsaaclabBaseEnv
 from rlinf.envs.isaaclab.tasks.realworld_tabero_tacfield import (
     IsaaclabRealWorldTaberoTacFieldEnv,
+    _build_state,
     _load_task_contract,
     _RealWorldActionChunkFilter,
     _RealWorldMarkerHistory,
     _RealWorldTactileImageHistory,
+    map_model_actions_to_xarm_sim,
+    map_model_gripper_unit_to_xarm_sim,
+    map_xarm_sim_gripper_observation_to_model,
 )
 from rlinf.envs.isaaclab.tasks.tabero_force_reward import (
     make_trajectory_force_success_reward_term,
@@ -41,9 +60,10 @@ from rlinf.utils.tabero_ppo_boundary import (
 REPO_ROOT = Path(__file__).resolve().parents[3]
 GENTLE_GRASP_CONFIG_DIR = REPO_ROOT / "Tabero_X/benchmarks/datasets/realworld/config"
 RLINF_CONFIG_DIR = REPO_ROOT / "RLinf/examples/embodiment/config"
+LOCAL_MODEL_PATH = REPO_ROOT / "models/pi05_realworld_replayed_task820_23000_lora"
 
 
-def _load_client_action_filter_class():
+def _load_client_gripper_mapping_module():
     source = REPO_ROOT / "Tabero_X/benchmarks/openpi/gripper_action_mapping.py"
     spec = importlib.util.spec_from_file_location(
         "tabero_x_gripper_action_mapping_golden", source
@@ -51,7 +71,11 @@ def _load_client_action_filter_class():
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module.XarmSimActionChunkFilter
+    return module
+
+
+def _load_client_action_filter_class():
+    return _load_client_gripper_mapping_module().XarmSimActionChunkFilter
 
 
 def _make_torch_filter(num_envs: int) -> _RealWorldActionChunkFilter:
@@ -85,6 +109,83 @@ def _enabled_action_filter_cfg():
         "max_orientation_step_deg": 2.0,
         "max_orientation_delta_change_deg": 1.5,
     }
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_xarm_gripper_mapping_endpoints_clamp_roundtrip_and_dtype(dtype):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    policy = torch.tensor([-1.0, 0.0, 0.5, 1.0, 2.0], dtype=dtype, device=device)
+    sim = map_model_gripper_unit_to_xarm_sim(policy)
+
+    assert sim.device.type == device.type
+    assert sim.dtype == dtype
+    torch.testing.assert_close(
+        sim,
+        torch.tensor([0.045, 0.045, 0.0225, 0.0, 0.0], dtype=dtype, device=device),
+    )
+    torch.testing.assert_close(
+        map_xarm_sim_gripper_observation_to_model(sim),
+        torch.tensor([0.0, 0.0, 0.5, 1.0, 1.0], dtype=dtype, device=device),
+    )
+
+    in_range = torch.tensor([[0.0, 0.25, 0.5, 0.75, 1.0]], dtype=dtype, device=device)
+    torch.testing.assert_close(
+        map_xarm_sim_gripper_observation_to_model(
+            map_model_gripper_unit_to_xarm_sim(in_range)
+        ),
+        in_range,
+    )
+
+
+def test_xarm_gripper_mapping_rejects_nonfinite_values():
+    with pytest.raises(ValueError, match="finite floating point"):
+        map_model_gripper_unit_to_xarm_sim(torch.tensor([float("nan")]))
+    with pytest.raises(ValueError, match="finite floating point"):
+        map_xarm_sim_gripper_observation_to_model(torch.tensor([float("inf")]))
+
+
+def test_action_mapping_changes_only_gripper_without_mutating_input():
+    actions = torch.arange(2 * 10 * 13, dtype=torch.float32).reshape(2, 10, 13)
+    actions[..., 6] = torch.tensor([0.0, 0.5] * 10).reshape(2, 10)
+    original = actions.clone()
+
+    mapped = map_model_actions_to_xarm_sim(actions)
+
+    assert torch.equal(actions, original)
+    torch.testing.assert_close(
+        mapped[..., 6],
+        (1.0 - original[..., 6]) * 0.045,
+    )
+    assert torch.equal(mapped[..., :6], original[..., :6])
+    assert torch.equal(mapped[..., 7:], original[..., 7:])
+
+
+def test_torch_gripper_mapping_matches_tabero_x_numpy_mapping():
+    client_mapping = _load_client_gripper_mapping_module()
+    policy = np.array([-0.5, 0.0, 0.25, 0.5, 1.0, 1.5], dtype=np.float32)
+    expected_sim = client_mapping.map_model_gripper_unit_to_xarm_sim(policy)
+    actual_sim = map_model_gripper_unit_to_xarm_sim(torch.from_numpy(policy)).numpy()
+    np.testing.assert_array_equal(actual_sim, expected_sim)
+
+    expected_policy = client_mapping.map_xarm_sim_gripper_observation_to_model(
+        expected_sim
+    )
+    actual_policy = map_xarm_sim_gripper_observation_to_model(
+        torch.from_numpy(expected_sim)
+    ).numpy()
+    np.testing.assert_array_equal(actual_policy, expected_policy)
+
+
+def test_build_state_reports_open_reset_gripper_in_model_coordinates():
+    policy_obs = {
+        "eef_pose": torch.tensor([[0.4, 0.0, 0.3, 1.0, 0.0, 0.0, 0.0]]),
+        "gripper_pos": torch.tensor([[0.0, 0.0]]),
+    }
+
+    state = _build_state(policy_obs)
+
+    assert state.shape == (1, 7)
+    assert state[0, 6].item() == pytest.approx(1.0)
 
 
 def test_action_filter_matches_client_for_two_consecutive_chunks():
@@ -147,12 +248,23 @@ def test_realworld_adapter_does_not_construct_disabled_action_filter(
     monkeypatch,
     remove_action_filter,
 ):
+    monkeypatch.setenv("REALWORLD_TABERO_TACIMG_PIRL_RUN_ID", "unit_test")
     with initialize_config_dir(version_base="1.1", config_dir=str(RLINF_CONFIG_DIR)):
         cfg = compose(
-            config_name="isaaclab_pi05_pirl_realworld_tabero_task6_2gpu_100step"
+            config_name=(
+                "isaaclab_pi05_pirl_realworld_tabero_tacimg_task6_step23000_"
+                "fixed_gripper_shared_sim_smoke"
+            )
         ).env.train
     if remove_action_filter:
         del cfg.init_params.action_filter
+    cfg.init_params.extension_path = str(REPO_ROOT / "Tabero_X/source/tac_manip")
+    cfg.init_params.realworld_config_dir = str(
+        REPO_ROOT / "Tabero_X/benchmarks/datasets/realworld/config"
+    )
+    cfg.init_params.realworld_assets_dir = str(
+        REPO_ROOT / "Tabero_X/benchmarks/datasets/realworld/USD"
+    )
 
     monkeypatch.setattr(IsaaclabBaseEnv, "__init__", lambda self, *args: None)
     env = IsaaclabRealWorldTaberoTacFieldEnv(
@@ -186,14 +298,6 @@ def test_task_contract_selects_only_vitasoy_success_branch():
     assert len(goals[0]["any_of"]) == 1
     assert goals[0]["any_of"][0]["ref_obj"] == "target_object_1"
     assert goals[0]["any_of"][0]["target"] == "target_object_4"
-
-
-def test_tabero_x_realworld_env_cfg_exposes_gripper_bridge_contract():
-    source = (
-        REPO_ROOT
-        / "Tabero_X/source/tac_manip/tac_manip/tasks/manipulation/realworld/config/xarm_umi/realworld_env_cfg.py"
-    ).read_text()
-    assert "policy_gripper_sign_bridge: bool = False" in source
 
 
 def test_marker_history_builds_reference_plus_eight_current_frames():
@@ -346,16 +450,16 @@ def test_chunk_step_masks_policy_actions_after_early_done():
     env.num_envs = 1
     env.device = torch.device("cpu")
     env._action_filter = _make_torch_filter(1)
-    anchor = torch.tensor([[0.4, 0.0, 0.3, 0.0, 0.0, 0.0, 0.045]], dtype=torch.float32)
+    anchor = torch.tensor([[0.4, 0.0, 0.3, 0.0, 0.0, 0.0, 1.0]], dtype=torch.float32)
     env._action_filter.reset(anchor)
     call_index = 0
 
     def terminal_safe_step(actions, *, active_mask):
         nonlocal call_index
-        del actions
         done = active_mask & (call_index == 2)
         call_index += 1
         infos = {
+            "_tabero_executed_action": map_model_actions_to_xarm_sim(actions),
             "_realworld_hold_state": anchor.clone(),
             "_realworld_terminal_capture": done.clone(),
         }
@@ -383,14 +487,17 @@ def test_chunk_step_masks_policy_actions_after_early_done():
     executed = infos_list[-1]["_tabero_executed_chunk_actions"]
     recorded_raw = infos_list[-1]["_tabero_raw_chunk_actions"]
     torch.testing.assert_close(recorded_raw, raw)
-    torch.testing.assert_close(executed[:, 3:, :7], anchor[:, None].expand(-1, 7, -1))
+    expected_hold = torch.zeros(1, 7, 13)
+    expected_hold[:, :, :7] = anchor[:, None]
+    expected_hold = map_model_actions_to_xarm_sim(expected_hold)
+    torch.testing.assert_close(executed[:, 3:, :7], expected_hold[:, :, :7])
     torch.testing.assert_close(executed[:, 3:, 7:], torch.zeros(1, 7, 6))
     metrics = infos_list[-1]["chunk_boundary_metrics"]
     assert metrics["post_done_policy_actions"].item() == 0
     assert metrics["post_done_hold_steps"].item() == 7
 
 
-def test_chunk_step_passes_through_all_13_dimensions_when_filter_is_disabled():
+def test_chunk_step_keeps_raw_policy_actions_and_records_mapped_execution():
     env = IsaaclabRealWorldTaberoTacFieldEnv.__new__(IsaaclabRealWorldTaberoTacFieldEnv)
     env.num_envs = 2
     env.device = torch.device("cpu")
@@ -400,6 +507,7 @@ def test_chunk_step_passes_through_all_13_dimensions_when_filter_is_disabled():
     def terminal_safe_step(actions, *, active_mask):
         seen_actions.append(actions.clone())
         infos = {
+            "_tabero_executed_action": map_model_actions_to_xarm_sim(actions),
             "_realworld_hold_state": torch.zeros(2, 7),
             "_realworld_terminal_capture": torch.zeros(2, dtype=torch.bool),
         }
@@ -421,7 +529,57 @@ def test_chunk_step_passes_through_all_13_dimensions_when_filter_is_disabled():
     assert torch.equal(raw, original)
     assert torch.equal(recorded_raw, original)
     assert torch.equal(torch.stack(seen_actions, dim=1), original)
-    assert torch.equal(executed, original)
+    torch.testing.assert_close(executed, map_model_actions_to_xarm_sim(original))
+    assert torch.equal(executed[..., :6], original[..., :6])
+    assert torch.equal(executed[..., 7:], original[..., 7:])
+
+
+def test_terminal_safe_step_maps_gripper_once_and_keeps_hold_state_in_model_units():
+    env = IsaaclabRealWorldTaberoTacFieldEnv.__new__(IsaaclabRealWorldTaberoTacFieldEnv)
+    env.num_envs = 1
+    env.device = torch.device("cpu")
+    env.cfg = SimpleNamespace(max_episode_steps=300)
+    env._elapsed_steps = torch.zeros(1, dtype=torch.long)
+    env._gripper_diagnostics_path = None
+    env._wrap_obs = lambda raw_obs, marker_update_mask=None: {
+        "states": _build_state(raw_obs["policy"])
+    }
+    env._record_metrics = lambda reward, terminations, infos: {"episode": {}}
+    seen_actions = []
+
+    class FakeEnv:
+        def step(self, actions):
+            seen_actions.append(actions.clone())
+            raw_obs = {
+                "policy": {
+                    "eef_pose": torch.tensor(
+                        [[0.4, 0.0, 0.3, 1.0, 0.0, 0.0, 0.0]]
+                    ),
+                    "gripper_pos": actions[:, 6:7].clone(),
+                }
+            }
+            return (
+                raw_obs,
+                torch.zeros(1),
+                torch.zeros(1, dtype=torch.bool),
+                torch.zeros(1, dtype=torch.bool),
+                {},
+            )
+
+    env.env = FakeEnv()
+    policy_action = torch.zeros(1, 13)
+    policy_action[:, 6] = 0.5
+    original = policy_action.clone()
+
+    _, _, _, _, infos = env._terminal_safe_step(
+        policy_action,
+        active_mask=torch.ones(1, dtype=torch.bool),
+    )
+
+    assert torch.equal(policy_action, original)
+    assert seen_actions[0][0, 6].item() == pytest.approx(0.0225)
+    assert infos["_tabero_executed_action"][0, 6].item() == pytest.approx(0.0225)
+    assert infos["_realworld_hold_state"][0, 6].item() == pytest.approx(0.5)
 
 
 def test_reset_skips_disabled_action_filter_for_full_and_selected_resets():
@@ -453,27 +611,24 @@ def test_reset_skips_disabled_action_filter_for_full_and_selected_resets():
     assert torch.equal(reset_calls[1][1], selected)
 
 
-@pytest.mark.parametrize(
-    "config_name",
-    [
-        "isaaclab_pi05_pirl_realworld_tabero_task6_2gpu_100step",
-        "isaaclab_pi05_pirl_realworld_tabero_task6_2gpu_smoke",
-        "isaaclab_pi05_pirl_realworld_tabero_tacimg_task6_2gpu_100step",
-        "isaaclab_pi05_pirl_realworld_tabero_tacimg_task6_2gpu_smoke",
-        "isaaclab_pi05_pirl_realworld_tabero_tacimg_task6_step23000_2gpu_100step",
-        "isaaclab_pi05_pirl_realworld_tabero_tacimg_task6_step23000_2gpu_smoke",
-        "isaaclab_pi05_pirl_realworld_tabero_tacimg_task6_step23000_2xa100_env32_1000step_gc_offload",
-    ],
-)
-def test_realworld_configs_disable_action_filter_by_default(config_name):
+def test_fixed_gripper_config_disables_action_filter_by_default():
+    config_name = (
+        "isaaclab_pi05_pirl_realworld_tabero_tacimg_task6_step23000_"
+        "fixed_gripper_shared_sim_smoke"
+    )
     with initialize_config_dir(version_base="1.1", config_dir=str(RLINF_CONFIG_DIR)):
         cfg = compose(config_name=config_name)
 
     for split_name in ("train", "eval"):
         assert cfg.env[split_name].init_params.action_filter.enabled is False
         assert list(cfg.env[split_name].init_params.action_filter.keys()) == ["enabled"]
+        assert "gripper_mapping" not in cfg.env[split_name].init_params
     metadata = cfg.actor.fsdp_config.trainable_checkpoint_metadata
     assert metadata.action_filter == "disabled"
+    assert metadata.gripper_mapping == "xarm_unit_inverse_v1"
+    assert metadata.policy_gripper_coordinate == "unit_0_closed_1_open"
+    assert metadata.sim_gripper_coordinate == "meters_0_open_0045_close"
+    assert metadata.gripper_travel_m == pytest.approx(0.045)
     assert (
         _validate_tabero_realworld_action_filter_contract(cfg, metadata) == "disabled"
     )
@@ -493,173 +648,66 @@ def test_action_filter_contract_keeps_explicit_enable_as_opt_in():
     )
 
 
-def test_step23000_tacimg_pirl_smoke_pins_models_artifact_and_scope():
+def test_fixed_gripper_checkpoint_metadata_rejects_drift():
+    metadata = {
+        "gripper_mapping": "xarm_unit_inverse_v1",
+        "policy_gripper_coordinate": "unit_0_closed_1_open",
+        "sim_gripper_coordinate": "meters_0_open_0045_close",
+        "gripper_travel_m": 0.045,
+    }
+    assert _validate_tabero_realworld_gripper_checkpoint_metadata(metadata) == {
+        "gripper_mapping": "xarm_unit_inverse_v1",
+        "policy_gripper_coordinate": "unit_0_closed_1_open",
+        "sim_gripper_coordinate": "meters_0_open_0045_close",
+        "gripper_travel_m": 0.045,
+    }
+
+    drifted_metadata = dict(metadata)
+    drifted_metadata["gripper_mapping"] = "legacy_direct"
+    with pytest.raises(ValueError, match="gripper_mapping='xarm_unit_inverse_v1'"):
+        _validate_tabero_realworld_gripper_checkpoint_metadata(drifted_metadata)
+
+
+def test_fixed_gripper_shared_sim_smoke_contract(monkeypatch):
     config_name = (
-        "isaaclab_pi05_pirl_realworld_tabero_tacimg_task6_step23000_2gpu_smoke"
+        "isaaclab_pi05_pirl_realworld_tabero_tacimg_task6_"
+        "step23000_fixed_gripper_shared_sim_smoke"
     )
+    monkeypatch.setenv("REALWORLD_TABERO_TACIMG_PIRL_RUN_ID", "unit_test")
     with initialize_config_dir(version_base="1.1", config_dir=str(RLINF_CONFIG_DIR)):
         cfg = compose(config_name=config_name)
 
-    expected_model_path = (
-        "/data/home/sim6g/code/tabero/models/pi05_realworld_replayed_task820_23000_lora"
-    )
-    assert cfg.actor.model.model_path == expected_model_path
-    assert cfg.rollout.model.model_path == expected_model_path
-    assert cfg.actor.model.tabero_pi05_checkpoint_contract.require_final is False
-    assert cfg.actor.model.tabero_pi05_checkpoint_contract.expected_model_sha256 == (
-        "9b506e72d643fb2df78f8aa1fd0f730d52df10566d247f6f2ea4a5010f1e6c15"
-    )
-    assert cfg.actor.fsdp_config.gradient_checkpointing is False
-    assert cfg.actor.micro_batch_size == 1
-    assert cfg.actor.global_batch_size == 1
+    assert cfg.actor.fsdp_config.gradient_checkpointing is True
+    assert cfg.actor.fsdp_config.gradient_checkpointing_use_reentrant is False
+    assert cfg.cluster.component_placement.actor.placement == 0
+    assert cfg.cluster.component_placement.rollout.placement == 2
+    assert cfg.cluster.component_placement.env.placement == 3
     assert cfg.env.train.total_num_envs == 1
-    assert cfg.env.train.rollout_epoch == 1
+    assert cfg.env.train.max_steps_per_rollout_epoch == 300
+    assert cfg.env.train.max_episode_steps == 300
     assert cfg.runner.max_epochs == 1
-    assert cfg.runner.save_interval == 1
-    assert cfg.cluster.component_placement.actor == "6"
-    assert cfg.cluster.component_placement.rollout == "3"
-    assert cfg.cluster.component_placement.env == "3"
+    assert cfg.runner.max_steps == 1
+    assert cfg.env.train.video_cfg.save_video is True
+    assert cfg.env.eval.video_cfg.save_video is True
+    assert list(cfg.env.train.video_cfg.image_names) == ["agentview", "eye_in_hand"]
+    assert cfg.env.train.video_cfg.composite_name == "combined"
+    assert cfg.actor.model.model_path == str(LOCAL_MODEL_PATH)
+    assert cfg.rollout.model.model_path == str(LOCAL_MODEL_PATH)
     metadata = cfg.actor.fsdp_config.trainable_checkpoint_metadata
-    assert metadata.base_checkpoint_require_final is False
-    assert metadata.training_config == config_name
-    assert metadata.target_global_step == 1
-    assert metadata.action_filter == "disabled"
-    assert validate_embodied_cfg(cfg) is cfg
-
-
-def test_step23000_tacimg_pirl_100step_explicitly_opts_into_non_final_base():
-    config_name = (
-        "isaaclab_pi05_pirl_realworld_tabero_tacimg_task6_step23000_2gpu_100step"
-    )
-    config_source = OmegaConf.load(RLINF_CONFIG_DIR / f"{config_name}.yaml")
-    defaults = OmegaConf.to_container(config_source.defaults, resolve=False)
-    assert "isaaclab_pi05_pirl_realworld_tabero_tacimg_task6_2gpu_100step" not in (
-        defaults
-    )
-    with initialize_config_dir(version_base="1.1", config_dir=str(RLINF_CONFIG_DIR)):
-        cfg = compose(config_name=config_name)
-
-    expected_model_path = (
-        "/data/home/sim6g/code/tabero/models/pi05_realworld_replayed_task820_23000_lora"
-    )
-    assert cfg.actor.model.model_path == expected_model_path
-    assert cfg.rollout.model.model_path == expected_model_path
-    checkpoint_contract = cfg.actor.model.tabero_pi05_checkpoint_contract
-    assert checkpoint_contract.require_final is False
-    assert checkpoint_contract.allow_non_final_formal_training is True
-    assert checkpoint_contract.expected_model_sha256 == (
-        "9b506e72d643fb2df78f8aa1fd0f730d52df10566d247f6f2ea4a5010f1e6c15"
-    )
-    assert cfg.runner.max_epochs == 100
-    assert cfg.runner.save_interval == 10
-    assert cfg.actor.micro_batch_size == 1
-    assert cfg.actor.global_batch_size == 16
-    assert cfg.actor.fsdp_config.gradient_checkpointing is False
-    assert cfg.env.train.total_num_envs == 8
-    assert cfg.env.train.rollout_epoch == 2
-    assert cfg.cluster.component_placement.actor == "1"
-    assert cfg.cluster.component_placement.rollout == "0"
-    assert cfg.cluster.component_placement.env == "0"
-    metadata = cfg.actor.fsdp_config.trainable_checkpoint_metadata
-    assert metadata.base_checkpoint_require_final is False
-    assert metadata.base_checkpoint_allow_non_final_formal_training is True
-    assert metadata.base_checkpoint_global_step == 23000
-    assert metadata.base_checkpoint_target_global_step == 30000
-    assert metadata.base_checkpoint_is_final is False
-    assert metadata.training_config == config_name
-    assert metadata.target_global_step == 100
-    assert metadata.action_filter == "disabled"
-    assert validate_embodied_cfg(cfg) is cfg
-
-
-def test_step23000_tacimg_pirl_100step_rejects_missing_non_final_opt_in():
-    config_name = (
-        "isaaclab_pi05_pirl_realworld_tabero_tacimg_task6_step23000_2gpu_100step"
-    )
-    with initialize_config_dir(version_base="1.1", config_dir=str(RLINF_CONFIG_DIR)):
-        cfg = compose(config_name=config_name)
-
-    cfg.actor.model.tabero_pi05_checkpoint_contract.allow_non_final_formal_training = (
-        False
-    )
-    with pytest.raises(ValueError, match="allow_non_final_formal_training=true"):
-        validate_embodied_cfg(cfg)
-
-
-def test_step23000_tacimg_pirl_2xa100_1000step_contract():
-    config_name = (
-        "isaaclab_pi05_pirl_realworld_tabero_tacimg_task6_step23000_"
-        "2xa100_env32_1000step_gc_offload"
-    )
-    config_source = OmegaConf.load(RLINF_CONFIG_DIR / f"{config_name}.yaml")
-    defaults = OmegaConf.to_container(config_source.defaults, resolve=False)
-    assert (
-        "isaaclab_pi05_pirl_realworld_tabero_tacimg_task6_step23000_2gpu_100step"
-        not in defaults
-    )
-
-    with initialize_config_dir(version_base="1.1", config_dir=str(RLINF_CONFIG_DIR)):
-        cfg = compose(config_name=config_name)
-
-    expected_model_path = (
-        "/data/home/sim6g/code/tabero/models/pi05_realworld_replayed_task820_23000_lora"
-    )
-    assert cfg.actor.model.model_path == expected_model_path
-    assert cfg.rollout.model.model_path == expected_model_path
-    assert cfg.runner.max_epochs == 1000
-    assert cfg.runner.save_interval == 100
-    assert cfg.runner.val_check_interval == -1
-    assert cfg.env.train.total_num_envs == 32
-    assert cfg.env.train.rollout_epoch == 2
-    assert cfg.actor.micro_batch_size == 8
-    assert cfg.actor.global_batch_size == 16
-    assert cfg.actor.enable_offload is True
-    assert cfg.rollout.enable_offload is True
-    assert cfg.cluster.component_placement.actor == "0-1"
-    assert cfg.cluster.component_placement.rollout == "0-1"
-    assert cfg.cluster.component_placement.env == "0-1"
-
-    fsdp_cfg = cfg.actor.fsdp_config
-    assert fsdp_cfg.sharding_strategy == "no_shard"
-    assert fsdp_cfg.gradient_checkpointing is True
-    assert fsdp_cfg.gradient_checkpointing_use_reentrant is False
-    assert fsdp_cfg.cpu_offload is False
-    assert fsdp_cfg.offload_pin_memory is False
-    assert fsdp_cfg.amp_autocast.enabled is True
-    assert fsdp_cfg.amp_autocast.precision == "bf16"
-
-    assert cfg.actor.optim.lr == pytest.approx(1.0e-6)
-    assert cfg.actor.optim.value_lr == pytest.approx(1.0e-4)
-    assert cfg.actor.optim.lr_scheduler == "constant"
-    assert cfg.actor.optim.lr_warmup_steps == 0
-    assert cfg.actor.optim.total_training_steps == 1000
-
-    checkpoint_contract = cfg.actor.model.tabero_pi05_checkpoint_contract
-    assert checkpoint_contract.require_final is False
-    assert checkpoint_contract.allow_non_final_formal_training is True
-    assert checkpoint_contract.expected_model_sha256 == (
-        "9b506e72d643fb2df78f8aa1fd0f730d52df10566d247f6f2ea4a5010f1e6c15"
-    )
-    metadata = fsdp_cfg.trainable_checkpoint_metadata
-    assert metadata.training_config == config_name
-    assert metadata.target_global_step == 1000
-    assert metadata.selected_total_num_envs == 32
-    assert metadata.micro_batch_size == 8
-    assert metadata.global_batch_size == 16
-    assert metadata.gradient_accumulation_steps == 1
-    assert metadata.optimizer_updates_per_global_step == 120
-    assert metadata.target_optimizer_updates == 120000
-    assert metadata.actor_component_offload is True
-    assert metadata.rollout_component_offload is True
-    assert metadata.fsdp_cpu_offload is False
+    assert metadata.gripper_mapping == "xarm_unit_inverse_v1"
     assert metadata.gradient_checkpointing is True
     assert metadata.gradient_checkpointing_use_reentrant is False
     assert (
-        metadata.host_memory_release_contract
-        == "release_actor_batch_and_await_trajectory_send_v2"
+        _validate_tabero_realworld_gripper_checkpoint_metadata(metadata)[
+            "gripper_mapping"
+        ]
+        == "xarm_unit_inverse_v1"
     )
-    assert metadata.action_filter == "disabled"
-    assert validate_embodied_cfg(cfg) is cfg
+    assert cfg.actor.model.openpi.action_horizon == 50
+    assert cfg.actor.model.openpi.action_chunk == 10
+    assert cfg.actor.model.openpi.num_images_in_input == 3
+    assert cfg.env.train.init_params.tactile_image_history_len == 8
+    _validate_tabero_realworld_pi05_pirl_contract(cfg, cfg.actor.model)
 
 
 def test_openpi_gradient_checkpointing_bridge_is_non_reentrant(monkeypatch):
@@ -728,57 +776,6 @@ def test_action_filter_contract_rejects_state_and_metadata_drift():
             missing_parameter_cfg,
             {"action_filter": "xarm_sim_action_chunk_filter_v1"},
         )
-
-
-def test_smoke_config_pins_xarm_checkpoint_and_bridge_false():
-    with initialize_config_dir(version_base="1.1", config_dir=str(RLINF_CONFIG_DIR)):
-        cfg = compose(
-            config_name="isaaclab_pi05_pirl_realworld_tabero_task6_2gpu_smoke"
-        )
-    assert cfg.env.train.init_params.policy_gripper_sign_bridge is False
-    assert cfg.env.train.init_params.target_object == "target_object_1"
-    assert cfg.env.train.init_params.reset_source == "task_config_default_reset"
-    assert cfg.env.train.max_episode_steps == 300
-    assert cfg.actor.model.openpi.config_name.endswith("_xarm_gripper")
-    assert (
-        cfg.actor.model.tabero_pi05_checkpoint_contract.expected_norm_asset_id
-        == "replay_firm_tabero_xarm_gripper"
-    )
-    assert cfg.actor.model.tabero_pi05_checkpoint_contract.require_final is False
-
-
-def test_tacimg_smoke_config_preserves_50_prediction_10_execution_contract():
-    with initialize_config_dir(version_base="1.1", config_dir=str(RLINF_CONFIG_DIR)):
-        cfg = compose(
-            config_name="isaaclab_pi05_pirl_realworld_tabero_tacimg_task6_2gpu_smoke"
-        )
-    assert cfg.actor.model.openpi.config_name == (
-        "pi05_lora_tacimg_realworld_replayed_task820_force"
-    )
-    assert cfg.actor.model.openpi.action_horizon == 50
-    assert cfg.actor.model.openpi.action_chunk == 10
-    assert cfg.actor.model.num_action_chunks == 10
-    assert cfg.actor.model.openpi.num_images_in_input == 3
-    assert cfg.actor.model.openpi.tactile_streams == []
-    assert cfg.env.train.init_params.tactile_image_history_len == 8
-    assert cfg.env.train.init_params.success.required_consecutive_steps == 8
-    assert cfg.env.train.init_params.success.terminal_reward == 1.0
-    assert dict(cfg.env.train.init_params.success.force_bonus) == {
-        "enabled": True,
-        "coefficient": 20.0,
-        "epsilon": 1.0,
-        "max_bonus": 1.0,
-        "min_valid_samples": 4,
-        "contact_epsilon": 1.0,
-    }
-    metadata = cfg.actor.fsdp_config.trainable_checkpoint_metadata
-    assert metadata.action_horizon == 50
-    assert metadata.execution_horizon == 10
-    assert metadata.tactile_input == "tactile_image"
-    assert metadata.success_scene_task_id == 6
-    assert list(metadata.semantic_task_ids) == [0, 2, 4]
-    assert metadata.reward_contract == ("binary_success_plus_inverse_measured_force_v1")
-    assert metadata.force_reward_source == "policy_gripper_net_force"
 
 
 def test_realworld_direct_force_reward_uses_contact_only_mean():

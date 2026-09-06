@@ -1,0 +1,62 @@
+defaults:
+  - isaaclab_pi05_pirl_realworld_tabero_tacimg_task6_step23000_fixed_gripper_shared_sim_smoke
+  - _self_
+
+runner:
+  logger:
+    experiment_name: ${oc.env:REALWORLD_TABERO_RANDOMIZATION_RUN_ID}
+  max_epochs: 1
+  max_steps: 1
+  only_eval: false
+  val_check_interval: -1
+  save_interval: 1
+
+env:
+  train:
+    rollout_epoch: 1
+    total_num_envs: 1
+    max_steps_per_rollout_epoch: 300
+    max_episode_steps: 300
+    video_cfg:
+      save_video: true
+      video_base_dir: ${runner.logger.log_path}/${runner.logger.experiment_name}/video/train
+    init_params:
+      max_episode_steps: ${..max_episode_steps}
+      realworld_config_dir: /home_shared/rashare/qixuan/Tabero/RLinf/examples/embodiment/config/env/realworld_profiles/gentle_grasp_task6_uniform_randomization
+      gripper_diagnostics_path: ${runner.logger.log_path}/${runner.logger.experiment_name}/gripper_diagnostics.jsonl
+  eval:
+    rollout_epoch: 1
+    total_num_envs: 1
+    max_steps_per_rollout_epoch: 300
+    max_episode_steps: 300
+    video_cfg:
+      save_video: true
+      video_base_dir: ${runner.logger.log_path}/${runner.logger.experiment_name}/video/eval
+    init_params:
+      max_episode_steps: ${..max_episode_steps}
+      realworld_config_dir: /home_shared/rashare/qixuan/Tabero/RLinf/examples/embodiment/config/env/realworld_profiles/gentle_grasp_task6_uniform_randomization
+
+actor:
+  micro_batch_size: 1
+  global_batch_size: 1
+  fsdp_config:
+    gradient_checkpointing: true
+    gradient_checkpointing_use_reentrant: false
+    trainable_checkpoint_metadata:
+      training_config: isaaclab_pi05_pirl_realworld_tabero_tacimg_task6_step23000_uniform_randomization_shared_sim_smoke
+      target_global_step: 1
+      gradient_checkpointing: true
+      gradient_checkpointing_use_reentrant: false
+      randomization_profile: gentle_grasp_task6_uniform_randomization
+      randomization_reset_scope: full_environment
+      object_mass_ranges_kg:
+        target_object_1: [0.08, 0.12]
+        target_object_2: [0.16, 0.24]
+        target_object_3: [0.1224, 0.1836]
+        target_object_4: [0.16, 0.24]
+      object_static_friction_range: [0.5, 0.7]
+      object_dynamic_friction_range: [0.3, 0.5]
+      gripper_static_friction_range: [0.2, 0.4]
+      gripper_dynamic_friction_range: [0.1, 0.2]
+      light_intensity_range: [1600.0, 2400.0]
+      fill_light_intensity_range: [320.0, 480.0]

@@ -30,8 +30,8 @@ init_params:
   realworld_assets_dir: "/data/home/sim6g/code/tabero/Tabero_X/benchmarks/datasets/realworld/USD"
   tactile_backend: taxim_fots
   chunk_boundary_mode: terminal_safe_v1
-  # replay_firm_tabero_xarm_gripper uses the native XArm positive-open coordinate.
-  policy_gripper_sign_bridge: false
+  # RLinf fixes model units to 0=closed, 1=open and converts to the XArm
+  # 0=open, 0.045=closed metre coordinate inside the RealWorld wrapper.
   action_filter:
     enabled: false
   camera_preprocess:

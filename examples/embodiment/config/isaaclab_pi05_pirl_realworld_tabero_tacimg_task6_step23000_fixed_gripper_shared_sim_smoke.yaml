@@ -14,28 +14,55 @@ hydra:
 cluster:
   num_nodes: 1
   component_placement:
-    actor: "1"
-    rollout: "0"
-    env: "0"
+    actor:
+      node_group: train
+      placement: 0
+    rollout:
+      node_group: train
+      placement: 2
+    env:
+      node_group: sim
+      placement: 3
+  node_groups:
+    - label: train
+      node_ranks: 0
+      env_configs:
+        - node_ranks: 0
+          python_interpreter_path: /home_shared/rashare/qixuan/Tabero/RLinf/.venv/bin/python
+    - label: sim
+      node_ranks: 0
+      env_configs:
+        - node_ranks: 0
+          python_interpreter_path: /home_shared/rashare/qixuan/Tabero/.tabero_env/bin/python
+          env_vars:
+            - ISAACSIM_PATH: /home_shared/rashare/qixuan/Tabero/isaac-sim
+            - ISAACSIM_PYTHON_EXE: /home_shared/rashare/qixuan/Tabero/isaac-sim/python.sh
+            - ISAACLAB_PATH: /home_shared/rashare/qixuan/Tabero/IsaacLab
+            - ISAAC_PATH: /home_shared/rashare/qixuan/Tabero/isaac-sim
+            - EXP_PATH: /home_shared/rashare/qixuan/Tabero/isaac-sim/apps
+            - CARB_APP_PATH: /home_shared/rashare/qixuan/Tabero/isaac-sim/kit
+            - OMNI_KIT_ACCEPT_EULA: "YES"
+            - PYTHONPATH: /home_shared/rashare/qixuan/Tabero/RLinf:/home_shared/rashare/qixuan/Tabero/isaac-sim/python_packages:/home_shared/rashare/qixuan/Tabero/isaac-sim/exts/isaacsim.simulation_app:/home_shared/rashare/qixuan/Tabero/isaac-sim/extsDeprecated/omni.isaac.kit:/home_shared/rashare/qixuan/Tabero/isaac-sim/kit/kernel/py:/home_shared/rashare/qixuan/Tabero/isaac-sim/kit/plugins/bindings-python:/home_shared/rashare/qixuan/Tabero/isaac-sim/exts/isaacsim.robot_motion.lula/pip_prebundle:/home_shared/rashare/qixuan/Tabero/isaac-sim/exts/isaacsim.asset.exporter.urdf/pip_prebundle:/home_shared/rashare/qixuan/Tabero/isaac-sim/extscache/omni.kit.pip_archive-0.0.0+69cbf6ad.lx64.cp311/pip_prebundle:/home_shared/rashare/qixuan/Tabero/isaac-sim/exts/omni.isaac.core_archive/pip_prebundle:/home_shared/rashare/qixuan/Tabero/isaac-sim/exts/omni.isaac.ml_archive/pip_prebundle:/home_shared/rashare/qixuan/Tabero/isaac-sim/exts/omni.pip.compute/pip_prebundle:/home_shared/rashare/qixuan/Tabero/isaac-sim/exts/omni.pip.cloud/pip_prebundle
+            - LD_LIBRARY_PATH: /home_shared/rashare/qixuan/Tabero/isaac-sim:/home_shared/rashare/qixuan/Tabero/isaac-sim/exts/isaacsim.robot.schema/plugins/lib:/home_shared/rashare/qixuan/Tabero/isaac-sim/exts/isaacsim.robot_motion.lula/pip_prebundle:/home_shared/rashare/qixuan/Tabero/isaac-sim/exts/isaacsim.asset.exporter.urdf/pip_prebundle:/home_shared/rashare/qixuan/Tabero/isaac-sim/kit:/home_shared/rashare/qixuan/Tabero/isaac-sim/kit/kernel/plugins:/home_shared/rashare/qixuan/Tabero/isaac-sim/kit/libs/iray:/home_shared/rashare/qixuan/Tabero/isaac-sim/kit/plugins:/home_shared/rashare/qixuan/Tabero/isaac-sim/kit/plugins/bindings-python:/home_shared/rashare/qixuan/Tabero/isaac-sim/kit/plugins/carb_gfx:/home_shared/rashare/qixuan/Tabero/isaac-sim/kit/plugins/rtx:/home_shared/rashare/qixuan/Tabero/isaac-sim/kit/plugins/gpu.foundation
 
 runner:
   task_type: embodied
   logger:
-    log_path: /data/home/sim6g/code/tabero/results
+    log_path: /home_shared/rashare/qixuan/Tabero/results
     project_name: tabero-rlinf
     experiment_name: ${oc.env:REALWORLD_TABERO_TACIMG_PIRL_RUN_ID}
     logger_backends: [tensorboard, wandb]
-  max_epochs: 100
-  max_steps: -1
+  max_epochs: 1
+  max_steps: 1
   only_eval: false
   val_check_interval: -1
-  save_interval: 10
+  save_interval: 1
   resume_dir: null
   ckpt_path: null
 
 algorithm:
-  tabero_ppo_transition_boundary_semantics: terminal_observation_first_done_prefix_logprob_default_reset_v1
-  normalize_advantages: true
+  tabero_ppo_transition_boundary_semantics: terminal_observation_first_done_prefix_logprob_default_reset_gripper_map_v2
+  normalize_advantages: false
   kl_penalty: kl
   group_size: 1
   reward_coef: 1.0
@@ -62,11 +89,22 @@ algorithm:
 env:
   group_name: EnvGroup
   train:
-    rollout_epoch: 2
-    total_num_envs: 8
+    rollout_epoch: 1
+    total_num_envs: 1
     max_steps_per_rollout_epoch: 300
     max_episode_steps: 300
+    video_cfg:
+      save_video: true
+      video_base_dir: ${runner.logger.log_path}/${runner.logger.experiment_name}/video/train
+      image_keys: [main_images, wrist_images]
+      image_names: [agentview, eye_in_hand]
+      composite_views: [agentview, eye_in_hand]
+      composite_name: combined
     init_params:
+      extension_path: /home_shared/rashare/qixuan/Tabero/Tabero_X/source/tac_manip
+      realworld_config_dir: /home_shared/rashare/qixuan/Tabero/Tabero_X/benchmarks/datasets/realworld/config
+      realworld_assets_dir: /home_shared/rashare/qixuan/Tabero/Tabero_X/benchmarks/datasets/realworld/USD
+      gripper_diagnostics_path: ${runner.logger.log_path}/${runner.logger.experiment_name}/gripper_diagnostics.jsonl
       tactile_image_history_len: 8
       success:
         required_consecutive_steps: 8
@@ -83,7 +121,17 @@ env:
     total_num_envs: 1
     max_steps_per_rollout_epoch: 300
     max_episode_steps: 300
+    video_cfg:
+      save_video: true
+      video_base_dir: ${runner.logger.log_path}/${runner.logger.experiment_name}/video/eval
+      image_keys: [main_images, wrist_images]
+      image_names: [agentview, eye_in_hand]
+      composite_views: [agentview, eye_in_hand]
+      composite_name: combined
     init_params:
+      extension_path: /home_shared/rashare/qixuan/Tabero/Tabero_X/source/tac_manip
+      realworld_config_dir: /home_shared/rashare/qixuan/Tabero/Tabero_X/benchmarks/datasets/realworld/config
+      realworld_assets_dir: /home_shared/rashare/qixuan/Tabero/Tabero_X/benchmarks/datasets/realworld/USD
       tactile_image_history_len: 8
       success:
         required_consecutive_steps: 8
@@ -95,8 +143,6 @@ env:
           max_bonus: 1.0
           min_valid_samples: 4
           contact_epsilon: 1.0
-    video_cfg:
-      video_base_dir: ${runner.logger.log_path}/${runner.logger.experiment_name}/video/eval
 
 rollout:
   group_name: RolloutGroup
@@ -104,19 +150,19 @@ rollout:
   enable_offload: true
   pipeline_stage_num: 1
   model:
-    model_path: ${oc.env:REALWORLD_TABERO_TACIMG_PI05_CHECKPOINT}
+    model_path: /home_shared/rashare/qixuan/Tabero/models/pi05_realworld_replayed_task820_23000_lora
     precision: ${actor.model.precision}
 
 actor:
   group_name: ActorGroup
   training_backend: fsdp
   micro_batch_size: 1
-  global_batch_size: 16
+  global_batch_size: 1
   seed: 42
   enable_offload: false
   combine_reference_model: true
   model:
-    model_path: ${oc.env:REALWORLD_TABERO_TACIMG_PI05_CHECKPOINT}
+    model_path: /home_shared/rashare/qixuan/Tabero/models/pi05_realworld_replayed_task820_23000_lora
     model_type: openpi
     precision: null
     frozen_parameter_precision: bf16
@@ -134,13 +180,13 @@ actor:
     add_value_head: true
     checkpoint_load_allowed_missing_prefixes: [value_head.]
     tabero_pi05_checkpoint_contract:
-      expected_model_sha256: ${oc.env:REALWORLD_TABERO_TACIMG_PI05_MODEL_SHA256}
-      expected_norm_stats_sha256: ${oc.env:REALWORLD_TABERO_TACIMG_PI05_NORM_STATS_SHA256}
+      expected_model_sha256: 9b506e72d643fb2df78f8aa1fd0f730d52df10566d247f6f2ea4a5010f1e6c15
+      expected_norm_stats_sha256: 6b8751c3699f3a00a7c4a0335ab20bf629e2c63cfebb9c43b8473fd60490d88b
       expected_config_name: pi05_lora_tacimg_realworld_replayed_task820_force
       expected_norm_asset_id: pi05_horizon50_tacimg_task820_firm
       expected_dataset: datas/realworld_replayed_task820_firm
       expected_gripper_coordinate: xarm_positive_open
-      require_final: true
+      require_final: false
     openpi:
       config_name: pi05_lora_tacimg_realworld_replayed_task820_force
       pi05: true
@@ -182,7 +228,8 @@ actor:
   fsdp_config:
     strategy: fsdp
     sharding_strategy: no_shard
-    gradient_checkpointing: false
+    gradient_checkpointing: true
+    gradient_checkpointing_use_reentrant: false
     cpu_offload: false
     offload_pin_memory: false
     reshard_after_forward: true
@@ -215,9 +262,12 @@ actor:
       task_description: "pick up the Vitasoy and put it into the basket"
       control_mode: hybrid_tactile
       reset_source: task_config_default_reset
-      policy_gripper_sign_bridge: false
       gripper_coordinate: xarm_positive_open
       action_filter: disabled
+      gripper_mapping: xarm_unit_inverse_v1
+      policy_gripper_coordinate: unit_0_closed_1_open
+      sim_gripper_coordinate: meters_0_open_0045_close
+      gripper_travel_m: 0.045
       camera_preprocess: stretch_480x640_to_224x224_inter_area
       model_family: pi05
       openpi_config_name: pi05_lora_tacimg_realworld_replayed_task820_force
@@ -225,7 +275,7 @@ actor:
       normalization_asset_id: pi05_horizon50_tacimg_task820_firm
       base_model_sha256: ${actor.model.tabero_pi05_checkpoint_contract.expected_model_sha256}
       base_norm_stats_sha256: ${actor.model.tabero_pi05_checkpoint_contract.expected_norm_stats_sha256}
-      base_checkpoint_require_final: ${actor.model.tabero_pi05_checkpoint_contract.require_final}
+      base_checkpoint_require_final: false
       action_horizon: 50
       execution_horizon: 10
       effective_action_dim: 13
@@ -237,9 +287,11 @@ actor:
       excluded_tactile_inputs: [tactile_gripper_force, tactile_marker_motion]
       reward_contract: binary_success_plus_inverse_measured_force_v1
       force_reward_source: policy_gripper_net_force
-      training_config: isaaclab_pi05_pirl_realworld_tabero_tacimg_task6_2gpu_100step
-      target_global_step: 100
-      tabero_ppo_transition_boundary_semantics: terminal_observation_first_done_prefix_logprob_default_reset_v1
+      training_config: isaaclab_pi05_pirl_realworld_tabero_tacimg_task6_step23000_fixed_gripper_shared_sim_smoke
+      target_global_step: 1
+      gradient_checkpointing: true
+      gradient_checkpointing_use_reentrant: false
+      tabero_ppo_transition_boundary_semantics: terminal_observation_first_done_prefix_logprob_default_reset_gripper_map_v2
 
 reward:
   use_reward_model: false

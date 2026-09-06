@@ -64,6 +64,7 @@ from rlinf.utils.tabero_ppo_boundary import (
     TABERO_PPO_BOUNDARY_CONTRACTS,
     TABERO_PPO_CHECKPOINT_METADATA_KEY,
     TABERO_PPO_DEFAULT_RESET_TRANSITION_BOUNDARY_SEMANTICS,
+    TABERO_XARM_GRIPPER_MAPPING_CONTRACT,
     validate_tabero_pi05_pirl_deployment_checkpoint,
 )
 
@@ -921,6 +922,32 @@ def _validate_tabero_realworld_action_filter_contract(
     return expected_metadata
 
 
+def _validate_tabero_realworld_gripper_checkpoint_metadata(
+    checkpoint_metadata,
+) -> dict[str, object]:
+    """Require audit metadata for RLinf's fixed XArm gripper boundary."""
+
+    metadata_contract = {
+        "gripper_mapping": TABERO_XARM_GRIPPER_MAPPING_CONTRACT["version"],
+        "policy_gripper_coordinate": TABERO_XARM_GRIPPER_MAPPING_CONTRACT[
+            "policy_coordinate"
+        ],
+        "sim_gripper_coordinate": TABERO_XARM_GRIPPER_MAPPING_CONTRACT[
+            "sim_coordinate"
+        ],
+        "gripper_travel_m": TABERO_XARM_GRIPPER_MAPPING_CONTRACT["travel_m"],
+    }
+    for key, expected in metadata_contract.items():
+        actual = checkpoint_metadata.get(key)
+        if actual != expected:
+            raise ValueError(
+                "RealWorld Tabero training requires auditable "
+                "actor.fsdp_config.trainable_checkpoint_metadata."
+                f"{key}={expected!r}; got {actual!r}."
+            )
+    return metadata_contract
+
+
 def _validate_tabero_realworld_pi05_pirl_contract(cfg, model_cfg) -> None:
     """Fail before Ray starts when the RealWorld PI0.5 PiRL contract drifts."""
 
@@ -1093,6 +1120,9 @@ def _validate_tabero_realworld_pi05_pirl_contract(cfg, model_cfg) -> None:
         cfg,
         checkpoint_metadata,
     )
+    gripper_mapping_metadata = _validate_tabero_realworld_gripper_checkpoint_metadata(
+        checkpoint_metadata,
+    )
     required_checkpoint_metadata = {
         "method": "pirl",
         "task_domain": "realworld",
@@ -1102,9 +1132,9 @@ def _validate_tabero_realworld_pi05_pirl_contract(cfg, model_cfg) -> None:
         "task_description": "pick up the Vitasoy and put it into the basket",
         "control_mode": "hybrid_tactile",
         "reset_source": "task_config_default_reset",
-        "policy_gripper_sign_bridge": False,
         "gripper_coordinate": expected_gripper_coordinate,
         "action_filter": action_filter_metadata,
+        **gripper_mapping_metadata,
         "camera_preprocess": "stretch_480x640_to_224x224_inter_area",
         "model_family": "pi05",
         "openpi_config_name": expected_config_name,
@@ -1195,7 +1225,6 @@ def _validate_tabero_realworld_pi05_pirl_contract(cfg, model_cfg) -> None:
         "task_id": 6,
         "tactile_backend": "taxim_fots",
         "chunk_boundary_mode": "terminal_safe_v1",
-        "policy_gripper_sign_bridge": False,
         "marker_history_len": 8,
         "combined_marker_count": 440,
     }
@@ -1514,6 +1543,9 @@ def _validate_tabero_realworld_pi05_dsrl_contract(cfg, model_cfg) -> None:
     action_filter_metadata = _validate_tabero_realworld_action_filter_contract(
         cfg, checkpoint_metadata
     )
+    gripper_mapping_metadata = _validate_tabero_realworld_gripper_checkpoint_metadata(
+        checkpoint_metadata,
+    )
     required_checkpoint_metadata = {
         "method": "dsrl",
         "task_domain": "realworld",
@@ -1523,9 +1555,9 @@ def _validate_tabero_realworld_pi05_dsrl_contract(cfg, model_cfg) -> None:
         "task_description": "pick up the Vitasoy and put it into the basket",
         "control_mode": "hybrid_tactile",
         "reset_source": "task_config_default_reset",
-        "policy_gripper_sign_bridge": False,
         "gripper_coordinate": expected_gripper_coordinate,
         "action_filter": action_filter_metadata,
+        **gripper_mapping_metadata,
         "camera_preprocess": "stretch_480x640_to_224x224_inter_area",
         "model_family": "pi05",
         "openpi_config_name": expected_config_name,
@@ -1607,7 +1639,6 @@ def _validate_tabero_realworld_pi05_dsrl_contract(cfg, model_cfg) -> None:
         "task_id": 6,
         "tactile_backend": "taxim_fots",
         "chunk_boundary_mode": REALWORLD_TACIMG_DSRL_CHUNK_BOUNDARY_MODE,
-        "policy_gripper_sign_bridge": False,
         "marker_history_len": 8,
         "combined_marker_count": 440,
         "tactile_image_history_len": 8,

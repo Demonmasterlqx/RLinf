@@ -222,6 +222,31 @@ def test_rlt_prefix_cache_passes_tactile_prefix_to_backbone():
     assert captured["tactile_prefix"] is tactile
 
 
+@pytest.mark.parametrize("api_items", [5, 6])
+def test_tactile_preprocess_accepts_pinned_and_tabero_openpi_apis(api_items):
+    model = _bare_model(SimpleNamespace())
+    tactile = torch.randn(2, 9, 396)
+    observation = SimpleNamespace(tactile_prefix=tactile)
+    processed = (
+        [torch.zeros(2, 3, 8, 8)],
+        [torch.ones(2, dtype=torch.bool)],
+        torch.ones(2, 4, dtype=torch.long),
+        torch.ones(2, 4, dtype=torch.bool),
+        torch.zeros(2, 7),
+    )
+    if api_items == 6:
+        processed = (*processed, tactile)
+
+    model._preprocess_observation = MethodType(
+        lambda self, obs, *, train: processed, model
+    )
+
+    result = model._preprocess_observation_with_tactile(observation, train=False)
+
+    assert len(result) == 6
+    assert result[-1] is tactile
+
+
 def test_rlt_image_only_keeps_tactile_token_and_excludes_language():
     model = _bare_model(SimpleNamespace(rlt_image_only=True))
     prefix = torch.arange(7, dtype=torch.float32).reshape(1, 7, 1)
@@ -325,6 +350,8 @@ def test_openpi_sft_dataloader_preserves_tactile_prefix():
     assert loader.data_config() == "data-config"
     assert loader._data_loader is _Delegate._data_loader
     assert set(payload) == {"observation", "actions", "tactile_prefix"}
-    assert not hasattr(payload["observation"], "tactile_prefix")
+    observation_tactile = getattr(payload["observation"], "tactile_prefix", None)
+    if observation_tactile is not None:
+        torch.testing.assert_close(observation_tactile, tactile)
     torch.testing.assert_close(payload["tactile_prefix"], tactile)
     torch.testing.assert_close(payload["actions"], actions)
