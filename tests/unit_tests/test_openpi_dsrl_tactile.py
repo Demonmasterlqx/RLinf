@@ -51,11 +51,12 @@ def _bare_model(config) -> OpenPi0ForRLActionPrediction:
 
 
 def _runtime_model(
-    *, use_tactile: bool, num_images: int = 1
+    *, use_tactile: bool, num_images: int = 1, tactile_input_dim: int = 396
 ) -> OpenPi0ForRLActionPrediction:
     config = SimpleNamespace(
         use_dsrl=True,
         dsrl_use_tactile=use_tactile,
+        dsrl_tactile_input_dim=tactile_input_dim,
         dsrl_tactile_latent_dim=64,
         dsrl_state_dim=7,
         dsrl_action_noise_dim=32,
@@ -371,9 +372,10 @@ def test_dsrl_tactile_rejects_wrong_shape_with_actual_shape(method_name, actual_
         getattr(model, method_name)(_obs(tactile_shape=actual_shape), **kwargs)
 
 
-def test_dsrl_tactile_actor_and_q_shapes_and_gradients_are_independent():
-    model = _runtime_model(use_tactile=True)
-    obs = _obs()
+@pytest.mark.parametrize("marker_count", [198, 440])
+def test_dsrl_tactile_actor_and_q_shapes_and_gradients_are_independent(marker_count):
+    model = _runtime_model(use_tactile=True, tactile_input_dim=marker_count * 2)
+    obs = _obs(tactile_shape=(2, 9, marker_count, 2))
 
     actions, logprobs, _ = model.sac_forward(obs, train=False)
 

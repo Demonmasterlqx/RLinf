@@ -166,6 +166,59 @@ done 字段保持布尔类型。冻结 Pi0 的 diffusion chain、token、model a
 ring checkpoint 按 shard 串行写入。上述语义属于 resume/export 的前置校验
 契约；旧 trajectory replay checkpoint 会在恢复 model 或 optimizer 前被拒绝。
 
+**2.5 Task820 PI0.5 TacField 配置**
+
+Task820 的 marker motion 为 ``[B, 9, 440, 2]``，需要设置
+``actor.model.openpi.dsrl_tactile_input_dim: 880``。该参数控制独立
+actor/critic 触觉编码器的每帧输入宽度，默认值 396 保留原有 198-marker
+模型行为。冻结的 PI0.5 TacField 前缀仍由原模型配置控制。
+此配置使用通用 trajectory replay 和完整 trainable 参数同步；上节的
+compact replay 及选择性同步契约仍固定为 198 markers，不能直接用于此配置。
+
+提供两个本地实验配置，均从 Task820 firm_mixed SFT 的 step-18000 export
+初始化，并使用 TensorBoard 和 W&B：
+
+- ``isaaclab_pi05_dsrl_task820_tacfield_8gpu_smoke``：8 环境，2 次同步
+  runner 调用，每次 1 次 SAC 更新；通过 ``train_embodied_agent.py`` 启动。
+- ``isaaclab_pi05_dsrl_task820_tacfield_8gpu_benchmark``：96 环境，env 位于
+  GPU 0–5、rollout 位于 GPU 6、actor 位于 GPU 7；micro batch 128、global
+  batch 512、梯度累积 4，replay preload 开启、预取 2 批。
+
+benchmark 必须通过 ``train_async.py`` 启动：异步 actor 更新与环境采样重叠，
+``rollout.pipeline_stage_num: 2`` 开启两级采样流水线。
+``runner.use_training_pipeline`` 是 PPO/PIRL 专用开关，SAC 必须保持 false。
+两套配置均关闭 gradient checkpointing、checkpoint 保存、导出、视频与评测。
+配置中的模型、资产和日志路径对应本地工作区；在其他机器上使用前需要调整。
+
+当前 embodied runner 固定每个 epoch 为一次训练调用；若 ``max_steps >= 0``，
+最终调用上限是 ``min(max_epochs, max_steps)``，设为 -1 则只由 max_epochs
+限制。benchmark 两者均为 96，``algorithm.update_epoch: 8``，共执行
+768 次 SAC 更新。这不是 96 次完整采样，也不是遍历数据集 96 次。
+每 2 次 runner 调用请求权重同步，即每 16 次 SAC 更新。
+
+在 8 张 RTX 5090（每卡 32607 MiB）上，该 benchmark 完成了 768 次更新、
+两轮共 5760 个新 transition 入库，正常退出。丢弃前 4 次 runner 调用后的
+replay 训练吞吐为 420.8 samples/s，新数据采样约 5.35–5.50 transitions/s
+（每个 transition 执行 10 个控制步）。actor 显存抽样峰值 30846 MiB。
+这是短程吞吐验证，不代表策略质量或 8 卡持续满载。
+结果见 `W&B 确认实验 <https://wandb.ai/183842220-hkust/tabero-rlinf/runs/529eb1dc58>`_。
+
+从 RLinf 根目录、配置好 W&B 认证后启动：
+
+.. code-block:: bash
+
+   # 进入持久会话后，在其中执行下面的环境设置及训练命令。
+   tmux new-session -s task820_dsrl_benchmark
+   source .venv/bin/activate
+   export REPO_PATH="$PWD"
+   export OMP_NUM_THREADS=4 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=4
+   # 此实验主机验证过的 NCCL 通信设置。
+   export NCCL_SHM_DISABLE=1 NCCL_P2P_DISABLE=1 NCCL_SOCKET_IFNAME=lo
+   # 每个新实验使用独立 run ID；相同实验重试时保持 ID 不变。
+   export WANDB_RUN_ID=task820_dsrl_benchmark_run1 WANDB_RESUME=allow
+   python -u examples/embodiment/train_async.py \
+     --config-name isaaclab_pi05_dsrl_task820_tacfield_8gpu_benchmark
+
 **3. 启动命令**
 
 ::

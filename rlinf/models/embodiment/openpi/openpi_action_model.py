@@ -222,6 +222,7 @@ class OpenPi0Config(Pi0Config):
     dsrl_num_images: int = 1  # Number of ordered DSRL image views
     dsrl_state_latent_dim: int = 64  # Hidden dim for state encoder
     dsrl_use_tactile: bool = False  # Include TacField history in DSRL steering
+    dsrl_tactile_input_dim: int = 396  # Flattened marker coordinates per frame
     dsrl_tactile_latent_dim: int = 64  # Latent dim for each tactile encoder
     dsrl_hidden_dims: tuple = field(
         default_factory=lambda: (128, 128, 128)
@@ -480,7 +481,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         ).to(dtype=dsrl_dtype)
         if self.config.dsrl_use_tactile:
             tactile_encoder_kwargs = {
-                "input_dim": 396,
+                "input_dim": self._dsrl_tactile_input_dim(),
                 "hidden_dim": self.config.dsrl_tactile_latent_dim,
                 "output_dim": self.config.dsrl_tactile_latent_dim,
                 "history_len": 8,
@@ -2259,6 +2260,14 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                     )
         return images
 
+    def _dsrl_tactile_input_dim(self) -> int:
+        input_dim = getattr(self.config, "dsrl_tactile_input_dim", 396)
+        if type(input_dim) is not int or input_dim <= 0 or input_dim % 2:
+            raise ValueError(
+                "DSRL tactile input dimension must be a positive even integer."
+            )
+        return input_dim
+
     def _validate_dsrl_tactile(self, obs, *, batch_size):
         key = "tactile_marker_motion"
         if key not in obs:
@@ -2267,7 +2276,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             )
         tactile = obs[key]
         actual_shape = tuple(tactile.shape) if hasattr(tactile, "shape") else None
-        expected_shape = (batch_size, 9, 198, 2)
+        expected_shape = (batch_size, 9, self._dsrl_tactile_input_dim() // 2, 2)
         if (
             batch_size is None
             or not torch.is_tensor(tactile)
@@ -2282,7 +2291,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
     def _prepare_dsrl_tactile(self, obs, *, batch_size, encoder):
         tactile = self._validate_dsrl_tactile(obs, batch_size=batch_size)
         parameter = next(encoder.parameters())
-        return tactile.reshape(batch_size, 9, 396).to(
+        return tactile.reshape(batch_size, 9, self._dsrl_tactile_input_dim()).to(
             device=parameter.device, dtype=parameter.dtype
         )
 
