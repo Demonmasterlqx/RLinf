@@ -1353,6 +1353,7 @@ class IsaaclabRealWorldTaberoTacFieldEnv(IsaaclabBaseEnv):
         )
         self._marker_history = _RealWorldMarkerHistory(num_envs)
         self._tactile_image_history = _RealWorldTactileImageHistory(num_envs)
+        self._rotvec_history: torch.Tensor | None = None
 
         with open_dict(cfg):
             cfg.init_params.task_description = self._task_description
@@ -1527,6 +1528,7 @@ class IsaaclabRealWorldTaberoTacFieldEnv(IsaaclabBaseEnv):
     def reset(self, seed=None, env_ids: torch.Tensor | None = None):
         self._marker_history.reset(env_ids)
         self._tactile_image_history.reset(env_ids)
+        self._reset_rotvec_history(env_ids)
         update_mask = None
         target_env_ids = None
         if env_ids is not None:
@@ -1856,6 +1858,91 @@ class IsaaclabRealWorldTaberoTacFieldEnv(IsaaclabBaseEnv):
             raise ValueError("RealWorld Hybrid actions must be finite floating point.")
         return actions
 
+    def _reset_rotvec_history(self, env_ids: torch.Tensor | None = None) -> None:
+        """Restore the client's initial branch for just the reset environments."""
+        if env_ids is None:
+            self._rotvec_history = None
+        elif getattr(self, "_rotvec_history", None) is not None:
+            indices = torch.as_tensor(
+                env_ids, device=self._rotvec_history.device, dtype=torch.long
+            )
+            self._rotvec_history[indices] = self._rotvec_history.new_tensor(
+                [math.pi / math.sqrt(2.0), 0.0, math.pi / math.sqrt(2.0)]
+            )
+
+    def _update_rotvec_history(
+        self,
+        quaternion_wxyz: torch.Tensor,
+        update_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Match the client's OnlineWxyzRotvecTracker on each active policy frame.
+
+        History stays on the observation device in float64, matching the client's
+        SciPy calculations before its float32 state conversion. Hold observations
+        must not advance this history after an environment's first done.
+        """
+        if tuple(quaternion_wxyz.shape) != (self.num_envs, 4):
+            raise ValueError("RealWorld WXYZ quaternions must have shape (N, 4).")
+        device = quaternion_wxyz.device
+        mask = (
+            torch.ones(self.num_envs, device=device, dtype=torch.bool)
+            if update_mask is None
+            else torch.as_tensor(update_mask, device=device, dtype=torch.bool)
+        )
+        if tuple(mask.shape) != (self.num_envs,):
+            raise ValueError("RealWorld rotvec update mask must have shape (N,).")
+        quaternion = quaternion_wxyz[mask].to(dtype=torch.float64)
+        norm = torch.linalg.vector_norm(quaternion, dim=-1, keepdim=True)
+        if (
+            not torch.isfinite(quaternion).all()
+            or not torch.isfinite(norm).all()
+            or (norm == 0).any()
+        ):
+            raise ValueError("RealWorld quaternions must be finite and nonzero.")
+        quaternion = quaternion / norm
+
+        # SciPy canonicalizes q/-q, including the exact half-turn tie at w=0.
+        w, x, y, z = quaternion.unbind(dim=-1)
+        flip = (w < 0) | (
+            (w == 0) & ((x < 0) | ((x == 0) & ((y < 0) | ((y == 0) & (z < 0)))))
+        )
+        quaternion = torch.where(flip[:, None], -quaternion, quaternion)
+        sin_half = torch.linalg.vector_norm(quaternion[:, 1:], dim=-1, keepdim=True)
+        angle = 2.0 * torch.atan2(sin_half, quaternion[:, :1])
+        canonical = quaternion[:, 1:] * (
+            angle / sin_half.clamp(min=torch.finfo(torch.float64).tiny)
+        )
+        angle = torch.linalg.vector_norm(canonical, dim=-1, keepdim=True)
+
+        history = getattr(self, "_rotvec_history", None)
+        if history is None:
+            history = quaternion.new_tensor(
+                [math.pi / math.sqrt(2.0), 0.0, math.pi / math.sqrt(2.0)]
+            ).repeat(self.num_envs, 1)
+        reference = history[mask]
+        axis = canonical / angle.clamp(min=1e-12)
+        two_pi = 2.0 * math.pi
+        center = torch.round(
+            ((reference * axis).sum(dim=-1, keepdim=True) - angle) / two_pi
+        )
+        offsets = quaternion.new_tensor([-1.0, 0.0, 1.0]).view(1, 3, 1)
+        candidates = (
+            canonical[:, None] + (center[:, None] + offsets) * two_pi * axis[:, None]
+        )
+        distances = torch.linalg.vector_norm(candidates - reference[:, None], dim=-1)
+        nearest = candidates[
+            torch.arange(reference.shape[0], device=device), distances.argmin(dim=1)
+        ]
+        reference_norm = torch.linalg.vector_norm(reference, dim=-1, keepdim=True)
+        identity_branch = (
+            reference
+            / reference_norm.clamp(min=1e-12)
+            * (torch.round(reference_norm / two_pi) * two_pi)
+        )
+        history[mask] = torch.where(angle < 1e-12, identity_branch, nearest)
+        self._rotvec_history = history
+        return history.to(dtype=torch.float32)
+
     def _wrap_obs(
         self,
         obs: dict[str, Any],
@@ -1895,10 +1982,14 @@ class IsaaclabRealWorldTaberoTacFieldEnv(IsaaclabBaseEnv):
                     f"got {tuple(image.shape)}."
                 )
 
+        state = _build_state(policy_obs)
+        state[:, 3:6] = self._update_rotvec_history(
+            policy_obs["eef_pose"][:, 3:7], update_mask=marker_update_mask
+        )
         env_obs = {
             "main_images": main_image,
             "wrist_images": wrist_image,
-            "states": _build_state(policy_obs),
+            "states": state,
             "task_descriptions": [self._task_description] * self.num_envs,
             "tactile_marker_motion": self._marker_history.update(
                 policy_obs["gripper_marker_motion"],
