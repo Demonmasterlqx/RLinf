@@ -175,9 +175,13 @@ def get_model(cfg: DictConfig, torch_dtype=None):
     else:
         # We are loading the norm stats from the checkpoint instead of the config assets dir to make sure
         # that the policy is using the same normalization stats as the original training process.
-        if data_config.asset_id is None:
+        checkpoint_contract = cfg.get("tabero_pi05_checkpoint_contract", {})
+        asset_id = checkpoint_contract.get(
+            "expected_norm_asset_id", data_config.asset_id
+        )
+        if asset_id is None:
             raise ValueError("Asset id is required to load norm stats.")
-        norm_stats = _checkpoints.load_norm_stats(checkpoint_dir, data_config.asset_id)
+        norm_stats = _checkpoints.load_norm_stats(checkpoint_dir, asset_id)
     # wrappers
     repack_transforms = transforms.Group()
     default_prompt = None

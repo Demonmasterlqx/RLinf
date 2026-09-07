@@ -53,6 +53,10 @@ TABERO_PPO_BOUNDARY_CONTRACTS = {
 }
 TABERO_PPO_CHECKPOINT_METADATA_KEY = "tabero_ppo_transition_boundary_semantics"
 TABERO_PI05_TACFIELD_CONFIG_NAME = "pi05_lora_tacfield_tabero_xarm_gripper"
+TABERO_PI05_TACFIELD_CONFIG_NAMES = (
+    TABERO_PI05_TACFIELD_CONFIG_NAME,
+    "pi05_lora_tacfield_realworld_replayed_task820",
+)
 TABERO_PI05_TACIMG_CONFIG_NAME = "pi05_lora_tacimg_realworld_replayed_task820_force"
 
 
@@ -153,6 +157,7 @@ def validate_tabero_pi05_pirl_deployment_checkpoint(
     expected_dataset: str,
     expected_gripper_coordinate: str,
     require_final: bool,
+    expected_action_horizon: int | None = None,
 ) -> dict[str, Any]:
     """Validate a local merged PI0.5 tactile checkpoint before Ray starts.
 
@@ -186,14 +191,19 @@ def validate_tabero_pi05_pirl_deployment_checkpoint(
     expected_gripper_coordinate = _validate_expected_string(
         expected_gripper_coordinate, field="expected_gripper_coordinate"
     )
-    if expected_config_name == TABERO_PI05_TACFIELD_CONFIG_NAME:
+    if expected_config_name in TABERO_PI05_TACFIELD_CONFIG_NAMES:
+        action_horizon = (
+            10 if expected_action_horizon is None else expected_action_horizon
+        )
+        if type(action_horizon) is not int or action_horizon not in (10, 50):
+            raise ValueError("Tabero TacField PiRL action horizon must be 10 or 50.")
         export_method = "sft_full_lora_tacfield"
         source_metadata_contract = {
             "dataset": expected_dataset,
             "model_family": "pi05",
             "openpi_config_name": expected_config_name,
             "deployment_config_name": expected_config_name,
-            "action_horizon": 10,
+            "action_horizon": action_horizon,
             "effective_action_dim": 13,
             "tactile_prefix_dim_in": 9 * 440 * 2,
             "tactile_prefix_history": 8,
@@ -201,12 +211,12 @@ def validate_tabero_pi05_pirl_deployment_checkpoint(
         }
         model_config_contract = {
             "action_dim": 32,
-            "action_horizon": 10,
+            "action_horizon": action_horizon,
             "pi05": True,
             "discrete_state_input": True,
             "config_name": expected_config_name,
             "num_images_in_input": 2,
-            "action_chunk": 10,
+            "action_chunk": action_horizon,
             "action_env_dim": 13,
             "num_steps": 10,
             "tactile_type": "expert_his_c_fut",

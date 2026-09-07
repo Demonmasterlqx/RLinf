@@ -59,7 +59,7 @@ from rlinf.utils.placement import (
     PlacementMode,
 )
 from rlinf.utils.tabero_ppo_boundary import (
-    TABERO_PI05_TACFIELD_CONFIG_NAME,
+    TABERO_PI05_TACFIELD_CONFIG_NAMES,
     TABERO_PI05_TACIMG_CONFIG_NAME,
     TABERO_PPO_BOUNDARY_CONTRACTS,
     TABERO_PPO_CHECKPOINT_METADATA_KEY,
@@ -1002,12 +1002,15 @@ def _validate_tabero_realworld_pi05_pirl_contract(cfg, model_cfg) -> None:
         "detach_critic_input": True,
         "use_dsrl": False,
     }
-    if config_name == TABERO_PI05_TACFIELD_CONFIG_NAME:
+    if config_name in TABERO_PI05_TACFIELD_CONFIG_NAMES:
         tactile_kind = "tacfield"
+        action_horizon = openpi_cfg.get("action_horizon")
+        if type(action_horizon) is not int or action_horizon not in (10, 50):
+            raise ValueError("RealWorld TacField PiRL action horizon must be 10 or 50.")
         required_openpi_values = {
             **common_openpi_values,
-            "config_name": TABERO_PI05_TACFIELD_CONFIG_NAME,
-            "action_horizon": 10,
+            "config_name": config_name,
+            "action_horizon": action_horizon,
             "num_images_in_input": 2,
             "tactile_prefix_dim_in": 9 * 440 * 2,
             "tactile_prefix_history": 8,
@@ -1105,6 +1108,7 @@ def _validate_tabero_realworld_pi05_pirl_contract(cfg, model_cfg) -> None:
         expected_dataset=expected_dataset,
         expected_gripper_coordinate=expected_gripper_coordinate,
         require_final=require_final,
+        expected_action_horizon=openpi_cfg.get("action_horizon"),
     )
     if allow_non_final_formal_training and checkpoint_info["is_final"] is not False:
         raise ValueError(
@@ -1143,7 +1147,7 @@ def _validate_tabero_realworld_pi05_pirl_contract(cfg, model_cfg) -> None:
         "base_model_sha256": checkpoint_contract.get("expected_model_sha256"),
         "base_norm_stats_sha256": checkpoint_contract.get("expected_norm_stats_sha256"),
         "base_checkpoint_require_final": require_final,
-        "action_horizon": 50 if tactile_kind == "tacimg" else 10,
+        "action_horizon": openpi_cfg.get("action_horizon"),
         "execution_horizon": 10,
         "effective_action_dim": 13,
         "state_dim": 7,
@@ -1783,7 +1787,7 @@ def validate_embodied_cfg(cfg):
         openpi_cfg = model_cfg.get("openpi", {})
         expected_openpi_configs = (
             {
-                TABERO_PI05_TACFIELD_CONFIG_NAME,
+                *TABERO_PI05_TACFIELD_CONFIG_NAMES,
                 TABERO_PI05_TACIMG_CONFIG_NAME,
             }
             if ppo_boundary_semantics
