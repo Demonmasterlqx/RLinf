@@ -28,8 +28,15 @@ from rlinf.algorithms.rlt.route import (
     SimulatorRLTRoute,
     build_rlt_route,
 )
-from rlinf.algorithms.rlt.transition import use_simulator_transition_replay
-from rlinf.data.embodied_io_struct import Trajectory
+from rlinf.algorithms.rlt.transition import (
+    update_rlt_transitions,
+    use_simulator_transition_replay,
+)
+from rlinf.data.embodied_io_struct import (
+    ChunkStepResult,
+    EmbodiedRolloutResult,
+    Trajectory,
+)
 from rlinf.data.replay_buffer import TrajectoryReplayBuffer
 from rlinf.models.embodiment.mlp_policy import get_model as get_mlp_model
 from rlinf.models.embodiment.mlp_policy.rlt_mlp_policy import RLTMLPPolicy
@@ -44,6 +51,7 @@ from rlinf.workers.actor.fsdp_rlt_ac_policy_worker import (
     RLTACReplayMixin,
 )
 from rlinf.workers.actor.fsdp_sac_policy_worker import EmbodiedSACFSDPPolicy
+from rlinf.workers.env.env_worker import EnvWorker
 
 
 def _rlt_obs(batch_size: int = 2) -> dict[str, torch.Tensor]:
@@ -871,3 +879,87 @@ def test_run_training_reports_post_update_schedule_step(monkeypatch):
 
     assert worker.update_step == 1
     assert metrics["rlt/update_step"] == 1.0
+
+
+@pytest.mark.parametrize("num_epochs", [1, 2])
+@pytest.mark.parametrize("collect_prev_infos", [False, True])
+def test_rlt_bootstrap_closes_transition_without_recording_unexecuted_action(
+    num_epochs, collect_prev_infos
+):
+    result = EmbodiedRolloutResult(max_episode_length=20)
+    pending = [None]
+    env_worker = SimpleNamespace(enable_rlt=True, collect_prev_infos=collect_prev_infos)
+    for epoch in range(num_epochs):
+        for t in range(3):
+            value = float(epoch * 10 + t)
+            obs = {
+                key: torch.full((1, 1), value)
+                for key in ("z_rl", "proprio", "ref_chunk")
+            }
+            forward = {
+                **obs,
+                **{f"rlt_transition_{key}": tensor for key, tensor in obs.items()},
+                "action": torch.full((1, 1), value),
+                "record_transition": torch.ones(1, 1, dtype=torch.bool),
+            }
+            rollout = SimpleNamespace(
+                forward_inputs=forward,
+                prev_logprobs=torch.zeros(1, 1),
+                prev_values=torch.zeros(1, 1),
+                versions=torch.ones(1, 1),
+            )
+            env = SimpleNamespace(
+                dones=torch.tensor([[t == 2]]),
+                terminations=torch.tensor([[t == 2]]),
+                truncations=torch.zeros(1, 1, dtype=torch.bool),
+            )
+            reward = torch.tensor([[float(t)]])
+            if t == 2:
+                step = EnvWorker._build_bootstrap_step_result(
+                    env_worker, env, rollout, reward
+                )
+            else:
+                step = ChunkStepResult(
+                    actions=forward["action"],
+                    forward_inputs=forward,
+                    versions=rollout.versions,
+                    rewards=reward,
+                    dones=env.dones,
+                    terminations=env.terminations,
+                    truncations=env.truncations,
+                    prev_logprobs=rollout.prev_logprobs if collect_prev_infos else None,
+                    prev_values=rollout.prev_values if collect_prev_infos else None,
+                )
+            result.append_step_result(step)
+            update_rlt_transitions(0, pending, [result], rollout, cache_current=t < 2)
+    trajectory = result.to_trajectory()
+    assert trajectory.actions.shape[0] == 2 * num_epochs
+    assert trajectory.curr_obs["z_rl"].shape[0] == 2 * num_epochs
+    assert trajectory.dones.shape[0] == 3 * num_epochs
+    assert pending == [None]
+    worker = RLTACReplayMixin()
+    worker.cfg = OmegaConf.create({"env": {"train": {"auto_reset": False}}})
+    worker.replay_buffer = TrajectoryReplayBuffer(auto_save=False)
+    transitions, completed = worker._transition_replay_trajectories(trajectory)
+    assert completed == num_epochs
+    assert [row.actions.item() for row in transitions] == [
+        float(epoch * 10 + t) for epoch in range(num_epochs) for t in range(2)
+    ]
+    assert [row.rewards.item() for row in transitions] == [1.0, 2.0] * num_epochs
+    assert [row.dones.item() for row in transitions] == [False, True] * num_epochs
+
+
+def test_non_rlt_bootstrap_preserves_rollout_fields():
+    worker = SimpleNamespace(enable_rlt=False, collect_prev_infos=True)
+    rollout = SimpleNamespace(
+        forward_inputs={"action": torch.ones(1, 2)},
+        prev_logprobs=torch.zeros(1, 1),
+        prev_values=torch.zeros(1, 1),
+        versions=torch.ones(1, 1),
+    )
+    env = SimpleNamespace(dones=None, terminations=None, truncations=None)
+    step = EnvWorker._build_bootstrap_step_result(worker, env, rollout, None)
+    assert step.actions is rollout.forward_inputs["action"]
+    assert step.forward_inputs is rollout.forward_inputs
+    assert step.prev_logprobs is rollout.prev_logprobs
+    assert step.versions is rollout.versions

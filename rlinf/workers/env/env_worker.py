@@ -869,6 +869,37 @@ class EnvWorker(Worker):
 
         return infer_batch_size(data)
 
+    def _build_bootstrap_step_result(
+        self,
+        env_output: EnvOutput,
+        rollout_result: RolloutResult,
+        rewards: torch.Tensor | None,
+    ) -> ChunkStepResult:
+        """Keep RLT bootstrap features out of the executed-action trajectory."""
+        return ChunkStepResult(
+            actions=(
+                None
+                if self.enable_rlt
+                else rollout_result.forward_inputs.get("action", None)
+            ),
+            prev_logprobs=(
+                rollout_result.prev_logprobs
+                if self.collect_prev_infos and not self.enable_rlt
+                else None
+            ),
+            prev_values=(
+                rollout_result.prev_values if self.collect_prev_infos else None
+            ),
+            # update_rlt_transitions consumes the original rollout result below
+            # to finish the last transition; its action was never executed.
+            forward_inputs={} if self.enable_rlt else rollout_result.forward_inputs,
+            versions=None if self.enable_rlt else rollout_result.versions,
+            dones=env_output.dones,
+            truncations=env_output.truncations,
+            terminations=env_output.terminations,
+            rewards=rewards,
+        )
+
     @Worker.timer("compute_bootstrap_rewards")
     def compute_bootstrap_rewards(
         self,
@@ -1400,22 +1431,8 @@ class EnvWorker(Worker):
                 rewards = self.compute_bootstrap_rewards(
                     env_output, rollout_result.bootstrap_values, reward_model_output
                 )
-                chunk_step_result = ChunkStepResult(
-                    actions=rollout_result.forward_inputs.get("action", None),
-                    prev_logprobs=(
-                        rollout_result.prev_logprobs
-                        if self.collect_prev_infos
-                        else None
-                    ),
-                    prev_values=(
-                        rollout_result.prev_values if self.collect_prev_infos else None
-                    ),
-                    forward_inputs=rollout_result.forward_inputs,
-                    versions=rollout_result.versions,
-                    dones=env_output.dones,
-                    truncations=env_output.truncations,
-                    terminations=env_output.terminations,
-                    rewards=rewards,
+                chunk_step_result = self._build_bootstrap_step_result(
+                    env_output, rollout_result, rewards
                 )
                 if self.compact_dsrl_replay:
                     chunk_step_result = project_compact_dsrl_step_result(

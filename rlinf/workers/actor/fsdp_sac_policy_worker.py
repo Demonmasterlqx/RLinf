@@ -191,6 +191,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         # Record names before FSDP wrapping. DSRL rollout sync is intentionally
         # limited to actor-side steering parameters; other policies retain the
         # existing trainable-parameter and persistent-buffer behavior.
+        self.trainable_param_names = self._collect_trainable_param_names(module)
         if self._rollout_sync_prefixes is not None:
             rollout_state_dict = select_named_parameters_by_prefix(
                 module, self._rollout_sync_prefixes

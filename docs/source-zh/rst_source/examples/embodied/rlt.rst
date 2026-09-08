@@ -654,6 +654,11 @@ rollout worker 会返回 RLT 特征，learner 侧把这些特征组装成 transi
    action   = 实际发送给环境的 action chunk
    next_obs = {next_z_rl, next_proprio, next_ref_chunk}
 
+每个 rollout epoch 末尾额外推理一次，用于补齐最后一条 transition 的下一状态。
+该 bootstrap 推理的动作没有发送给环境，因此不会追加到动作、动作版本或
+``forward_inputs`` 轨迹中；奖励和终止标记仍会保留，以对齐最后一个实际执行的
+action chunk。同步和异步入口都遵守这一规则。
+
 这意味着：
 
 - 真机切换前的 step 仍然会用于训练。这些 step 的执行动作是 VLA reference action，transition 也会进入同一个 replay buffer。
@@ -727,3 +732,6 @@ rollout worker 会返回 RLT 特征，learner 侧把这些特征组装成 transi
 - Stage 1、Stage 2 和 checkpoint assets 中的 ``norm_stats.json`` 必须来自同一套数据语义和同一个 ``repo_id``。推荐通过 ``openpi_data.norm_stats_path`` 显式指定，避免 Stage 1 checkpoint 未写入 norm stats 时加载失败。
 - ``rollout.rlt_feature_model.model_path`` 应指向 Stage 1 FSDP 检查点下的 ``actor`` 目录，例如 ``.../checkpoints/global_step_<step>/actor``。
 - 添加仿真示例时，可以新建仿真环境配置，保留 ``loss_type: rlt_ac`` 和 ``rollout.rlt_feature_model``，再把真机阶段切换逻辑替换成适合仿真的逻辑。
+
+Stage 2 MLP 的 FSDP 配置使用 ``use_orig_params: false``。SAC/RLT worker 在
+FSDP 包装前记录可训练参数名，保证展平参数后仍可导出 ``trainable_weights.pt``。
