@@ -1,0 +1,47 @@
+defaults:
+- isaaclab_pi05_pirl_task820_tacfield_8gpu_benchmark
+- _self_
+runner:
+  logger:
+    log_path: /data/home/chenxiangyu/Tabero/results/2026-09-09_15-31-54-task820-cookie-no_adverb-pirl_action_expert_lora-8gpu-gc-forceoff-10k
+    experiment_name: 2026-09-09_15-31-54-task820-cookie-no_adverb-pirl_action_expert_lora-8gpu-gc-forceoff-10k
+  max_epochs: 10000
+  max_steps: 10000
+  only_eval: false
+  val_check_interval: -1
+  save_interval: 10
+env:
+  train:
+    init_params:
+      realworld_config_dir: /data/home/chenxiangyu/Tabero/Tabero_X/benchmarks/datasets/realworld/config/pos_random_config
+      target_object: target_object_3
+      task_description: pick up the cookie and put it into the basket
+      success:
+        force_bonus:
+          enabled: false
+  eval:
+    init_params:
+      realworld_config_dir: /data/home/chenxiangyu/Tabero/Tabero_X/benchmarks/datasets/realworld/config/pos_random_config
+      target_object: target_object_3
+      task_description: pick up the cookie and put it into the basket
+      success:
+        force_bonus:
+          enabled: false
+rollout:
+  model:
+    model_path: /data/home/chenxiangyu/Tabero/models/pi05_realworld_replay_task820_firm_mixed_tacfield_sft_step18000
+actor:
+  model:
+    model_path: /data/home/chenxiangyu/Tabero/models/pi05_realworld_replay_task820_firm_mixed_tacfield_sft_step18000
+  fsdp_config:
+    trainable_checkpoint_metadata:
+      semantic_task_ids:
+      - 4
+      target_object: target_object_3
+      task_description: pick up the cookie and put it into the basket
+      training_config: isaaclab_pi05_pirl_task820_cookie_no_adverb_tacfield_8gpu_10k_gc_forceoff
+      target_global_step: 10000
+      gradient_checkpointing: true
+      reward_contract: binary_success_v1
+      force_reward_source: disabled
+    gradient_checkpointing: true

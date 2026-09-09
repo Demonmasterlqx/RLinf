@@ -1776,7 +1776,8 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             "eager"  # noqa: SLF001
         )
 
-        outputs_embeds, _ = self.paligemma_with_expert.forward(
+        outputs_embeds, _ = self._apply_checkpoint(
+            self.paligemma_with_expert.forward,
             attention_mask=full_att_2d_masks_4d,
             position_ids=position_ids,
             past_key_values=past_key_values,
@@ -1870,13 +1871,21 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
         self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
-        (prefix_output, _), past_key_values = self.paligemma_with_expert.forward(
-            attention_mask=prefix_att_2d_masks_4d,
-            position_ids=prefix_position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, None],
-            use_cache=True,
-        )
+        # Gemma disables KV cache creation when its checkpointing flag is set.
+        # Keep the prefix cache available to the checkpointed suffix forward.
+        language_model = self.paligemma_with_expert.paligemma.language_model
+        checkpointing = getattr(language_model, "gradient_checkpointing", False)
+        language_model.gradient_checkpointing = False
+        try:
+            (prefix_output, _), past_key_values = self.paligemma_with_expert.forward(
+                attention_mask=prefix_att_2d_masks_4d,
+                position_ids=prefix_position_ids,
+                past_key_values=None,
+                inputs_embeds=[prefix_embs, None],
+                use_cache=True,
+            )
+        finally:
+            language_model.gradient_checkpointing = checkpointing
         return prefix_output, prefix_pad_masks, past_key_values
 
     def _compute_value_from_suffix(self, suffix_out):

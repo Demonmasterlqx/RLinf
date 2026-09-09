@@ -951,6 +951,18 @@ def _validate_tabero_realworld_gripper_checkpoint_metadata(
 def _validate_tabero_realworld_pi05_pirl_contract(cfg, model_cfg) -> None:
     """Fail before Ray starts when the RealWorld PI0.5 PiRL contract drifts."""
 
+    from rlinf.envs.isaaclab.tasks.realworld_tabero_tacfield import (
+        REALWORLD_TARGET_PROMPTS,
+    )
+
+    target_object = cfg.env.train.get("init_params", {}).get("target_object")
+    task_description = REALWORLD_TARGET_PROMPTS.get(target_object)
+    if task_description is None:
+        raise ValueError(
+            "RealWorld Tabero PI0.5 PiRL requires a supported target_object; "
+            f"expected one of {sorted(REALWORLD_TARGET_PROMPTS)}, got {target_object!r}."
+        )
+
     required_model_values = {
         "num_action_chunks": 10,
         "action_dim": 13,
@@ -1132,8 +1144,8 @@ def _validate_tabero_realworld_pi05_pirl_contract(cfg, model_cfg) -> None:
         "task_domain": "realworld",
         "task_suite": "gentle_grasp",
         "task_id": 6,
-        "target_object": "target_object_1",
-        "task_description": "pick up the Vitasoy and put it into the basket",
+        "target_object": target_object,
+        "task_description": task_description,
         "control_mode": "hybrid_tactile",
         "reset_source": "task_config_default_reset",
         "gripper_coordinate": expected_gripper_coordinate,
@@ -1222,8 +1234,8 @@ def _validate_tabero_realworld_pi05_pirl_contract(cfg, model_cfg) -> None:
 
     expected_env_values = {
         "id": "Isaac-RealWorld-GentleGrasp-XarmUmi-Hybrid-Tactile-v0",
-        "target_object": "target_object_1",
-        "task_description": "pick up the Vitasoy and put it into the basket",
+        "target_object": target_object,
+        "task_description": task_description,
         "reset_source": "task_config_default_reset",
         "task_suite": "gentle_grasp",
         "task_id": 6,
