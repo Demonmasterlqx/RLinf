@@ -60,6 +60,40 @@ from rlinf.utils.utils import (
 from rlinf.workers.env.history_manager import HistoryManager
 
 _TABERO_CHUNK_EPISODE_RECORDS_KEY = "_tabero_chunk_episode_records"
+_REALWORLD_FIRST_EPISODE_RECORDS_KEY = "_realworld_first_episode_records"
+
+
+def realworld_first_episode_records_to_env_info(
+    records: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Keep completed first-episode samples separate from per-chunk diagnostics."""
+    fields = (
+        "success_once",
+        "return",
+        "episode_len",
+        "reward",
+        "termination",
+        "truncation",
+    )
+    if not records:
+        return {key: torch.empty(0) for key in fields}
+    missing = {"env_index", *fields} - records.keys()
+    if missing:
+        raise ValueError(f"RealWorld episode records missing fields: {sorted(missing)}")
+    count = records["env_index"].numel()
+    if any(value.ndim != 1 or value.numel() != count for value in records.values()):
+        raise ValueError("RealWorld episode records must be aligned 1D tensors.")
+    if records["env_index"].unique().numel() != count:
+        raise ValueError(
+            "RealWorld first-episode records contain duplicate environments."
+        )
+    if (records["episode_len"] <= 0).any():
+        raise ValueError("RealWorld completed episode lengths must be positive.")
+    return {
+        key: value.detach().cpu()
+        for key, value in records.items()
+        if key != "env_index"
+    }
 
 
 def tabero_chunk_episode_records_to_env_info(
@@ -628,7 +662,13 @@ class EnvWorker(Worker):
             if isinstance(infos, dict)
             else None
         )
-        if tabero_episode_records is not None:
+        if _REALWORLD_FIRST_EPISODE_RECORDS_KEY in infos:
+            env_info.update(
+                realworld_first_episode_records_to_env_info(
+                    infos[_REALWORLD_FIRST_EPISODE_RECORDS_KEY]
+                )
+            )
+        elif tabero_episode_records is not None:
             env_info.update(
                 tabero_chunk_episode_records_to_env_info(tabero_episode_records)
             )
@@ -733,7 +773,13 @@ class EnvWorker(Worker):
             if isinstance(infos, dict)
             else None
         )
-        if tabero_episode_records is not None:
+        if _REALWORLD_FIRST_EPISODE_RECORDS_KEY in infos:
+            env_info.update(
+                realworld_first_episode_records_to_env_info(
+                    infos[_REALWORLD_FIRST_EPISODE_RECORDS_KEY]
+                )
+            )
+        elif tabero_episode_records is not None:
             env_info.update(
                 tabero_chunk_episode_records_to_env_info(tabero_episode_records)
             )
@@ -1186,6 +1232,18 @@ class EnvWorker(Worker):
         for key, value in env_info.items():
             env_metrics.setdefault(key, []).append(value)
 
+    def should_record_env_metrics(
+        self, env_output: EnvOutput, env_info: dict[str, Any], chunk_step_idx: int
+    ) -> bool:
+        """Record explicit terminal samples on every chunk, including empty batches."""
+        return (
+            self.cfg.env.train.auto_reset
+            or self.cfg.env.train.ignore_terminations
+            or chunk_step_idx == self.n_train_chunk_steps - 1
+            or any(key.startswith("reward_audit/") for key in env_info)
+            or _REALWORLD_FIRST_EPISODE_RECORDS_KEY in (env_output.env_infos or {})
+        )
+
     def store_last_obs_and_intervened_info(self, env_output_list: list[EnvOutput]):
         self.last_obs_list = [env_output.obs for env_output in env_output_list]
         self.last_intervened_info_list = [
@@ -1387,13 +1445,9 @@ class EnvWorker(Worker):
                         )
 
                     env_outputs[stage_id] = env_output
-                    should_record = (
-                        self.cfg.env.train.auto_reset
-                        or self.cfg.env.train.ignore_terminations
-                        or chunk_step_idx == self.n_train_chunk_steps - 1
-                        or any(key.startswith("reward_audit/") for key in env_info)
-                    )
-                    if should_record:
+                    if self.should_record_env_metrics(
+                        env_output, env_info, chunk_step_idx
+                    ):
                         self.record_env_metrics(env_metrics, env_info)
 
             for stage_id in range(self.stage_num):

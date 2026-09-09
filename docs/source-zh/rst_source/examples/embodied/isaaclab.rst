@@ -281,3 +281,22 @@
 感谢 `许明辉 <https://github.com/smallcracker>`__ 和
 `杨楠 <https://github.com/AquaSage18>`__ 对 GR00T N1.5 示例的贡献与支持，也感谢
 `Yifan Wu <https://github.com/YifWRobotics>`__ 对 OpenPI π₀.₅ 示例的贡献与支持。
+
+
+Tabero RealWorld 首次轨迹指标
+----------------------------
+
+RealWorld 的 ``auto_reset=false`` rollout 每个环境只使用第一次终止之前的动作训练。
+环境在 chunk 边界仍会局部 reset，因此指标在首次成功或超时时复制保存；
+后续局部 reset 和替代轨迹不会覆盖这些记录。下一次整体 reset 开始新一轮计数。
+
+``env/success_once`` 为首次轨迹的成功比例，``env/return`` 为累计奖励均值，
+``env/reward`` 为各轨迹累计奖励除以实际长度后的均值。
+``env/num_trajectories`` 按完成的 episode 记录计数，与 chunk 诊断数量分开。
+记录覆盖成功动作所在的 chunk 中间和边界，并在完整 episode horizon 到达时检查遗漏。
+这些记录不改变逐步 reward、终止标记、GAE 或 PPO mask。
+
+可设置 ``env.train.init_params.episode_records_dir`` 保存逐轨迹 JSONL。
+每个文件按 seed 和进程 ID 区分，记录包含 ``rollout_index``、``env_index``、
+成功、奖励、长度、终止原因及可用的力指标。无有效力样本的非有限值写为 JSON ``null``。
+视频可通过相同 seed 与 ``env_index`` 对应网格位置；首次轨迹结束后的画面属于替代轨迹。

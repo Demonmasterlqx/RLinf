@@ -525,6 +525,8 @@ def _validate_hybrid_action_cfg(
     controller_cfg = getattr(ik_cfg, "controller", None)
     if bool(getattr(controller_cfg, "use_relative_mode", True)):
         raise ValueError("RealWorld Hybrid control requires absolute EEF poses.")
+
+
 def _build_state(
     policy_obs: dict[str, torch.Tensor],
 ) -> torch.Tensor:
@@ -1337,9 +1339,11 @@ class IsaaclabRealWorldTaberoTacFieldEnv(IsaaclabBaseEnv):
             _cfg_get(init_params, "gripper_diagnostics_path", "")
         ).strip()
         self._gripper_diagnostics_path = (
-            Path(diagnostics_path).expanduser().resolve()
-            if diagnostics_path
-            else None
+            Path(diagnostics_path).expanduser().resolve() if diagnostics_path else None
+        )
+        records_dir = str(_cfg_get(init_params, "episode_records_dir", "")).strip()
+        self._episode_records_dir = (
+            Path(records_dir).expanduser() if records_dir else None
         )
         self._target_object = target_object
         self._reset_source = reset_source
@@ -1459,12 +1463,8 @@ class IsaaclabRealWorldTaberoTacFieldEnv(IsaaclabBaseEnv):
                             "coefficient": self._force_bonus["coefficient"],
                             "epsilon": self._force_bonus["epsilon"],
                             "max_bonus": self._force_bonus["max_bonus"],
-                            "min_valid_samples": self._force_bonus[
-                                "min_valid_samples"
-                            ],
-                            "contact_epsilon": self._force_bonus[
-                                "contact_epsilon"
-                            ],
+                            "min_valid_samples": self._force_bonus["min_valid_samples"],
+                            "contact_epsilon": self._force_bonus["contact_epsilon"],
                         }
                     )
                     reward_func = make_trajectory_force_success_reward_term(
@@ -1526,6 +1526,17 @@ class IsaaclabRealWorldTaberoTacFieldEnv(IsaaclabBaseEnv):
         return make_env_isaaclab
 
     def reset(self, seed=None, env_ids: torch.Tensor | None = None):
+        if env_ids is None:
+            # Partial resets start replacement episodes, which PPO masks out.
+            # Only a full rollout reset starts a new first-episode cohort.
+            self._first_episode_completed = torch.zeros(
+                self.num_envs, dtype=torch.bool, device=self.device
+            )
+            self._first_episode_pending = []
+            self._episode_rollout_index = (
+                getattr(self, "_episode_rollout_index", -1) + 1
+            )
+            self._episode_rollout_steps = 0
         self._marker_history.reset(env_ids)
         self._tactile_image_history.reset(env_ids)
         self._reset_rotvec_history(env_ids)
@@ -1550,6 +1561,61 @@ class IsaaclabRealWorldTaberoTacFieldEnv(IsaaclabBaseEnv):
         self._reset_metrics(target_env_ids)
         return obs, {}
 
+    def _capture_first_episode(
+        self,
+        episode: dict[str, torch.Tensor],
+        terminations: torch.Tensor,
+        truncations: torch.Tensor,
+    ) -> None:
+        """Copy first terminal metrics before reset, independently of rewards."""
+        done = terminations | truncations
+        completed = getattr(self, "_first_episode_completed", None)
+        if completed is None:
+            completed = torch.zeros_like(done)
+            self._first_episode_completed = completed
+        selected = done & ~completed
+        if not selected.any():
+            return
+        records = {
+            key: value[selected].detach().clone() for key, value in episode.items()
+        }
+        records.update(
+            env_index=torch.nonzero(selected, as_tuple=False).squeeze(-1),
+            termination=terminations[selected].clone(),
+            truncation=truncations[selected].clone(),
+        )
+        pending = getattr(self, "_first_episode_pending", [])
+        pending.append(records)
+        self._first_episode_pending = pending
+        completed |= selected
+        records_dir = getattr(self, "_episode_records_dir", None)
+        if records_dir is not None:
+            records_dir.mkdir(parents=True, exist_ok=True)
+            path = records_dir / f"seed_{self.seed}_pid_{os.getpid()}.jsonl"
+            columns = {key: value.cpu().tolist() for key, value in records.items()}
+            with path.open("a") as stream:
+                for index in range(int(selected.sum())):
+                    row = {key: values[index] for key, values in columns.items()}
+                    row = {
+                        key: None
+                        if isinstance(value, float) and not math.isfinite(value)
+                        else value
+                        for key, value in row.items()
+                    }
+                    row.update(
+                        seed=self.seed, rollout_index=self._episode_rollout_index
+                    )
+                    stream.write(json.dumps(row, allow_nan=False) + "\n")
+
+    def _drain_first_episode_records(self) -> dict[str, torch.Tensor]:
+        pending = getattr(self, "_first_episode_pending", [])
+        self._first_episode_pending = []
+        if not pending:
+            return {}
+        return {
+            key: torch.cat([record[key] for record in pending]) for key in pending[0]
+        }
+
     def step(self, actions=None, auto_reset=True):
         actions = self._validate_actions(actions, expected_rank=2)
         active_mask = torch.ones(self.num_envs, device=self.device, dtype=torch.bool)
@@ -1561,6 +1627,7 @@ class IsaaclabRealWorldTaberoTacFieldEnv(IsaaclabBaseEnv):
             env_ids = torch.nonzero(dones, as_tuple=False).squeeze(-1)
             reset_obs, _ = self.reset(env_ids=env_ids)
             obs = _replace_batch_rows(obs, reset_obs, dones)
+        infos["_realworld_first_episode_records"] = self._drain_first_episode_records()
         return obs, reward, terminations, truncations, infos
 
     def chunk_step(self, chunk_actions: torch.Tensor):
@@ -1655,6 +1722,9 @@ class IsaaclabRealWorldTaberoTacFieldEnv(IsaaclabBaseEnv):
             executed_actions, dim=1
         )
         infos_list[-1][_RAW_CHUNK_ACTIONS_KEY] = raw_chunk_actions
+        infos_list[-1]["_realworld_first_episode_records"] = (
+            self._drain_first_episode_records()
+        )
         return (
             obs_list,
             chunk_rewards,
@@ -1749,6 +1819,13 @@ class IsaaclabRealWorldTaberoTacFieldEnv(IsaaclabBaseEnv):
             infos["episode"][_EPISODE_FORCE_MEAN_KEY] = terminal_force_mean
             infos["episode"][_EPISODE_FORCE_COUNT_KEY] = terminal_force_count
             infos["episode"][_EPISODE_FORCE_BONUS_KEY] = terminal_force_bonus
+        self._capture_first_episode(infos["episode"], terminations, truncations)
+        self._episode_rollout_steps = getattr(self, "_episode_rollout_steps", 0) + 1
+        if self._episode_rollout_steps == int(self.cfg.max_episode_steps):
+            if not self._first_episode_completed.all():
+                raise RuntimeError(
+                    "RealWorld rollout is missing first-episode terminal records."
+                )
         if newly_done.any():
             infos["final_observation"] = _clone_nested(obs)
             infos["final_info"] = {"episode": _clone_nested(infos["episode"])}

@@ -306,9 +306,10 @@ def count_trajectories(metrics_dict):
     if not metrics_dict:
         return 0
 
-    # Use the first metric tensor to get the trajectory count
-    # All metrics should have the same first dimension (number of trajectories)
-    first_key = next(iter(metrics_dict.keys()))
+    # Per-chunk diagnostics can have a different count from completed episodes.
+    first_key = (
+        "success_once" if "success_once" in metrics_dict else next(iter(metrics_dict))
+    )
     first_tensor = metrics_dict[first_key]
 
     if isinstance(first_tensor, torch.Tensor):
