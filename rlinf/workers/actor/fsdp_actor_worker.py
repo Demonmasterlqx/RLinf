@@ -1206,6 +1206,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         )
         await self.weight_syncer.sync(state_dict, send_func, version=version)
 
+        # Release GPU state-dict views before offload clears the allocator cache.
+        del state_dict
         if self.enable_offload:
             assert not self.is_weight_offloaded, (
                 "weight should be offloaded in sync_model_to_rollout"
