@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import dataclasses
 import itertools
 import json
 import os
@@ -121,6 +122,19 @@ class FSDPVlaSftWorker(FSDPSftWorker):
                 batch_size=self.cfg.actor.micro_batch_size * self._world_size,
                 repo_id=repo_id,
                 data_kwargs=getattr(self.cfg.actor.model, "openpi_data", None),
+            )
+            config = dataclasses.replace(
+                config,
+                model=dataclasses.replace(
+                    config.model,
+                    discrete_state_input=self.cfg.actor.model.openpi.get(
+                        "discrete_state_input", config.model.discrete_state_input
+                    ),
+                ),
+            )
+            self._logger.info(
+                "OpenPI SFT data discrete_state_input=%s",
+                config.model.discrete_state_input,
             )
             data_loader = openpi_data_loader.create_data_loader(
                 config, framework="pytorch", shuffle=True
