@@ -738,6 +738,7 @@ def _build_export_metadata(
             "datas/realworld_replayed_task820_firm",
             "datasets/realworld_replayed_task820_firm",
             "datasets/realworld_replay_task820_firm_mixed",
+            "datasets/realworld_replay_task820_firm_gentle_mixed_current",
         }:
             raise ValueError(
                 f"Tabero SFT checkpoint provenance dataset is unsupported: {dataset!r}."
