@@ -396,9 +396,7 @@ def test_tabero_tacimg_schema_rejects_extra_tensors(tmp_path):
     save_file(
         {
             **base_tensors,
-            "tactile_prefix_encoder.weight": torch.ones(
-                1, dtype=torch.bfloat16
-            ),
+            "tactile_prefix_encoder.weight": torch.ones(1, dtype=torch.bfloat16),
         },
         model,
     )
@@ -478,6 +476,16 @@ def test_export_metadata_carries_verified_fsdp_provenance_and_hashes(tmp_path):
             "sft_full_lora_tacimg",
             "datas/realworld_replayed_task820_firm",
             "realworld_replayed_task820_firm_pi05_tacimg_sft_2gpu_gb32_mb16_gc_on_ema099_force0001_30k",
+        ),
+        (
+            "sft_full_lora_tacfield",
+            "datasets/tabero",
+            "tabero_pi05_tacfield_no_state_sft_2gpu_b64_gc_on_30k",
+        ),
+        (
+            "sft_full_lora_tacfield",
+            "datasets/tabero_firmly_tightly_no_adverb",
+            "tabero_firmly_tightly_no_adverb_pi05_tacfield_no_state_sft_2gpu_b64_gc_on_30k",
         ),
     ],
 )
