@@ -484,14 +484,14 @@ def get_model(cfg: DictConfig):
 
         _enable_value_head_if_present(model)
 
-        if SupportedModel(model_type) in (
-            SupportedModel.OPENPI,
-            SupportedModel.CFG_MODEL,
-        ):
-            _apply_trainability_aware_precision(model, cfg)
-
     if use_dsrl:
         model.freeze_non_dsrl_parameters()
+
+    if SupportedModel(model_type) in (
+        SupportedModel.OPENPI,
+        SupportedModel.CFG_MODEL,
+    ):
+        _apply_trainability_aware_precision(model, cfg)
 
     return model
 

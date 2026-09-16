@@ -323,6 +323,8 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             "time_mlp_out",
             # --Tabero tacfield--
             "tactile_prefix_encoder",
+            # Keep trainable RLT parameters separate from the frozen backbone.
+            "rlt_module",
         ]
 
     def __init__(
@@ -771,7 +773,9 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 device=rlt_param.device, dtype=rlt_param.dtype
             )
             rlt_mask = prefix_mask if self.config.rlt_use_mask else None
-            rlt_loss, _ = self.rlt_module(prefix_output, rlt_mask)
+            rlt_loss, _ = self._apply_checkpoint(
+                self.rlt_module, prefix_output, rlt_mask
+            )
             return {"loss": rlt_loss, "rlt_loss": rlt_loss}
 
         if not isinstance(actions, torch.Tensor):
@@ -804,7 +808,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         rlt_param = next(self.rlt_module.parameters())
         prefix_output = prefix_output.to(device=rlt_param.device, dtype=rlt_param.dtype)
         rlt_mask = prefix_mask if self.config.rlt_use_mask else None
-        rlt_loss, _ = self.rlt_module(prefix_output, rlt_mask)
+        rlt_loss, _ = self._apply_checkpoint(self.rlt_module, prefix_output, rlt_mask)
         total_loss = rlt_loss + self.config.rlt_alpha * vla_loss
         return {
             "loss": total_loss,

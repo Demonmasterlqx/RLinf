@@ -20,6 +20,7 @@ from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 from torch import nn
 
+import rlinf.models as model_registry
 from rlinf.models import (
     _apply_openpi_lora,
     _apply_trainability_aware_precision,
@@ -27,6 +28,31 @@ from rlinf.models import (
 )
 
 CONFIG_DIR = Path(__file__).resolve().parents[2] / "examples" / "embodiment" / "config"
+
+
+def test_non_lora_factory_applies_precision_after_freezing(monkeypatch):
+    model = nn.Module()
+    model.backbone = nn.Linear(2, 2)
+    model.rlt_module = nn.Linear(2, 2)
+    model.backbone.requires_grad_(False)
+    monkeypatch.setitem(
+        model_registry._MODEL_REGISTRY, "openpi", lambda cfg, dtype: model
+    )
+    cfg = OmegaConf.create(
+        {
+            "model_type": "openpi",
+            "precision": "fp32",
+            "is_lora": False,
+            "load_to_device": False,
+            "frozen_parameter_precision": "bf16",
+            "trainable_parameter_precision": "fp32",
+        }
+    )
+    result = model_registry.get_model(cfg)
+    assert result.backbone.weight.dtype == torch.bfloat16
+    assert result.rlt_module.weight.dtype == torch.float32
+    assert not result.backbone.weight.requires_grad
+    assert result.rlt_module.weight.requires_grad
 
 
 class DummyActionExpert(nn.Module):

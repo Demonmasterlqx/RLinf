@@ -35,6 +35,7 @@ def _bare_model(config) -> OpenPi0ForRLActionPrediction:
     model = OpenPi0ForRLActionPrediction.__new__(OpenPi0ForRLActionPrediction)
     nn.Module.__init__(model)
     model.config = config
+    model.gradient_checkpointing_enabled = False
     return model
 
 
@@ -43,8 +44,10 @@ class _TinyRLT(nn.Module):
         super().__init__()
         self.scale = nn.Parameter(torch.tensor(1.0))
         self.last_mask = None
+        self.forward_calls = 0
 
     def forward(self, prefix, mask):
+        self.forward_calls += 1
         self.last_mask = mask
         loss = torch.square(prefix * self.scale).mean()
         return loss, {"mse": loss}
@@ -111,13 +114,16 @@ def test_rlt_only_sft_skips_vla_path_and_backpropagates_only_rlt():
     )
 
 
-def test_rlt_only_sft_preserves_tactile_field_during_device_move():
+@pytest.mark.parametrize("checkpointing", [False, True])
+def test_rlt_only_sft_preserves_tactile_field_during_device_move(checkpointing):
     config = SimpleNamespace(
         use_rlt=True,
         rlt_train_module_only=True,
         rlt_use_mask=True,
     )
     model = _bare_model(config)
+    model.gradient_checkpointing_enabled = checkpointing
+    model._rlinf_gradient_checkpointing_enabled = checkpointing
     model.anchor = nn.Parameter(torch.zeros(()))
     model.rlt_module = _TinyRLT()
     tactile = torch.randn(2, 9, 396)
@@ -134,12 +140,15 @@ def test_rlt_only_sft_preserves_tactile_field_during_device_move():
     def extract_prefix(self, moved_observation, *, train):
         assert train is True
         captured["tactile_prefix"] = getattr(moved_observation, "tactile_prefix", None)
-        return torch.zeros(2, 3, 4), torch.ones(2, 3, dtype=torch.bool)
+        return torch.ones(2, 3, 4), torch.ones(2, 3, dtype=torch.bool)
 
     model._extract_rlt_prefix_embeddings = MethodType(extract_prefix, model)
     model.gradient_checkpointing_disable = MethodType(lambda self: None, model)
 
-    model.sft_forward(data=(observation, torch.zeros(2, 1)))
+    output = model.sft_forward(data=(observation, torch.zeros(2, 1)))
+    output["loss"].backward()
+    torch.testing.assert_close(model.rlt_module.scale.grad, torch.tensor(2.0))
+    assert model.rlt_module.forward_calls == (2 if checkpointing else 1)
 
     torch.testing.assert_close(captured["tactile_prefix"], tactile)
 
