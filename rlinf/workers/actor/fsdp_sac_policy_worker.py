@@ -103,6 +103,15 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             self._dsrl_replay_semantics()
         )
 
+    def _dsrl_actor_contract_kwargs(self):
+        config = self.cfg.get("actor", {}).get("model", {}).get("openpi", {})
+        result = {}
+        if config.get("dsrl_actor_use_state", True) is False:
+            result["actor_use_state"] = False
+        if config.get("dsrl_tactile_input_dim", 396) != 396:
+            result["tactile_input_dim"] = config["dsrl_tactile_input_dim"]
+        return result
+
     def _dsrl_observation_semantics(self) -> str:
         return self.cfg.get("algorithm", {}).get(
             "dsrl_observation_semantics", DSRL_OBSERVATION_SEMANTICS
@@ -133,6 +142,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         validate_dsrl_rollout_state_dict(
             state_dict,
             observation_semantics=self._dsrl_observation_semantics(),
+            **self._dsrl_actor_contract_kwargs(),
         )
         if list(state_dict) != self.param_names_need_sync:
             raise ValueError(
@@ -199,6 +209,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             validate_dsrl_rollout_state_dict(
                 rollout_state_dict,
                 observation_semantics=self._dsrl_observation_semantics(),
+                **self._dsrl_actor_contract_kwargs(),
             )
             self.param_names_need_sync = list(rollout_state_dict)
         else:
@@ -506,11 +517,14 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         try:
             observation_semantics = self._dsrl_observation_semantics()
             if observation_semantics == DSRL_OBSERVATION_SEMANTICS:
-                state_dict = select_dsrl_trainable_state(self.model)
+                state_dict = select_dsrl_trainable_state(
+                    self.model, **self._dsrl_actor_contract_kwargs()
+                )
             else:
                 state_dict = select_dsrl_trainable_state(
                     self.model,
                     observation_semantics=observation_semantics,
+                    **self._dsrl_actor_contract_kwargs(),
                 )
         except Exception as error:  # noqa: BLE001
             local_error = f"{type(error).__name__}: {error}"
@@ -548,7 +562,8 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                     "parameter_count": len(state_dict),
                     "tensor_count": len(state_dict),
                     "total_parameter_count": get_dsrl_checkpoint_contract(
-                        self._dsrl_observation_semantics()
+                        self._dsrl_observation_semantics(),
+                        **self._dsrl_actor_contract_kwargs(),
                     )["trainable_parameter_count"],
                 }
                 configured_metadata = self._cfg.fsdp_config.get(

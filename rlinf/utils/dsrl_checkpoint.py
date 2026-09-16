@@ -29,6 +29,7 @@ from rlinf.utils.dsrl_observation import (
 from rlinf.utils.dsrl_reward import DSRL_REWARD_SEMANTICS
 from rlinf.utils.dsrl_rollout_sync import (
     DSRL_ROLLOUT_SYNC_MANIFEST_V2,
+    adapt_dsrl_manifest,
     normalize_fsdp_parameter_name,
 )
 from rlinf.utils.dsrl_transition import (
@@ -134,7 +135,9 @@ assert len(DSRL_TARGET_MANIFEST_V2) == 172
 assert sum(prod(shape) for shape in DSRL_TARGET_MANIFEST_V2.values()) == 2_954_026
 
 
-def get_dsrl_checkpoint_contract(observation_semantics: str) -> dict[str, object]:
+def get_dsrl_checkpoint_contract(
+    observation_semantics: str, *, actor_use_state=True, tactile_input_dim=396
+) -> dict[str, object]:
     """Return trainable and target manifests for an observation contract."""
 
     if observation_semantics == DSRL_OBSERVATION_SEMANTICS:
@@ -147,6 +150,14 @@ def get_dsrl_checkpoint_contract(observation_semantics: str) -> dict[str, object
         raise ValueError(
             f"Unsupported OpenPI DSRL observation semantics {observation_semantics!r}."
         )
+    trainable_manifest = adapt_dsrl_manifest(
+        trainable_manifest,
+        actor_use_state=actor_use_state,
+        tactile_input_dim=tactile_input_dim,
+    )
+    target_manifest = adapt_dsrl_manifest(
+        target_manifest, tactile_input_dim=tactile_input_dim
+    )
     return {
         "trainable_manifest": trainable_manifest,
         "target_manifest": target_manifest,
@@ -215,7 +226,11 @@ def select_compact_target_parameters(
 ) -> dict[str, nn.Parameter]:
     """Return target parameters matching the canonical DSRL critic/Q manifest."""
     selected = select_target_parameters(model)
-    manifest = get_dsrl_checkpoint_contract(observation_semantics)["target_manifest"]
+    config = getattr(model, "config", None)
+    manifest = get_dsrl_checkpoint_contract(
+        observation_semantics,
+        tactile_input_dim=getattr(config, "dsrl_tactile_input_dim", 396),
+    )["target_manifest"]
     expected_keys = set(manifest)
     actual_keys = set(selected)
     missing_keys = sorted(expected_keys - actual_keys)
@@ -592,6 +607,8 @@ def select_dsrl_trainable_state(
     model: nn.Module,
     *,
     observation_semantics: str = DSRL_OBSERVATION_SEMANTICS,
+    actor_use_state: bool = True,
+    tactile_input_dim: int = 396,
 ) -> dict[str, torch.Tensor]:
     """Collect and validate the canonical DSRL trainable sidecar tensors."""
     trainable = _normalized_named_parameters(model, requires_grad_only=True)
@@ -603,7 +620,11 @@ def select_dsrl_trainable_state(
             "OpenPI DSRL trainable parameters must use only the allowed prefixes "
             f"{list(DSRL_TRAINABLE_PREFIXES)}; got {disallowed}."
         )
-    contract = get_dsrl_checkpoint_contract(observation_semantics)
+    contract = get_dsrl_checkpoint_contract(
+        observation_semantics,
+        actor_use_state=actor_use_state,
+        tactile_input_dim=tactile_input_dim,
+    )
     manifest = contract["trainable_manifest"]
     tensor_count = len(trainable)
     parameter_count = sum(parameter.numel() for parameter in trainable.values())

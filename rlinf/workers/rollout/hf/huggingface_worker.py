@@ -693,6 +693,12 @@ class MultiStepRolloutWorker(Worker):
             observation_semantics=self.algorithm_cfg.get(
                 "dsrl_observation_semantics", DSRL_OBSERVATION_SEMANTICS
             ),
+            actor_use_state=self.cfg.actor.model.openpi.get(
+                "dsrl_actor_use_state", True
+            ),
+            tactile_input_dim=self.cfg.actor.model.openpi.get(
+                "dsrl_tactile_input_dim", 396
+            ),
         )
         return state_dict
 

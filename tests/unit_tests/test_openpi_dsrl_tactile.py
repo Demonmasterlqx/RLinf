@@ -906,3 +906,117 @@ def test_dsrl_target_shadow_and_ema_only_track_target_critic_parameters(tmp_path
     for name, parameter in worker.target_model.named_parameters():
         expected = 2.0 if name.split(".")[0] in expected_modules else 1.0
         torch.testing.assert_close(parameter, torch.full_like(parameter, expected))
+
+
+@pytest.mark.parametrize("use_state", [True, False])
+@pytest.mark.parametrize("compact", [True, False])
+def test_dsrl_actor_state_branch_is_independent_from_critic(use_state, compact):
+    torch.set_num_threads(2)
+    torch.manual_seed(12)
+    config = SimpleNamespace(
+        use_dsrl=True,
+        dsrl_actor_use_state=use_state,
+        dsrl_use_tactile=True,
+        dsrl_tactile_input_dim=22,
+        dsrl_tactile_latent_dim=8,
+        dsrl_state_dim=7,
+        dsrl_action_noise_dim=13,
+        dsrl_num_q_heads=2,
+        dsrl_image_latent_dim=8,
+        dsrl_num_images=2,
+        dsrl_state_latent_dim=8,
+        dsrl_hidden_dims=(16, 16),
+        action_horizon=3,
+    )
+    model = _bare_model(config)
+    model._init_dsrl_components()
+    assert hasattr(model, "actor_state_encoder") is use_state
+    assert hasattr(model, "critic_state_encoder")
+    assert model.dsrl_action_noise_net.shared_net[0].in_features == (
+        32 if use_state else 24
+    )
+    obs = {
+        "main_images": torch.randint(256, (2, 32, 40, 3), dtype=torch.uint8),
+        "wrist_images": torch.randint(256, (2, 32, 40, 3), dtype=torch.uint8),
+        "states": torch.randn(2, 7),
+        "tactile_marker_motion": torch.randn(2, 9, 11, 2),
+    }
+    if compact:
+        images = model._preprocess_dsrl_images(
+            [obs.pop("main_images"), obs.pop("wrist_images")]
+        )
+        obs["dsrl_images"] = images.bfloat16()
+    action, _, _ = model.sac_forward(obs=obs, mode="eval")
+    changed = {**obs, "states": torch.randn(2, 7) * 5}
+    other, _, _ = model.sac_forward(obs=changed, mode="eval")
+    assert torch.equal(action, other) is (not use_state)
+    if not use_state:
+        missing = {k: v for k, v in obs.items() if k != "states"}
+        without, _, _ = model.sac_forward(obs=missing, mode="eval")
+        assert torch.equal(action, without)
+    action.float().sum().backward()
+    assert model.dsrl_action_noise_net.mean_layer.weight.grad is not None
+    q = model.sac_q_forward(obs=obs, actions=action.detach()[:, 0])
+    q_changed = model.sac_q_forward(obs=changed, actions=action.detach()[:, 0])
+    assert not torch.equal(q, q_changed)
+    q.float().sum().backward()
+    assert model.critic_state_encoder.encoder[0].weight.grad is not None
+    if not use_state:
+        with pytest.raises(KeyError, match="states"):
+            model.sac_q_forward(obs=missing, actions=action.detach()[:, 0])
+
+
+@pytest.mark.parametrize("tactile_input_dim", [396, 880])
+def test_state_disabled_sync_and_compact_checkpoint_contracts(tactile_input_dim):
+    from rlinf.utils.dsrl_checkpoint import (
+        build_compact_target_payload,
+        get_dsrl_checkpoint_contract,
+        select_compact_target_parameters,
+        select_dsrl_trainable_state,
+    )
+    from rlinf.utils.dsrl_rollout_sync import (
+        DSRL_OBSERVATION_SEMANTICS,
+        get_dsrl_rollout_sync_contract,
+        select_named_parameters_by_prefix,
+        validate_dsrl_rollout_state_dict,
+    )
+
+    config = SimpleNamespace(
+        use_dsrl=True,
+        dsrl_actor_use_state=False,
+        dsrl_use_tactile=True,
+        dsrl_tactile_input_dim=tactile_input_dim,
+        dsrl_tactile_latent_dim=64,
+        dsrl_state_dim=7,
+        dsrl_action_noise_dim=32,
+        dsrl_num_q_heads=10,
+        dsrl_image_latent_dim=64,
+        dsrl_num_images=2,
+        dsrl_state_latent_dim=64,
+        dsrl_hidden_dims=(128, 128, 128),
+        action_horizon=50,
+    )
+    model = _bare_model(config)
+    model._init_dsrl_components()
+    options = {"actor_use_state": False, "tactile_input_dim": tactile_input_dim}
+    contract = get_dsrl_rollout_sync_contract(DSRL_OBSERVATION_SEMANTICS, **options)
+    weights = select_named_parameters_by_prefix(model, contract["prefixes"])
+    validate_dsrl_rollout_state_dict(weights, **options)
+    assert weights["dsrl_action_noise_net.shared_net.0.weight"].shape == (128, 192)
+    saved = select_dsrl_trainable_state(model, **options)
+    assert len(saved) == 216
+    target = select_compact_target_parameters(model)
+    assert any(k.startswith("critic_state_encoder.") for k in target)
+    assert (
+        get_dsrl_checkpoint_contract(DSRL_OBSERVATION_SEMANTICS, **options)[
+            "target_manifest"
+        ]
+        == get_dsrl_checkpoint_contract(
+            DSRL_OBSERVATION_SEMANTICS, tactile_input_dim=tactile_input_dim
+        )["target_manifest"]
+    )
+    shadow = {k: v.detach().float().clone() for k, v in target.items()}
+    payload = build_compact_target_payload(model, shadow, step=1, rank=0, world_size=1)
+    assert payload
+    with pytest.raises(ValueError, match="manifest|requires exactly"):
+        select_dsrl_trainable_state(model, tactile_input_dim=tactile_input_dim)

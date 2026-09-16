@@ -214,6 +214,7 @@ class OpenPi0Config(Pi0Config):
 
     # ===== DSRL-specific parameters =====
     use_dsrl: bool = False  # Enable DSRL algorithm
+    dsrl_actor_use_state: bool = True  # Only the noise actor; critic retains state
     dsrl_state_dim: int = 8  # Raw state dimension for DSRL encoders
     dsrl_action_noise_dim: int = 32  # Noise dimension output by GaussianPolicy
     dsrl_num_q_heads: int = 10  # Number of Q-networks
@@ -451,9 +452,16 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 "OpenPI DSRL dsrl_num_images must be 1, 2, or 3; "
                 f"got {dsrl_num_images}."
             )
+        use_state = getattr(self.config, "dsrl_actor_use_state", True)
+        if type(use_state) is not bool:
+            raise ValueError("dsrl_actor_use_state must be boolean.")
         state_side_dim = self.config.dsrl_state_latent_dim + tactile_latent_dim
         image_side_dim = self.config.dsrl_image_latent_dim * dsrl_num_images
-        dsrl_input_dim = state_side_dim + image_side_dim
+        dsrl_input_dim = (
+            image_side_dim
+            + tactile_latent_dim
+            + (self.config.dsrl_state_latent_dim if use_state else 0)
+        )
 
         self.dsrl_action_noise_net = GaussianPolicy(
             input_dim=dsrl_input_dim,
@@ -468,10 +476,11 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             latent_dim=self.config.dsrl_image_latent_dim,
             image_size=64,
         ).to(dtype=dsrl_dtype)
-        self.actor_state_encoder = CompactStateEncoder(
-            state_dim=self.config.dsrl_state_dim,
-            hidden_dim=self.config.dsrl_state_latent_dim,
-        ).to(dtype=dsrl_dtype)
+        if use_state:
+            self.actor_state_encoder = CompactStateEncoder(
+                state_dim=self.config.dsrl_state_dim,
+                hidden_dim=self.config.dsrl_state_latent_dim,
+            ).to(dtype=dsrl_dtype)
         self.critic_image_encoder = LightweightImageEncoder64(
             num_images=1,
             latent_dim=self.config.dsrl_image_latent_dim,
@@ -2102,8 +2111,10 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
 
     # ===== DSRL-specific methods =====
 
-    def _normalize_dsrl_obs(self, obs):
+    def _normalize_dsrl_obs(self, obs, *, require_state=True):
         """Normalize and validate the ordered DSRL image-view contract."""
+        if require_state and "states" not in obs:
+            raise KeyError("DSRL critic/state-enabled actor requires states.")
         num_images = int(getattr(self.config, "dsrl_num_images", 1))
         if num_images not in {1, 2, 3}:
             raise ValueError(
@@ -2125,7 +2136,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 )
             compact_images = obs["dsrl_images"]
             expected_shape = (
-                int(obs["states"].shape[0]),
+                int(compact_images.shape[0]) if compact_images.ndim else 0,
                 num_images,
                 3,
                 64,
@@ -2151,7 +2162,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 )
             normalized = {
                 "dsrl_images": compact_images,
-                "states": obs["states"],
+                "states": obs.get("states"),
             }
         elif "images" in obs:
             normalized = dict(obs)
@@ -2178,8 +2189,10 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 images.append(obs["tactile_images"])
             normalized = {
                 "images": images,
-                "states": obs["states"],
+                "states": obs.get("states"),
             }
+        if not require_state:
+            normalized.pop("states", None)
         if "tactile_marker_motion" in obs:
             normalized["tactile_marker_motion"] = obs["tactile_marker_motion"]
         if "dsrl_images" not in normalized:
@@ -2211,7 +2224,11 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         expected_batch = (
             int(states.shape[0])
             if torch.is_tensor(states) and states.ndim > 0
-            else None
+            else (
+                int(images[0].shape[0])
+                if torch.is_tensor(images[0]) and images[0].ndim
+                else None
+            )
         )
         is_tabero_dual_camera = (
             getattr(self.config, "config_name", None) == "pi0_lora_tacfield_tabero"
@@ -2334,29 +2351,38 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         if obs is None:
             obs = data.get("obs", data) if data is not None else kwargs.get("obs", {})
 
-        obs = self._normalize_dsrl_obs(obs)
+        use_state = getattr(self.config, "dsrl_actor_use_state", True)
+        obs = (
+            self._normalize_dsrl_obs(obs)
+            if use_state
+            else self._normalize_dsrl_obs(obs, require_state=False)
+        )
 
         # Preprocess ordered image views independently.
         # Returns [B, N, C, 64, 64] in [-1, 1] range (float32).
         images = self._prepare_dsrl_images(obs, train=train)
-        states = self._preprocess_states(obs["states"])
+        states = self._preprocess_states(obs["states"]) if use_state else None
 
         # Move to the same device as actor encoders, convert to bfloat16
         device = next(self.actor_image_encoder.parameters()).device
         images = images.to(device=device, dtype=torch.bfloat16)
-        states = states.to(device=device, dtype=torch.bfloat16)
+        if states is not None:
+            states = states.to(device=device, dtype=torch.bfloat16)
         tactile = None
         if self.config.dsrl_use_tactile:
             tactile = self._prepare_dsrl_tactile(
                 obs,
-                batch_size=states.shape[0],
+                batch_size=images.shape[0],
                 encoder=self.actor_tactile_encoder,
             )
 
         # Extract features (using actor's independent encoder)
         image_features = self._encode_dsrl_image_views(images, self.actor_image_encoder)
-        state_features = self.actor_state_encoder(states)  # [B, 64]
-        features = [state_features, image_features]
+        features = (
+            [self.actor_state_encoder(states), image_features]
+            if use_state
+            else [image_features]
+        )
         if tactile is not None:
             features.append(self.actor_tactile_encoder(tactile))
         features = torch.cat(features, dim=-1)

@@ -113,28 +113,51 @@ assert (
 )
 
 
+def adapt_dsrl_manifest(manifest, *, actor_use_state=True, tactile_input_dim=396):
+    """Adjust the existing training contract without altering critic state inputs."""
+    if type(actor_use_state) is not bool:
+        raise ValueError("dsrl_actor_use_state must be boolean.")
+    result = {}
+    for key, shape in manifest.items():
+        if not actor_use_state and key.startswith("actor_state_encoder."):
+            continue
+        if not actor_use_state and key == "dsrl_action_noise_net.shared_net.0.weight":
+            shape = (shape[0], shape[1] - 64)
+        if "tactile_encoder.blocks.0." in key and key.endswith("weight"):
+            shape = (shape[0], tactile_input_dim)
+        result[key] = shape
+    return result
+
+
 def get_dsrl_rollout_sync_contract(
     observation_semantics: str,
+    *,
+    actor_use_state=True,
+    tactile_input_dim=396,
 ) -> dict[str, object]:
     """Return the selective rollout-sync contract for an observation schema."""
 
     if observation_semantics == DSRL_OBSERVATION_SEMANTICS:
-        return {
-            "prefixes": DSRL_ROLLOUT_SYNC_PREFIXES,
-            "manifest": DSRL_ROLLOUT_SYNC_MANIFEST_V2,
-            "tensor_count": DSRL_ROLLOUT_SYNC_TENSOR_COUNT,
-            "parameter_count": DSRL_ROLLOUT_SYNC_PARAMETER_COUNT,
-        }
-    if observation_semantics == REALWORLD_TACIMG_DSRL_OBSERVATION_SEMANTICS:
-        return {
-            "prefixes": REALWORLD_TACIMG_DSRL_ROLLOUT_SYNC_PREFIXES,
-            "manifest": REALWORLD_TACIMG_DSRL_ROLLOUT_SYNC_MANIFEST_V2,
-            "tensor_count": REALWORLD_TACIMG_DSRL_ROLLOUT_SYNC_TENSOR_COUNT,
-            "parameter_count": REALWORLD_TACIMG_DSRL_ROLLOUT_SYNC_PARAMETER_COUNT,
-        }
-    raise ValueError(
-        f"Unsupported OpenPI DSRL observation semantics {observation_semantics!r}."
+        manifest = DSRL_ROLLOUT_SYNC_MANIFEST_V2
+        prefixes = DSRL_ROLLOUT_SYNC_PREFIXES
+    elif observation_semantics == REALWORLD_TACIMG_DSRL_OBSERVATION_SEMANTICS:
+        manifest = REALWORLD_TACIMG_DSRL_ROLLOUT_SYNC_MANIFEST_V2
+        prefixes = REALWORLD_TACIMG_DSRL_ROLLOUT_SYNC_PREFIXES
+    else:
+        raise ValueError(
+            f"Unsupported OpenPI DSRL observation semantics {observation_semantics!r}."
+        )
+    manifest = adapt_dsrl_manifest(
+        manifest, actor_use_state=actor_use_state, tactile_input_dim=tactile_input_dim
     )
+    return {
+        "prefixes": tuple(
+            p for p in prefixes if actor_use_state or p != "actor_state_encoder."
+        ),
+        "manifest": manifest,
+        "tensor_count": len(manifest),
+        "parameter_count": sum(prod(shape) for shape in manifest.values()),
+    }
 
 
 def validate_dsrl_rollout_sync_config(actor_cfg) -> tuple[str, ...] | None:
@@ -159,7 +182,10 @@ def validate_dsrl_rollout_sync_config(actor_cfg) -> tuple[str, ...] | None:
             f"dsrl_num_images={num_images!r}, dsrl_use_tactile={use_tactile!r}."
         )
     expected_prefixes = tuple(
-        get_dsrl_rollout_sync_contract(observation_semantics)["prefixes"]
+        get_dsrl_rollout_sync_contract(
+            observation_semantics,
+            actor_use_state=openpi_cfg.get("dsrl_actor_use_state", True),
+        )["prefixes"]
     )
 
     configured_prefixes = tuple(actor_cfg.rollout_sync_prefixes)
@@ -243,9 +269,15 @@ def validate_dsrl_rollout_state_dict(
     state_dict: Mapping[str, torch.Tensor],
     *,
     observation_semantics: str = DSRL_OBSERVATION_SEMANTICS,
+    actor_use_state: bool = True,
+    tactile_input_dim: int = 396,
 ) -> None:
     """Require the versioned Tabero DSRL rollout synchronization manifest."""
-    contract = get_dsrl_rollout_sync_contract(observation_semantics)
+    contract = get_dsrl_rollout_sync_contract(
+        observation_semantics,
+        actor_use_state=actor_use_state,
+        tactile_input_dim=tactile_input_dim,
+    )
     manifest = contract["manifest"]
     actual_key_set = set(state_dict)
     expected_key_set = set(manifest)

@@ -1780,6 +1780,20 @@ def validate_embodied_cfg(cfg):
         f"Supported embodied models: {sorted([x.value for x in EMBODIED_MODEL])}."
     )
     use_dsrl = model_cfg.get("openpi", {}).get("use_dsrl", False)
+    if use_dsrl:
+        actor_use_state = model_cfg.openpi.get("dsrl_actor_use_state", True)
+        if type(actor_use_state) is not bool:
+            raise ValueError("actor.model.openpi.dsrl_actor_use_state must be boolean.")
+        if not only_eval:
+            metadata_path = (
+                "actor.fsdp_config.trainable_checkpoint_metadata.dsrl_actor_use_state"
+            )
+            previous = OmegaConf.select(cfg, metadata_path, default=actor_use_state)
+            if previous != actor_use_state:
+                raise ValueError(
+                    "DSRL actor state setting disagrees with checkpoint metadata."
+                )
+            OmegaConf.update(cfg, metadata_path, actor_use_state, force_add=True)
     ppo_boundary_semantics = algorithm_cfg.get(
         "tabero_ppo_transition_boundary_semantics"
     )

@@ -260,3 +260,57 @@ replay 训练吞吐为 420.8 samples/s，新数据采样约 5.35–5.50 transiti
 
   - ``train/replay_buffer/size``：当前重放缓冲区的大小
   - ``train/replay_buffer/utilization``：重放缓冲区的利用率
+
+T2-VLA 配置化部署
+-----------------
+
+DSRL 部署使用单一配置契约，不按版本号分支，也不限制 task ID、训练配置名称或
+checkpoint 步数。旧 bundle 必须重新导出。训练流程原有的 rollout/replay 协议不受影响。
+
+导出需要已解析的训练 YAML（例如 TensorBoard 保存的 ``config.yaml``）、
+``trainable_weights.pt``、基座导出目录，以及一次真实原始观测的 tensor mapping。
+观测使用客户端字段 ``dsrl_raw_image``、``dsrl_raw_wrist_image``（按训练的视图数量）、``state``、
+``tactile_marker_motion``；三视图模型另需 ``tactile_image``。保存的是单次观测，
+没有 batch 维。由观测确认原图尺寸，由训练配置确定网络结构，并与实际权重校验。
+当前触觉编码语义为参考帧加8帧历史、不作参考帧差分、两层因果 TCN；不转换 marker 布局。
+
+.. code-block:: bash
+
+   python -m rlinf.utils.ckpt_convertor.export_tabero_dsrl_for_t2vla \
+     --trainable-checkpoint /path/to/trainable_weights.pt \
+     --train-config /path/to/resolved_config.yaml \
+     --observation-sample /path/to/observation.pt \
+     --base-model /path/to/base_export \
+     --expected-base-model-sha256 <sha256> \
+     --output-dir /path/to/dsrl_bundle
+
+在 T2-VLA 的本地虚拟环境中启动正式服务入口：
+
+.. code-block:: bash
+
+   python scripts/serve_policy.py --port 8052 --dsrl-bundle /path/to/dsrl_bundle \
+     policy:checkpoint --policy.config <base_config_name> --policy.dir /path/to/base_export
+
+服务从 bundle 加载观测键、shape、actor架构、noise horizon、去噪步数与基座设置，
+使用基座内已校验哈希的 normalization asset。观测、权重、基座配置不一致时拒绝加载或推理。
+``discrete_state_input=false`` 仅控制 VLA 的原有 state/prompt 语义；DSRL actor 的
+state 输入由 ``dsrl_actor_use_state`` 控制，启用时维度由 ``dsrl_state_dim`` 决定；
+动作坐标转换仍保留 state。
+数值对齐可使用 ``examples/embodiment/run_tabero_dsrl_parity.py``，传入
+``--bundle``、``--base-checkpoint``、``--observation``、``--device``、``--output``。
+
+客户端通过服务器 metadata 识别 DSRL，额外发送原始相机图像；原有 VLA 的224×224输入保持不变。
+
+DSRL actor 的 state 输入开关
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``actor.model.openpi.dsrl_actor_use_state`` 为布尔值，默认 ``true``。
+设置 ``false`` 后不构建 actor state encoder，noise 网络输入不再拼接 state 特征；
+双相机、每分支64维的 TacField 配置由256维变为192维。critic仍使用原有state分支，
+环境观测和replay保留state；VLA的 ``discrete_state_input`` 与动作坐标转换语义不变。
+
+开关会改变actor网络结构。改变开关后应从冻结VLA基座重新初始化并训练DSRL，
+不能直接恢复相反模式的actor/optimizer checkpoint；不会自动切片、补零或迁移权重。
+配置值写入checkpoint元数据和导出契约 ``actor_contract.use_state``，部署按同一开关
+构建网络。关闭时DSRL actor忽略缺失或变化的state，但完整VLA服务仍可能需要state。
+已有bundle需用当前导出器重新导出，不增加协议版本或兼容分支。

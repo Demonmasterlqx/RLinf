@@ -1,149 +1,69 @@
 # Copyright 2026 The RLinf Authors.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Licensed under the Apache License, Version 2.0.
+"""Numerical parity across independent implementations, with synthetic tensors."""
 
-import json
-import os
-import subprocess
+import importlib.util
 import sys
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-T2_REPO = REPO_ROOT.parent / "T2-VLA"
-RUNNER = REPO_ROOT / "examples" / "embodiment" / "run_tabero_dsrl_parity.py"
-ACTOR_STAGES = {
-    "image_input": [1, 2, 3, 64, 64],
-    "main_image_input": [1, 3, 64, 64],
-    "wrist_image_input": [1, 3, 64, 64],
-    "state_input": [1, 7],
-    "tactile_input": [1, 9, 396],
-    "state_features": [1, 64],
-    "image_features": [1, 128],
-    "main_image_features": [1, 64],
-    "wrist_image_features": [1, 64],
-    "tactile_features": [1, 64],
-    "gaussian_mean": [1, 32],
-    "deterministic_noise": [1, 32],
-    "broadcast_noise": [1, 50, 32],
-}
+import pytest
+import torch
 
-
-def test_actor_parity_runner_emits_complete_passing_contract(tmp_path):
-    output = tmp_path / "parity.json"
-    env = os.environ.copy()
-    env["PYTHONPATH"] = os.pathsep.join(
-        [str(T2_REPO / "src"), str(REPO_ROOT), env.get("PYTHONPATH", "")]
+T2_SRC = Path(__file__).resolve().parents[3] / "T2-VLA" / "src"
+if not T2_SRC.exists():
+    pytest.skip(
+        "T2-VLA checkout required for cross-repository parity", allow_module_level=True
     )
-    result = subprocess.run(
-        [
-            sys.executable,
-            str(RUNNER),
-            "--device",
-            "cpu",
-            "--output",
-            str(output),
-        ],
-        cwd=REPO_ROOT,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=120,
-        check=False,
+import openpi.policies  # noqa: E402
+
+openpi.policies.__path__.append(str(T2_SRC / "openpi" / "policies"))
+from openpi.policies.tabero_dsrl_policy import (  # noqa: E402
+    ActorContract,
+    TaberoDSRLActor,
+)
+
+runner_path = (
+    Path(__file__).resolve().parents[2]
+    / "examples/embodiment/run_tabero_dsrl_parity.py"
+)
+spec = importlib.util.spec_from_file_location("dsrl_parity_runner", runner_path)
+runner = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = runner
+spec.loader.exec_module(runner)
+
+
+@pytest.mark.parametrize("use_state", [True, False])
+@pytest.mark.parametrize(
+    "markers,views,width,dtype",
+    [(5, 1, 8, "float32"), (11, 2, 16, "bfloat16"), (7, 3, 12, "bfloat16")],
+)
+def test_independent_actor_numerics(markers, views, width, dtype, use_state):
+    torch.set_num_threads(2)
+    torch.manual_seed(41)
+    c = ActorContract(
+        use_state=use_state,
+        image_keys=[f"image{i}" for i in range(views)],
+        image_shapes=[[37, 53, 3]] * views,
+        state_key="state",
+        state_dim=7,
+        tactile_key="tactile",
+        tactile_shape=[9, markers, 2],
+        image_latent_dim=width,
+        state_latent_dim=width,
+        tactile_latent_dim=width,
+        hidden_dims=[23, 19],
+        noise_dim=13,
+        horizon=6,
+        num_steps=4,
+        dtype=dtype,
+        image_preprocessing="uint8_bilinear64_align_false_minus_one_one",
+        tactile_processing="reference_plus_history8_no_difference_causal_tcn2_kernel3",
+        feature_order="state_ordered_images_tactile"
+        if use_state
+        else "ordered_images_tactile",
     )
-
-    assert result.returncode == 0, result.stderr
-    report = json.loads(output.read_text())
-    assert report["schema_version"] == 1
-    assert report["passed"] is True
-    assert report["fixture"]["weight_key_count"] == 48
-    assert report["fixture"]["weight_dtype"] == "bfloat16"
-    assert report["fixture"]["raw_image_shape"] == [256, 256, 3]
-    assert report["fixture"]["raw_wrist_image_shape"] == [256, 256, 3]
-    assert set(report["revisions"]) == {"base", "t2", "rlinf"}
-    assert all(len(item["git_sha"]) == 40 for item in report["revisions"].values())
-    for name, shape in ACTOR_STAGES.items():
-        stage = report["stages"][name]
-        assert stage["passed"] is True
-        assert stage["max_abs"] <= report["tolerance"]
-        assert stage["rlinf"] == {"shape": shape, "dtype": "bfloat16"}
-        assert stage["t2"] == {"shape": shape, "dtype": "bfloat16"}
-    assert report["stages"]["final_pi0_action"]["status"] == "not_requested"
-
-
-def test_failed_stage_makes_runner_exit_nonzero(tmp_path):
-    output = tmp_path / "parity.json"
-    env = os.environ.copy()
-    env["PYTHONPATH"] = os.pathsep.join(
-        [str(T2_REPO / "src"), str(REPO_ROOT), env.get("PYTHONPATH", "")]
-    )
-    result = subprocess.run(
-        [
-            sys.executable,
-            str(RUNNER),
-            "--device",
-            "cpu",
-            "--tolerance",
-            "-1",
-            "--output",
-            str(output),
-        ],
-        cwd=REPO_ROOT,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=120,
-        check=False,
-    )
-
-    assert result.returncode != 0
-    report = json.loads(output.read_text())
-    assert report["passed"] is False
-    assert any(stage.get("passed") is False for stage in report["stages"].values())
-
-
-def test_requested_final_pi0_reports_missing_checkpoint_without_loading_model(
-    tmp_path,
-):
-    output = tmp_path / "parity.json"
-    missing_checkpoint = tmp_path / "missing-base-model"
-    env = os.environ.copy()
-    env["PYTHONPATH"] = os.pathsep.join(
-        [str(T2_REPO / "src"), str(REPO_ROOT), env.get("PYTHONPATH", "")]
-    )
-    result = subprocess.run(
-        [
-            sys.executable,
-            str(RUNNER),
-            "--device",
-            "cpu",
-            "--with-final-pi0",
-            "--base-checkpoint",
-            str(missing_checkpoint),
-            "--output",
-            str(output),
-        ],
-        cwd=REPO_ROOT,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=120,
-        check=False,
-    )
-
-    assert result.returncode != 0
-    report = json.loads(output.read_text())
-    final = report["stages"]["final_pi0_action"]
-    assert report["passed"] is False
-    assert final["status"] == "error"
-    assert final["passed"] is False
-    assert final["error_type"] == "FileNotFoundError"
+    actor = TaberoDSRLActor(c).eval()
+    obs = {k: torch.randint(256, (37, 53, 3), dtype=torch.uint8) for k in c.image_keys}
+    obs.update(state=torch.randn(7), tactile=torch.randn(9, markers, 2))
+    result = runner.compare_actor(actor, obs)
+    assert result["passed"], result

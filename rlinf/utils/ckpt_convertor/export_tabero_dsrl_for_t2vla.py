@@ -1,9 +1,6 @@
 # Copyright 2026 The RLinf Authors.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-
-"""Export a final Tabero DSRL-SAC actor bundle for T2-VLA inference."""
+# Licensed under the Apache License, Version 2.0.
+"""Export a configuration-driven DSRL actor with its raw observation contract."""
 
 import argparse
 import ctypes
@@ -15,554 +12,147 @@ import os
 import shutil
 import sys
 import tempfile
-from collections.abc import Mapping
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 import torch
 from omegaconf import OmegaConf
-from safetensors.torch import load_file, save_file
+from safetensors.torch import save_file
+from torch import nn
 
-from rlinf.utils.dsrl_checkpoint import (
-    DSRL_TRAINABLE_CHECKPOINT_VERSION,
-    DSRL_TRAINABLE_MANIFEST_V2,
-    DSRL_TRAINABLE_MANIFEST_VERSION,
-    DSRL_TRAINABLE_PARAMETER_COUNT,
-    DSRL_TRAINABLE_TENSOR_COUNT,
+from rlinf.models.embodiment.modules.compact_encoders import (
+    CompactStateEncoder,
+    LightweightImageEncoder64,
 )
-from rlinf.utils.dsrl_observation import DSRL_OBSERVATION_SEMANTICS
-from rlinf.utils.dsrl_replay import (
-    DSRL_REPLAY_BACKEND,
-    DSRL_REPLAY_CAPACITY_TRANSITIONS,
-    DSRL_REPLAY_CHECKPOINT_SHARD_TRANSITIONS,
-    DSRL_REPLAY_MAX_RESIDENT_GIB,
-    DSRL_REPLAY_SEMANTICS,
-)
-from rlinf.utils.dsrl_reward import DSRL_REWARD_SEMANTICS
-from rlinf.utils.dsrl_rollout_sync import (
-    DSRL_ROLLOUT_SYNC_MANIFEST_V2,
-    DSRL_ROLLOUT_SYNC_MANIFEST_VERSION,
-    DSRL_ROLLOUT_SYNC_PARAMETER_COUNT,
-    DSRL_ROLLOUT_SYNC_PREFIXES,
-    DSRL_ROLLOUT_SYNC_TENSOR_COUNT,
-    validate_dsrl_rollout_state_dict,
-)
-from rlinf.utils.dsrl_transition import DSRL_TRANSITION_BOUNDARY_SEMANTICS
-from rlinf.utils.tabero_dsrl_profiles import (
-    FORMAL_8GPU_50STEP_PROFILE,
-    TABERO_DSRL_TRAINING_PROFILE_CHOICES,
-    TaberoDSRLTrainingProfile,
-    resolve_tabero_dsrl_training_profile,
-)
+from rlinf.models.embodiment.modules.gaussian_policy import GaussianPolicy
+from rlinf.models.embodiment.openpi.tactile_encoder import TactileTCNEncoder
 
-FORMAT = "tabero_dsrl_t2vla"
-FORMAT_VERSION = 2
-ACTOR_WEIGHTS_NAME = "dsrl_actor.safetensors"
-MANIFEST_NAME = "manifest.json"
-AUDIT_NAME = "artifact_audit.json"
+ACTOR_PREFIXES = (
+    "dsrl_action_noise_net.",
+    "actor_image_encoder.",
+    "actor_state_encoder.",
+    "actor_tactile_encoder.",
+)
 AT_FDCWD = -100
 RENAME_NOREPLACE = 1
-PROVENANCE_KEYS = {
-    "TABERO_PROVENANCE_VERSION",
-    "TABERO_PROVENANCE_MODE",
-    "TABERO_CONFIG_SHA256",
-    "TABERO_CONFIG_SNAPSHOT_SHA256",
-    "TABERO_GIT_COMMIT",
-    "TABERO_GIT_DIRTY",
-    "TABERO_BASE_MODEL_PATH",
-    "TABERO_BASE_MODEL_SHA256",
-    "TABERO_SOURCE_CONFIG_SHA256",
-}
 
 
-@dataclass(frozen=True)
-class _ValidatedProvenance:
-    path: Path
-    sha256: str
-    config_snapshot: Path
-    config_snapshot_sha256: str
-    legacy_source_config: Path | None
-    legacy_source_config_sha256: str | None
-    values: dict[str, str]
-
-
-def checkpoint_sha256(path: str | Path) -> str:
-    """Return the SHA-256 digest of one checkpoint file."""
-    checkpoint = Path(path)
+def checkpoint_sha256(path):
     digest = hashlib.sha256()
-    with checkpoint.open("rb") as file:
-        for chunk in iter(lambda: file.read(8 * 1024 * 1024), b""):
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
 
 
-def _capture_artifact(path: Path, label: str) -> tuple[bytes, str]:
-    try:
-        content = path.read_bytes()
-    except OSError as error:
-        raise ValueError(f"{label} could not be captured: {path}") from error
-    return content, hashlib.sha256(content).hexdigest()
-
-
-def _require_artifact_unchanged(path: Path, expected_hash: str, label: str) -> None:
-    try:
-        actual_hash = checkpoint_sha256(path)
-    except OSError as error:
-        raise ValueError(f"{label} changed during export: {path}") from error
-    if actual_hash != expected_hash:
-        raise ValueError(
-            f"{label} changed during export; "
-            f"expected={expected_hash}, actual={actual_hash}, path={path}"
-        )
-
-
-def _require_sha256(value: str, label: str) -> str:
-    if not isinstance(value, str):
-        raise TypeError(f"{label} must be a string containing a SHA-256 digest")
-    normalized = value.lower()
-    if len(normalized) != 64 or any(
-        character not in "0123456789abcdef" for character in normalized
-    ):
-        raise ValueError(f"{label} must be a 64-character SHA-256 digest")
-    return normalized
-
-
-def _require_strict_int(value: Any, expected: int, label: str) -> None:
-    if type(value) is not int or value != expected:
-        raise ValueError(
-            f"selected DSRL checkpoint {label} must be {expected}; got {value!r}"
-        )
-
-
-def _load_provenance(
-    path: Path,
-    *,
-    captured_content: bytes | None = None,
-) -> dict[str, str]:
-    if captured_content is None:
-        if not path.is_file():
-            raise ValueError(f"formal provenance does not exist: {path}")
-        captured_content, _ = _capture_artifact(path, "formal provenance")
-    try:
-        text = captured_content.decode("utf-8")
-    except UnicodeDecodeError as error:
-        raise ValueError(f"formal provenance is not valid UTF-8: {path}") from error
-    values: dict[str, str] = {}
-    for line in text.splitlines():
-        key, separator, value = line.partition("=")
-        if not separator or not key or not value:
-            raise ValueError(f"invalid formal provenance line: {line!r}")
-        if key in values:
-            raise ValueError(f"duplicate formal provenance key: {key}")
-        values[key] = value
-    if set(values) != PROVENANCE_KEYS:
-        raise ValueError(
-            "formal provenance keyspace mismatch; "
-            f"missing={sorted(PROVENANCE_KEYS - set(values))}; "
-            f"unexpected={sorted(set(values) - PROVENANCE_KEYS)}"
-        )
-    if values["TABERO_PROVENANCE_VERSION"] != "1":
-        raise ValueError("unsupported formal provenance version")
-    if values["TABERO_PROVENANCE_MODE"] not in {"fresh", "legacy_migration"}:
-        raise ValueError("unsupported formal provenance mode")
-    for key, label in (
-        ("TABERO_CONFIG_SHA256", "formal config SHA-256"),
-        ("TABERO_CONFIG_SNAPSHOT_SHA256", "formal config snapshot SHA-256"),
-        ("TABERO_BASE_MODEL_SHA256", "formal base model SHA-256"),
-    ):
-        values[key] = _require_sha256(values[key], label)
-    source_hash = values["TABERO_SOURCE_CONFIG_SHA256"]
-    if values["TABERO_PROVENANCE_MODE"] == "fresh":
-        if source_hash != "none":
-            raise ValueError(
-                "fresh provenance source config SHA-256 must be literal 'none'"
-            )
-    else:
-        values["TABERO_SOURCE_CONFIG_SHA256"] = _require_sha256(
-            source_hash,
-            "legacy source config SHA-256",
-        )
-    return values
-
-
-def _validate_checkpoint_path(
-    checkpoint: Path,
-    profile: TaberoDSRLTrainingProfile,
-) -> Path:
-    checkpoint = checkpoint.resolve()
-    expected_suffix = (
-        f"global_step_{profile.global_step}",
-        "actor",
-        "model_state_dict",
-        "trainable_weights.pt",
+def build_actor(contract):
+    """Construct the real training modules without allocating the frozen VLA."""
+    c = contract
+    actor = nn.Module()
+    actor.dsrl_action_noise_net = GaussianPolicy(
+        input_dim=(c["state_latent_dim"] if c["use_state"] else 0)
+        + len(c["image_keys"]) * c["image_latent_dim"]
+        + c["tactile_latent_dim"],
+        output_dim=c["noise_dim"],
+        hidden_dims=c["hidden_dims"],
+        low=None,
+        high=None,
+        action_horizon=c["horizon"],
     )
-    actual_suffix = tuple(checkpoint.parts[-4:])
-    if actual_suffix != expected_suffix:
-        raise ValueError(
-            "selected DSRL checkpoint path must end with "
-            f"global_step_{profile.global_step}/actor/model_state_dict/"
-            "trainable_weights.pt; "
-            f"got {checkpoint}"
+    actor.actor_image_encoder = LightweightImageEncoder64(
+        num_images=1, latent_dim=c["image_latent_dim"], image_size=64
+    )
+    if c["use_state"]:
+        actor.actor_state_encoder = CompactStateEncoder(
+            state_dim=c["state_dim"], hidden_dim=c["state_latent_dim"]
         )
-    if not checkpoint.is_file():
-        raise ValueError(f"selected DSRL checkpoint does not exist: {checkpoint}")
-    return checkpoint
+    actor.actor_tactile_encoder = TactileTCNEncoder(
+        input_dim=c["tactile_shape"][1] * 2,
+        hidden_dim=c["tactile_latent_dim"],
+        output_dim=c["tactile_latent_dim"],
+        history_len=8,
+        has_reference_frame=True,
+        diff_from_reference=False,
+    )
+    return actor.to(dtype=getattr(torch, c["dtype"]))
 
 
-def _validate_metadata(
-    metadata: Any,
-    task_id: int,
-    profile: TaberoDSRLTrainingProfile,
-) -> dict[str, Any]:
-    if not isinstance(metadata, Mapping):
-        raise ValueError("selected DSRL checkpoint metadata must be a mapping")
-    expected_config = profile.training_config(task_id)
-    if metadata.get("format") != "trainable_weights":
-        raise ValueError("selected DSRL checkpoint format must be trainable_weights")
-    if metadata.get("method") != "dsrl":
-        raise ValueError("selected DSRL checkpoint method must be dsrl")
-    if metadata.get("reward_semantics") != DSRL_REWARD_SEMANTICS:
-        raise ValueError(
-            "selected DSRL checkpoint reward_semantics must be "
-            f"{DSRL_REWARD_SEMANTICS!r}"
-        )
-    if metadata.get("observation_semantics") != DSRL_OBSERVATION_SEMANTICS:
-        raise ValueError(
-            "selected DSRL checkpoint observation_semantics must be "
-            f"{DSRL_OBSERVATION_SEMANTICS!r}"
-        )
-    if metadata.get("replay_semantics") != DSRL_REPLAY_SEMANTICS:
-        raise ValueError(
-            "selected DSRL checkpoint replay_semantics must be "
-            f"{DSRL_REPLAY_SEMANTICS!r}"
-        )
-    if (
-        metadata.get("transition_boundary_semantics")
-        != DSRL_TRANSITION_BOUNDARY_SEMANTICS
-    ):
-        raise ValueError(
-            "selected DSRL checkpoint transition_boundary_semantics must be "
-            f"{DSRL_TRANSITION_BOUNDARY_SEMANTICS!r}"
-        )
-    _require_strict_int(
-        metadata.get("checkpoint_version"),
-        DSRL_TRAINABLE_CHECKPOINT_VERSION,
-        "checkpoint_version",
-    )
-    _require_strict_int(
-        metadata.get("manifest_version"),
-        DSRL_TRAINABLE_MANIFEST_VERSION,
-        "manifest_version",
-    )
-    _require_strict_int(metadata.get("task_id"), task_id, "task_id")
-    if metadata.get("training_config") != expected_config:
-        raise ValueError(
-            f"selected DSRL checkpoint training_config must be {expected_config!r}"
-        )
-    _require_strict_int(metadata.get("step"), profile.global_step, "step")
-    _require_strict_int(metadata.get("global_step"), profile.global_step, "global_step")
-    _require_strict_int(
-        metadata.get("target_global_step"),
-        profile.target_global_step,
-        "target_global_step",
-    )
-    if metadata.get("is_final") is not profile.is_final:
-        raise ValueError(
-            "DSRL checkpoint is_final must be "
-            f"{profile.is_final!r} for profile {profile.name!r}"
-        )
-    _require_strict_int(metadata.get("rank"), 0, "rank")
-    _require_strict_int(
-        metadata.get("world_size"), profile.actor_world_size, "world_size"
-    )
-    _require_strict_int(
-        metadata.get("parameter_count"),
-        DSRL_TRAINABLE_TENSOR_COUNT,
-        "parameter_count",
-    )
-    _require_strict_int(
-        metadata.get("tensor_count"),
-        DSRL_TRAINABLE_TENSOR_COUNT,
-        "tensor_count",
-    )
-    _require_strict_int(
-        metadata.get("total_parameter_count"),
-        DSRL_TRAINABLE_PARAMETER_COUNT,
-        "total_parameter_count",
-    )
-    return dict(metadata)
-
-
-def _validate_trainable_state(state: Any) -> dict[str, torch.Tensor]:
-    if not isinstance(state, Mapping):
-        raise ValueError("selected DSRL checkpoint model must be a tensor mapping")
-    expected_keys = set(DSRL_TRAINABLE_MANIFEST_V2)
-    actual_keys = set(state)
-    missing = sorted(expected_keys - actual_keys)
-    unexpected = sorted(actual_keys - expected_keys)
-    non_tensors = sorted(
-        key
-        for key in expected_keys & actual_keys
-        if not isinstance(state[key], torch.Tensor)
-    )
-    shape_mismatches = {
-        key: {
-            "expected": DSRL_TRAINABLE_MANIFEST_V2[key],
-            "actual": tuple(state[key].shape),
-        }
-        for key in expected_keys & actual_keys
-        if isinstance(state[key], torch.Tensor)
-        and tuple(state[key].shape) != DSRL_TRAINABLE_MANIFEST_V2[key]
-    }
-    dtype_mismatches = {
-        key: str(state[key].dtype)
-        for key in expected_keys & actual_keys
-        if isinstance(state[key], torch.Tensor) and state[key].dtype != torch.bfloat16
-    }
-    nonfinite = sorted(
-        key
-        for key in expected_keys & actual_keys
-        if isinstance(state[key], torch.Tensor)
-        and state[key].is_floating_point()
-        and not torch.isfinite(state[key]).all().item()
-    )
-    if missing or unexpected or non_tensors or shape_mismatches:
-        raise ValueError(
-            "selected DSRL trainable tensor manifest mismatch; "
-            f"missing={missing}; unexpected={unexpected}; non_tensors={non_tensors}; "
-            f"shape_mismatches={shape_mismatches}"
-        )
-    if dtype_mismatches:
-        raise ValueError(
-            "selected DSRL trainable tensor dtype mismatch; expected bfloat16; "
-            f"actual={dtype_mismatches}"
-        )
-    if nonfinite:
-        raise ValueError(
-            f"selected DSRL trainable tensors must be finite; keys={nonfinite}"
-        )
-    return {key: state[key] for key in DSRL_TRAINABLE_MANIFEST_V2}
-
-
-def _validate_config_snapshot(
-    config_snapshot: Path,
-    base_model: Path,
-    metadata: Mapping[str, Any],
-    profile: TaberoDSRLTrainingProfile,
-    *,
-    captured_content: bytes | None = None,
-) -> None:
-    if captured_content is None:
-        captured_content, _ = _capture_artifact(
-            config_snapshot,
-            "formal config snapshot",
-        )
-    try:
-        config_text = captured_content.decode("utf-8")
-        config = OmegaConf.load(io.StringIO(config_text))
-    except Exception as error:
-        raise ValueError(
-            f"formal config snapshot could not be loaded: {config_snapshot}"
-        ) from error
-
-    def require_value(path: str, expected: Any) -> None:
-        actual = OmegaConf.select(config, path, default=None)
-        if type(expected) in {bool, int}:
-            valid = type(actual) is type(expected) and actual == expected
-        else:
-            valid = actual == expected
-        if not valid:
-            raise ValueError(
-                f"formal config snapshot {path} must be {expected!r}; got {actual!r}"
-            )
-
-    task_id = metadata["task_id"]
-    require_value("env.train.init_params.task_id", task_id)
-    for path, expected in profile.config_requirements:
-        require_value(path, expected)
-    require_value("actor.model.openpi.use_dsrl", True)
-    require_value("actor.model.openpi.dsrl_use_tactile", True)
-    require_value("actor.model.openpi.dsrl_state_dim", 7)
-    require_value("actor.model.openpi.dsrl_action_noise_dim", 32)
-    require_value("algorithm.dsrl_reward_semantics", DSRL_REWARD_SEMANTICS)
-    require_value("algorithm.dsrl_observation_semantics", DSRL_OBSERVATION_SEMANTICS)
-    require_value("algorithm.dsrl_replay_semantics", DSRL_REPLAY_SEMANTICS)
-    require_value(
-        "algorithm.dsrl_transition_boundary_semantics",
-        DSRL_TRANSITION_BOUNDARY_SEMANTICS,
-    )
-    require_value("algorithm.replay_buffer.backend", DSRL_REPLAY_BACKEND)
-    require_value(
-        "algorithm.replay_buffer.capacity_transitions",
-        DSRL_REPLAY_CAPACITY_TRANSITIONS,
-    )
-    require_value(
-        "algorithm.replay_buffer.checkpoint_shard_transitions",
-        DSRL_REPLAY_CHECKPOINT_SHARD_TRANSITIONS,
-    )
-    require_value(
-        "algorithm.replay_buffer.max_resident_gib",
-        DSRL_REPLAY_MAX_RESIDENT_GIB,
-    )
-    require_value("actor.model.openpi.dsrl_num_images", 2)
-
-    logger_backends = OmegaConf.select(
-        config,
-        "runner.logger.logger_backends",
-        default=None,
-    )
-    if logger_backends is None or list(logger_backends) != ["tensorboard", "wandb"]:
-        raise ValueError(
-            "formal config snapshot runner.logger.logger_backends must contain "
-            "exactly ['tensorboard', 'wandb']"
-        )
-
-    rollout_sync_prefixes = OmegaConf.select(
-        config,
-        "actor.rollout_sync_prefixes",
-        default=None,
-    )
-    if rollout_sync_prefixes is None or (
-        tuple(rollout_sync_prefixes) != DSRL_ROLLOUT_SYNC_PREFIXES
-    ):
-        raise ValueError(
-            "formal config snapshot actor.rollout_sync_prefixes must contain exactly "
-            f"{list(DSRL_ROLLOUT_SYNC_PREFIXES)} in this order"
-        )
-
-    for config_path in ("actor.model.model_path", "rollout.model.model_path"):
-        configured_base_model = OmegaConf.select(
-            config,
-            config_path,
-            default=None,
-        )
-        if not isinstance(configured_base_model, str) or (
-            Path(configured_base_model).resolve() != base_model
+def actor_contract(model_config, observation, state):
+    """Derive architecture from training and spatial shapes from a captured observation."""
+    c = model_config
+    if c.get("use_dsrl") is not True or c.get("dsrl_use_tactile") is not True:
+        raise ValueError("This exporter requires tactile DSRL training.")
+    count = c["dsrl_num_images"]
+    if type(count) is not int or count not in (1, 2, 3):
+        raise ValueError("dsrl_num_images must be 1, 2, or 3.")
+    image_keys = ["dsrl_raw_image", "dsrl_raw_wrist_image", "tactile_image"][:count]
+    shapes = []
+    for key in image_keys:
+        value = observation[key]
+        if value.ndim != 3 or value.shape[-1] != 3 or value.dtype != torch.uint8:
+            raise ValueError(f"{key} must be a raw HWC uint8 image.")
+        shapes.append(list(value.shape))
+    tactile = observation["tactile_marker_motion"]
+    expected_tactile = (9, c["dsrl_tactile_input_dim"] // 2, 2)
+    if c["dsrl_tactile_input_dim"] % 2 or tuple(tactile.shape) != expected_tactile:
+        raise ValueError("Tactile observation and training input dimensions disagree.")
+    use_state = c.get("dsrl_actor_use_state", True)
+    if type(use_state) is not bool:
+        raise ValueError("dsrl_actor_use_state must be boolean.")
+    checked_keys = [*image_keys, "tactile_marker_motion"]
+    if tactile.dtype != torch.float32:
+        raise ValueError("Tactile observation must use float32.")
+    if use_state:
+        proprio = observation["state"]
+        if (
+            tuple(proprio.shape) != (c["dsrl_state_dim"],)
+            or proprio.dtype != torch.float32
         ):
-            raise ValueError(
-                f"formal config snapshot {config_path} must reference base model "
-                f"{base_model}; got {configured_base_model!r}"
-            )
-
-    trainable_metadata = {
-        "method": "dsrl",
-        "task_id": task_id,
-        "training_config": metadata["training_config"],
-        "target_global_step": metadata["target_global_step"],
+            raise ValueError("State observation shape or dtype mismatch.")
+        checked_keys.append("state")
+    if not all(torch.isfinite(observation[k]).all() for k in checked_keys):
+        raise ValueError("Observation contains nonfinite values.")
+    dtypes = {v.dtype for k, v in state.items() if k.startswith(ACTOR_PREFIXES)}
+    if len(dtypes) != 1 or next(iter(dtypes)) not in (torch.bfloat16, torch.float32):
+        raise ValueError("Actor weights must have one supported floating dtype.")
+    return {
+        "use_state": use_state,
+        "image_keys": image_keys,
+        "image_shapes": shapes,
+        "state_key": "state",
+        "state_dim": c["dsrl_state_dim"],
+        "tactile_key": "tactile_marker_motion",
+        "tactile_shape": list(expected_tactile),
+        "image_latent_dim": c["dsrl_image_latent_dim"],
+        "state_latent_dim": c["dsrl_state_latent_dim"],
+        "tactile_latent_dim": c["dsrl_tactile_latent_dim"],
+        "hidden_dims": list(c["dsrl_hidden_dims"]),
+        "noise_dim": c["dsrl_action_noise_dim"],
+        "horizon": c["action_horizon"],
+        "num_steps": c["num_steps"],
+        "dtype": str(next(iter(dtypes))).removeprefix("torch."),
+        "image_preprocessing": "uint8_bilinear64_align_false_minus_one_one",
+        "tactile_processing": "reference_plus_history8_no_difference_causal_tcn2_kernel3",
+        "feature_order": "state_ordered_images_tactile"
+        if use_state
+        else "ordered_images_tactile",
     }
-    for key, expected in trainable_metadata.items():
-        require_value(
-            f"actor.fsdp_config.trainable_checkpoint_metadata.{key}",
-            expected,
+
+
+def validate_actor_state(state, contract):
+    expected = build_actor(contract).state_dict()
+    actor_state = {k: v for k, v in state.items() if k.startswith(ACTOR_PREFIXES)}
+    if set(actor_state) != set(expected):
+        raise ValueError(
+            "Actor checkpoint keyspace differs from the training architecture."
         )
-
-
-def _validate_provenance(
-    checkpoint: Path,
-    base_model: Path,
-    actual_base_hash: str,
-    metadata: Mapping[str, Any],
-    profile: TaberoDSRLTrainingProfile,
-) -> _ValidatedProvenance:
-    output_root = checkpoint.parents[5]
-    provenance_path = output_root / "provenance.env"
-    config_snapshot = output_root / "config_snapshot.yaml"
-    if not provenance_path.is_file():
-        raise ValueError(f"formal provenance does not exist: {provenance_path}")
-    provenance_content, provenance_hash = _capture_artifact(
-        provenance_path,
-        "formal provenance",
-    )
-    provenance = _load_provenance(
-        provenance_path,
-        captured_content=provenance_content,
-    )
-    if not config_snapshot.is_file():
-        raise ValueError(f"formal config snapshot does not exist: {config_snapshot}")
-    snapshot_content, snapshot_hash = _capture_artifact(
-        config_snapshot,
-        "formal config snapshot",
-    )
-    if (
-        snapshot_hash != provenance["TABERO_CONFIG_SHA256"]
-        or snapshot_hash != (provenance["TABERO_CONFIG_SNAPSHOT_SHA256"])
-    ):
-        raise ValueError("formal config snapshot SHA-256 does not match provenance")
-    if Path(provenance["TABERO_BASE_MODEL_PATH"]).resolve() != base_model:
-        raise ValueError("base model path does not match formal provenance")
-    if provenance["TABERO_BASE_MODEL_SHA256"] != actual_base_hash:
-        raise ValueError("base model SHA-256 does not match formal provenance")
-    _validate_config_snapshot(
-        config_snapshot,
-        base_model,
-        metadata,
-        profile,
-        captured_content=snapshot_content,
-    )
-
-    legacy_source_config = None
-    legacy_source_hash = None
-    if provenance["TABERO_PROVENANCE_MODE"] == "legacy_migration":
-        legacy_source_config = output_root / "tensorboard" / "config.yaml"
-        if not legacy_source_config.is_file():
-            raise ValueError(
-                f"legacy source config does not exist: {legacy_source_config}"
-            )
-        _, legacy_source_hash = _capture_artifact(
-            legacy_source_config,
-            "legacy source config",
-        )
-        if legacy_source_hash != provenance["TABERO_SOURCE_CONFIG_SHA256"]:
-            raise ValueError("legacy source config SHA-256 does not match provenance")
-    return _ValidatedProvenance(
-        path=provenance_path,
-        sha256=provenance_hash,
-        config_snapshot=config_snapshot,
-        config_snapshot_sha256=snapshot_hash,
-        legacy_source_config=legacy_source_config,
-        legacy_source_config_sha256=legacy_source_hash,
-        values=provenance,
-    )
-
-
-def _require_sources_unchanged(
-    *,
-    checkpoint: Path,
-    checkpoint_hash: str,
-    base_weights: Path,
-    base_hash: str,
-    provenance: _ValidatedProvenance,
-) -> None:
-    artifacts = [
-        (checkpoint, checkpoint_hash, "source checkpoint"),
-        (base_weights, base_hash, "base model weights"),
-        (provenance.path, provenance.sha256, "formal provenance"),
-        (
-            provenance.config_snapshot,
-            provenance.config_snapshot_sha256,
-            "formal config snapshot",
-        ),
-    ]
-    if provenance.legacy_source_config is not None:
-        artifacts.append(
-            (
-                provenance.legacy_source_config,
-                provenance.legacy_source_config_sha256,
-                "legacy source config",
-            )
-        )
-    for path, expected_hash, label in artifacts:
-        if expected_hash is None:
-            raise ValueError(f"{label} changed during export: missing validated hash")
-        _require_artifact_unchanged(path, expected_hash, label)
-
-
-def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
-    path.write_text(
-        json.dumps(payload, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    for key, value in actor_state.items():
+        if (
+            value.shape != expected[key].shape
+            or value.dtype != expected[key].dtype
+            or not torch.isfinite(value).all()
+        ):
+            raise ValueError(f"Actor tensor shape/dtype/finite check failed: {key}")
+    return {k: v.detach().cpu().contiguous() for k, v in actor_state.items()}
 
 
 def _publish_directory_noreplace(source: Path, target: Path) -> None:
@@ -611,261 +201,174 @@ def _publish_directory_noreplace(source: Path, target: Path) -> None:
 
 def export_tabero_dsrl_bundle(
     *,
-    trainable_checkpoint: str | Path,
-    output_dir: str | Path,
-    base_model: str | Path,
-    expected_base_model_sha256: str,
-    task_id: int,
-    training_profile: str = FORMAL_8GPU_50STEP_PROFILE,
-) -> dict[str, Any]:
-    """Validate and export one allowlisted Task 0/5 DSRL actor bundle."""
-    if type(task_id) is not int or task_id not in {0, 5}:
-        raise ValueError(f"task_id must be exactly 0 or 5; got {task_id!r}")
-    profile = resolve_tabero_dsrl_training_profile(training_profile, task_id)
-    checkpoint = _validate_checkpoint_path(Path(trainable_checkpoint), profile)
-    output_dir = Path(output_dir).resolve()
-    if output_dir.exists():
-        raise FileExistsError(f"DSRL bundle output already exists: {output_dir}")
-    base_model = Path(base_model).resolve()
-    base_weights = base_model / "model.safetensors"
-    if not base_weights.is_file():
-        raise ValueError(f"base model weights do not exist: {base_weights}")
-    expected_base_hash = _require_sha256(
-        expected_base_model_sha256,
-        "expected base model SHA-256",
+    trainable_checkpoint,
+    train_config,
+    observation_sample,
+    output_dir,
+    base_model,
+    expected_base_model_sha256,
+):
+    """Export from a resolved training YAML and a raw single-observation tensor mapping."""
+    checkpoint, config_path, obs_path = map(
+        Path, (trainable_checkpoint, train_config, observation_sample)
     )
-    actual_base_hash = checkpoint_sha256(base_weights)
-    if actual_base_hash != expected_base_hash:
-        raise ValueError(
-            "base model SHA-256 does not match expected digest; "
-            f"expected={expected_base_hash}, actual={actual_base_hash}"
-        )
-
-    checkpoint_content, checkpoint_hash = _capture_artifact(
+    base, output = Path(base_model).resolve(), Path(output_dir).resolve()
+    if output.exists():
+        raise FileExistsError(output)
+    paths = [
         checkpoint,
-        "source checkpoint",
-    )
+        config_path,
+        obs_path,
+        base / "model.safetensors",
+        base / "config.json",
+        base / "export_meta.json",
+    ]
+    captured = {p: p.read_bytes() for p in paths if p != base / "model.safetensors"}
+    hashes = {p: hashlib.sha256(data).hexdigest() for p, data in captured.items()}
+    hashes[base / "model.safetensors"] = checkpoint_sha256(base / "model.safetensors")
+    if hashes[base / "model.safetensors"] != expected_base_model_sha256:
+        raise ValueError("Base model SHA-256 mismatch.")
+    # Parse captured bytes and check their identities again before publishing.
     payload = torch.load(
-        io.BytesIO(checkpoint_content),
-        map_location="cpu",
-        weights_only=True,
+        io.BytesIO(captured[checkpoint]), map_location="cpu", weights_only=True
     )
-    _require_artifact_unchanged(checkpoint, checkpoint_hash, "source checkpoint")
-    if not isinstance(payload, Mapping) or set(payload) != {"model", "metadata"}:
+    cfg = OmegaConf.create(captured[config_path].decode())
+    if "defaults" in cfg:
         raise ValueError(
-            "selected DSRL sidecar must contain exactly model and metadata"
+            "Supply the resolved training YAML, not an uncomposed Hydra config."
         )
-    metadata = _validate_metadata(payload["metadata"], task_id, profile)
-    trainable_state = _validate_trainable_state(payload["model"])
-    actor_state = {
-        key: trainable_state[key].detach().cpu().contiguous()
-        for key in DSRL_ROLLOUT_SYNC_MANIFEST_V2
+    c = OmegaConf.to_container(cfg.actor.model.openpi, resolve=True)
+    obs = torch.load(
+        io.BytesIO(captured[obs_path]), map_location="cpu", weights_only=True
+    )
+    state, metadata = payload["model"], payload["metadata"]
+    task_id = cfg.env.train.init_params.task_id
+    if type(task_id) is not int or task_id < 0 or metadata.get("method") != "dsrl":
+        raise ValueError("Training task/method metadata mismatch.")
+    step = metadata.get("global_step")
+    if type(step) is not int or step < 0 or type(metadata.get("is_final")) is not bool:
+        raise ValueError("Checkpoint step/finality metadata is invalid.")
+    if "task_id" in metadata and metadata["task_id"] != task_id:
+        raise ValueError("Checkpoint task_id disagrees with training config.")
+    for key, value in cfg.actor.fsdp_config.get(
+        "trainable_checkpoint_metadata", {}
+    ).items():
+        if metadata.get(key) != value:
+            raise ValueError(f"Checkpoint metadata disagrees with config: {key}")
+    for model_path in (cfg.actor.model.model_path, cfg.rollout.model.model_path):
+        if Path(model_path).resolve() != base:
+            raise ValueError("Training base path disagrees with export base.")
+    contract = actor_contract(c, obs, state)
+    actor_state = validate_actor_state(state, contract)
+    base_config = json.loads(captured[base / "config.json"])
+    base_meta = json.loads(captured[base / "export_meta.json"])
+    if base_meta["model_sha256"] != expected_base_model_sha256:
+        raise ValueError("Base export metadata SHA-256 mismatch.")
+    fields = (
+        "pi05",
+        "discrete_state_input",
+        "action_dim",
+        "action_horizon",
+        "max_token_len",
+        "tactile_prefix_dim_in",
+        "tactile_prefix_history",
+        "tactile_prefix_encoder_type",
+        "tactile_prefix_use_reference_frame",
+        "tactile_prefix_diff_from_reference",
+    )
+    model = {k: base_config[k] for k in fields if k in base_config}
+    for key, value in model.items():
+        if key in c and c[key] != value:
+            raise ValueError(f"Training/base model setting mismatch: {key}")
+    if (
+        c["config_name"] != base_config["config_name"]
+        or contract["noise_dim"] != model["action_dim"]
+    ):
+        raise ValueError("Training/base config or noise dimension mismatch.")
+    if (
+        model.get("tactile_prefix_dim_in")
+        != contract["tactile_shape"][0] * contract["tactile_shape"][1] * 2
+    ):
+        raise ValueError("Base VLA and DSRL tactile shapes disagree.")
+    asset = base_meta["normalization_asset_id"]
+    norm = base / "assets" / asset / "norm_stats.json"
+    norm_hash = checkpoint_sha256(norm)
+    hashes[norm] = norm_hash
+    if base_meta.get("norm_stats_sha256") != norm_hash:
+        raise ValueError("Base normalization metadata mismatch.")
+    training_contract = cfg.actor.model.get("tabero_pi05_checkpoint_contract", {})
+    for key, actual in [
+        ("expected_norm_asset_id", asset),
+        ("expected_norm_stats_sha256", norm_hash),
+        ("expected_model_sha256", expected_base_model_sha256),
+    ]:
+        if key in training_contract and training_contract[key] != actual:
+            raise ValueError(f"Training normalization/base contract mismatch: {key}")
+    manifest = {
+        "format": "tabero_dsrl_t2vla",
+        "algorithm": "dsrl-sac",
+        "task_id": task_id,
+        "global_step": step,
+        "is_final": metadata["is_final"],
+        "source": {
+            "checkpoint_sha256": hashes[checkpoint],
+            "config_sha256": hashes[config_path],
+            "observation_sha256": hashes[obs_path],
+            "metadata": metadata,
+            "semantics": {
+                k: v
+                for k, v in OmegaConf.to_container(cfg.algorithm, resolve=True).items()
+                if k.startswith("dsrl_")
+            },
+        },
+        "base": {
+            "model_sha256": expected_base_model_sha256,
+            "norm_sha256": norm_hash,
+            "norm_asset_id": asset,
+            "config_name": c["config_name"],
+            "model": model,
+            "use_quantile_norm": bool(model["pi05"]),
+        },
+        "actor_contract": contract,
+        "actor_weights": "dsrl_actor.safetensors",
+        "actor_shapes": {k: list(v.shape) for k, v in actor_state.items()},
     }
-    validate_dsrl_rollout_state_dict(actor_state)
-    provenance = _validate_provenance(
-        checkpoint,
-        base_model,
-        actual_base_hash,
-        metadata,
-        profile,
-    )
-
-    output_dir.parent.mkdir(parents=True, exist_ok=True)
-    temporary_dir = Path(
-        tempfile.mkdtemp(prefix=f".{output_dir.name}.", dir=output_dir.parent)
-    )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = Path(tempfile.mkdtemp(prefix=f".{output.name}.", dir=output.parent))
     try:
-        actor_path = temporary_dir / ACTOR_WEIGHTS_NAME
-        save_file(
-            actor_state,
-            actor_path,
-            metadata={
-                "format": FORMAT,
-                "format_version": str(FORMAT_VERSION),
-                "task_id": str(task_id),
-                "global_step": str(profile.global_step),
-                "dtype": "bfloat16",
-                "reward_semantics": DSRL_REWARD_SEMANTICS,
-                "observation_semantics": DSRL_OBSERVATION_SEMANTICS,
-                "transition_boundary_semantics": (DSRL_TRANSITION_BOUNDARY_SEMANTICS),
-            },
+        save_file(actor_state, temporary / manifest["actor_weights"])
+        manifest["actor_weights_sha256"] = checkpoint_sha256(
+            temporary / manifest["actor_weights"]
         )
-        saved_actor = load_file(actor_path, device="cpu")
-        validate_dsrl_rollout_state_dict(saved_actor)
-        if {tensor.dtype for tensor in saved_actor.values()} != {torch.bfloat16}:
-            raise ValueError("saved DSRL actor dtype audit failed")
-        if not all(
-            torch.isfinite(tensor).all().item() for tensor in saved_actor.values()
-        ):
-            raise ValueError("saved DSRL actor finite audit failed")
-        actor_hash = checkpoint_sha256(actor_path)
-
-        manifest: dict[str, Any] = {
-            "format": FORMAT,
-            "format_version": FORMAT_VERSION,
-            "algorithm": "dsrl-sac",
-            "reward_semantics": DSRL_REWARD_SEMANTICS,
-            "observation_semantics": DSRL_OBSERVATION_SEMANTICS,
-            "transition_boundary_semantics": DSRL_TRANSITION_BOUNDARY_SEMANTICS,
-            "task_id": task_id,
-            "global_step": profile.global_step,
-            "is_final": metadata["is_final"],
-            "training_config": metadata["training_config"],
-            "base_model": str(base_model),
-            "base_model_sha256": actual_base_hash,
-            "source_checkpoint": str(checkpoint),
-            "source_checkpoint_sha256": checkpoint_hash,
-            "source_provenance": str(provenance.path),
-            "source_provenance_sha256": provenance.sha256,
-            "source_config_snapshot": str(provenance.config_snapshot),
-            "source_config_snapshot_sha256": provenance.config_snapshot_sha256,
-            "legacy_source_config": (
-                str(provenance.legacy_source_config)
-                if provenance.legacy_source_config is not None
-                else None
-            ),
-            "legacy_source_config_sha256": provenance.legacy_source_config_sha256,
-            "source_git_commit": provenance.values["TABERO_GIT_COMMIT"],
-            "actor_weights": ACTOR_WEIGHTS_NAME,
-            "actor_weights_sha256": actor_hash,
-            "actor_manifest_version": DSRL_ROLLOUT_SYNC_MANIFEST_VERSION,
-            "actor_tensor_count": DSRL_ROLLOUT_SYNC_TENSOR_COUNT,
-            "actor_parameter_count": DSRL_ROLLOUT_SYNC_PARAMETER_COUNT,
-            "actor_dtype": "bfloat16",
-            "observation_contract": {
-                "main_image": {
-                    "key": "dsrl_raw_image",
-                    "shape": [256, 256, 3],
-                    "layout": "HWC",
-                    "dtype": "uint8",
-                    "value_range": [0, 255],
-                    "preprocessing": {
-                        "resize": [64, 64],
-                        "mode": "bilinear",
-                        "align_corners": False,
-                        "output_layout": "NCHW",
-                        "normalization": "uint8_to_minus_one_one",
-                    },
-                },
-                "wrist_image": {
-                    "key": "dsrl_raw_wrist_image",
-                    "shape": [256, 256, 3],
-                    "layout": "HWC",
-                    "dtype": "uint8",
-                    "value_range": [0, 255],
-                    "preprocessing": {
-                        "resize": [64, 64],
-                        "mode": "bilinear",
-                        "align_corners": False,
-                        "output_layout": "NCHW",
-                        "normalization": "uint8_to_minus_one_one",
-                    },
-                },
-                "state": {"key": "state", "shape": [7], "dtype": "float32"},
-                "tactile": {
-                    "key": "tactile_marker_motion",
-                    "shape": [9, 198, 2],
-                    "dtype": "float32",
-                    "encoder_shape": [9, 396],
-                },
-            },
-            "feature_contract": {
-                "order": ["state", "main_image", "wrist_image", "tactile"],
-                "dims": [64, 64, 64, 64],
-                "total_dim": 256,
-            },
-            "noise_contract": {
-                "dim": 32,
-                "horizon": 50,
-                "deterministic": "tanh(mean)",
-                "broadcast_across_horizon": True,
-                "pi0_denoise_steps": 10,
-            },
-            "architecture": {
-                "image_size": 64,
-                "image_views": ["main", "wrist"],
-                "shared_image_encoder": True,
-                "per_view_image_dim": 64,
-                "image_feature_dim": 128,
-                "state_dim": 7,
-                "tactile_shape": [9, 198, 2],
-                "hidden_dims": [128, 128, 128],
-                "feature_dim": 256,
-                "noise_dim": 32,
-            },
-            "artifact_audit": AUDIT_NAME,
-        }
-        manifest_path = temporary_dir / MANIFEST_NAME
-        _write_json(manifest_path, manifest)
-        audit = {
-            "format": "tabero_dsrl_artifact_audit",
-            "format_version": 2,
-            "status": "passed",
-            "task_id": task_id,
-            "global_step": profile.global_step,
-            "reward_semantics": DSRL_REWARD_SEMANTICS,
-            "observation_semantics": DSRL_OBSERVATION_SEMANTICS,
-            "transition_boundary_semantics": DSRL_TRANSITION_BOUNDARY_SEMANTICS,
-            "source_checkpoint_sha256": checkpoint_hash,
-            "base_model_sha256": actual_base_hash,
-            "actor_weights_sha256": actor_hash,
-            "manifest_sha256": checkpoint_sha256(manifest_path),
-            "checks": {
-                "final_checkpoint_path": True,
-                "source_metadata": True,
-                "source_trainable_manifest": True,
-                "actor_manifest": True,
-                "actor_dtype": True,
-                "actor_finite": True,
-                "base_model_sha256": True,
-                "formal_provenance": True,
-                "reward_semantics": True,
-                "observation_semantics": True,
-                "transition_boundary_semantics": True,
-                "output_hashes": True,
-            },
-        }
-        _write_json(temporary_dir / AUDIT_NAME, audit)
-        _require_sources_unchanged(
-            checkpoint=checkpoint,
-            checkpoint_hash=checkpoint_hash,
-            base_weights=base_weights,
-            base_hash=actual_base_hash,
-            provenance=provenance,
+        (temporary / "manifest.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n"
         )
-        _publish_directory_noreplace(temporary_dir, output_dir)
+        for path, digest in hashes.items():
+            if checkpoint_sha256(path) != digest:
+                raise ValueError(f"Export source changed: {path}")
+        _publish_directory_noreplace(temporary, output)
     except Exception:
-        shutil.rmtree(temporary_dir, ignore_errors=True)
+        shutil.rmtree(temporary, ignore_errors=True)
         raise
     return manifest
 
 
-def _parse_args() -> argparse.Namespace:
+def _parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--trainable-checkpoint", type=Path, required=True)
-    parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--base-model", type=Path, required=True)
+    for name in (
+        "trainable-checkpoint",
+        "train-config",
+        "observation-sample",
+        "output-dir",
+        "base-model",
+    ):
+        parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--expected-base-model-sha256", required=True)
-    parser.add_argument("--task-id", type=int, choices=(0, 5), required=True)
-    parser.add_argument(
-        "--training-profile",
-        choices=TABERO_DSRL_TRAINING_PROFILE_CHOICES,
-        default=FORMAL_8GPU_50STEP_PROFILE,
-    )
     return parser.parse_args()
 
 
-def main() -> None:
-    args = _parse_args()
-    manifest = export_tabero_dsrl_bundle(
-        trainable_checkpoint=args.trainable_checkpoint,
-        output_dir=args.output_dir,
-        base_model=args.base_model,
-        expected_base_model_sha256=args.expected_base_model_sha256,
-        task_id=args.task_id,
-        training_profile=args.training_profile,
-    )
-    print(json.dumps(manifest, indent=2, sort_keys=True))
+def main():
+    print(json.dumps(export_tabero_dsrl_bundle(**vars(_parse_args())), indent=2))
 
 
 if __name__ == "__main__":
