@@ -997,9 +997,10 @@ def _validate_tabero_realworld_pi05_pirl_contract(cfg, model_cfg) -> None:
 
     openpi_cfg = model_cfg.get("openpi", {})
     config_name = openpi_cfg.get("config_name")
+    if type(openpi_cfg.get("discrete_state_input")) is not bool:
+        raise ValueError("RealWorld PiRL discrete_state_input must be boolean.")
     common_openpi_values = {
         "pi05": True,
-        "discrete_state_input": True,
         "train_expert_only": True,
         "action_chunk": 10,
         "action_env_dim": 13,
@@ -1121,6 +1122,7 @@ def _validate_tabero_realworld_pi05_pirl_contract(cfg, model_cfg) -> None:
         expected_gripper_coordinate=expected_gripper_coordinate,
         require_final=require_final,
         expected_action_horizon=openpi_cfg.get("action_horizon"),
+        expected_discrete_state_input=openpi_cfg.get("discrete_state_input"),
     )
     if allow_non_final_formal_training and checkpoint_info["is_final"] is not False:
         raise ValueError(

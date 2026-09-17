@@ -158,6 +158,7 @@ def validate_tabero_pi05_pirl_deployment_checkpoint(
     expected_gripper_coordinate: str,
     require_final: bool,
     expected_action_horizon: int | None = None,
+    expected_discrete_state_input: bool = True,
 ) -> dict[str, Any]:
     """Validate a local merged PI0.5 tactile checkpoint before Ray starts.
 
@@ -168,6 +169,8 @@ def validate_tabero_pi05_pirl_deployment_checkpoint(
 
     if not isinstance(require_final, bool):
         raise ValueError("Tabero PiRL checkpoint require_final must be boolean.")
+    if type(expected_discrete_state_input) is not bool:
+        raise ValueError("Tabero PiRL discrete_state_input must be boolean.")
     expected_model_sha256 = _validate_expected_sha256(
         expected_model_sha256, field="expected_model_sha256"
     )
@@ -213,7 +216,7 @@ def validate_tabero_pi05_pirl_deployment_checkpoint(
             "action_dim": 32,
             "action_horizon": action_horizon,
             "pi05": True,
-            "discrete_state_input": True,
+            "discrete_state_input": expected_discrete_state_input,
             "config_name": expected_config_name,
             "num_images_in_input": 2,
             "action_chunk": action_horizon,
@@ -258,7 +261,7 @@ def validate_tabero_pi05_pirl_deployment_checkpoint(
             "action_dim": 32,
             "action_horizon": 50,
             "pi05": True,
-            "discrete_state_input": True,
+            "discrete_state_input": expected_discrete_state_input,
             "config_name": expected_config_name,
             "num_images_in_input": 3,
             "action_chunk": 50,
