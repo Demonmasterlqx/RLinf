@@ -26,7 +26,10 @@ from rlinf.envs.isaaclab.tasks.realworld_tabero_tacfield import (
     IsaaclabRealWorldTaberoTacFieldEnv,
     _build_state,
 )
-from rlinf.utils.metric_utils import compute_evaluate_metrics
+from rlinf.utils.metric_utils import (
+    aggregate_force_env_metrics,
+    compute_evaluate_metrics,
+)
 from rlinf.workers.env import env_worker
 from rlinf.workers.env.env_worker import (
     EnvWorker,
@@ -151,6 +154,16 @@ def test_first_success_survives_reset_and_next_rollout_starts_fresh(
         assert metrics["force_valid_sample_count"] == pytest.approx(
             (120 + 123 + 295 + 300) / 4
         )
+        assert metrics["force_bonus_mean"] == pytest.approx(0.25)
+        assert metrics["force_bonus_sum"] == pytest.approx(1.0)
+        assert metrics["force_bonus_max"] == pytest.approx(0.25)
+        assert metrics["trajectory_mean_measured_squeeze_mean"] == pytest.approx(5.0)
+        assert metrics["trajectory_mean_measured_squeeze_median"] == pytest.approx(5.0)
+        assert metrics["force_valid_sample_count_mean"] == pytest.approx(
+            (120 + 123 + 295 + 300) / 4
+        )
+        assert metrics["force_trajectory_count"] == 4
+        assert metrics["force_missing_trajectory_count"] == 0
         assert sum(float(out.rewards.sum()) for out in outputs) == 4
         assert outputs[12].rewards[1, 2] == 1
         assert not outputs[12].rewards[1, 3:].any()
@@ -186,6 +199,28 @@ def test_count_uses_episode_samples_even_when_chunk_diagnostics_arrive_first():
         ]
         == 0
     )
+
+
+def test_force_aggregation_counts_missing_force_trajectories():
+    metrics = aggregate_force_env_metrics(
+        [
+            {
+                "force_bonus": torch.tensor([0.0, 0.5, 0.0]),
+                "trajectory_mean_measured_squeeze": torch.tensor(
+                    [float("nan"), 4.0, float("nan")]
+                ),
+                "force_valid_sample_count": torch.tensor([0, 2, 0]),
+            }
+        ]
+    )
+    assert metrics["force_bonus_mean"] == pytest.approx(1 / 6)
+    assert metrics["force_bonus_sum"] == pytest.approx(0.5)
+    assert metrics["force_bonus_max"] == pytest.approx(0.5)
+    assert metrics["trajectory_mean_measured_squeeze_mean"] == pytest.approx(4.0)
+    assert metrics["trajectory_mean_measured_squeeze_median"] == pytest.approx(4.0)
+    assert metrics["force_valid_sample_count_mean"] == pytest.approx(2.0)
+    assert metrics["force_trajectory_count"] == 1
+    assert metrics["force_missing_trajectory_count"] == 2
 
 
 def test_duplicate_records_are_rejected():

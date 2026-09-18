@@ -75,11 +75,23 @@ def realworld_first_episode_records_to_env_info(
         "termination",
         "truncation",
     )
+    force_fields = (
+        "trajectory_mean_measured_squeeze",
+        "force_valid_sample_count",
+        "force_bonus",
+    )
     if not records:
-        return {key: torch.empty(0) for key in fields}
+        return {key: torch.empty(0) for key in (*fields, *force_fields)}
     missing = {"env_index", *fields} - records.keys()
     if missing:
         raise ValueError(f"RealWorld episode records missing fields: {sorted(missing)}")
+    present_force_fields = set(force_fields) & records.keys()
+    if present_force_fields and present_force_fields != set(force_fields):
+        missing_force_fields = sorted(set(force_fields) - present_force_fields)
+        raise ValueError(
+            "RealWorld episode records must provide force metrics together; "
+            f"missing {missing_force_fields}."
+        )
     count = records["env_index"].numel()
     if any(value.ndim != 1 or value.numel() != count for value in records.values()):
         raise ValueError("RealWorld episode records must be aligned 1D tensors.")

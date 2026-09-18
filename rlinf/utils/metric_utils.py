@@ -323,6 +323,113 @@ def count_trajectories(metrics_dict):
         raise TypeError(f"Unsupported tensor type: {type(first_tensor)}")
 
 
+def aggregate_force_env_metrics(
+    eval_metrics_list: Sequence[dict],
+) -> dict[str, float | int]:
+    """Aggregate explicit force diagnostics from completed episode rows.
+
+    The raw episode fields are still returned by :func:`compute_evaluate_metrics`
+    for backwards compatibility.  These named reductions make the force signal
+    unambiguous in TensorBoard/W&B and work for both RealWorld and chunked
+    Tabero episode records.
+    """
+
+    force_bonus_key = "force_bonus"
+    force_mean_key = "trajectory_mean_measured_squeeze"
+    force_count_key = "force_valid_sample_count"
+    present_keys = {
+        key
+        for metrics in eval_metrics_list
+        for key in metrics
+        if key in {force_bonus_key, force_mean_key, force_count_key}
+    }
+    if not present_keys:
+        return {}
+
+    def concatenate(field: str) -> torch.Tensor:
+        shards = [
+            _normalize_metric_shard(metrics[field])
+            for metrics in eval_metrics_list
+            if field in metrics
+        ]
+        return torch.cat(shards, dim=0) if shards else torch.empty(0)
+
+    force_bonus = concatenate(force_bonus_key)
+    force_mean = concatenate(force_mean_key)
+    force_count = concatenate(force_count_key)
+    has_force_trajectory_metrics = bool(
+        {force_mean_key, force_count_key} & present_keys
+    )
+    if has_force_trajectory_metrics and (
+        force_mean_key not in present_keys or force_count_key not in present_keys
+    ):
+        missing = sorted({force_mean_key, force_count_key} - present_keys)
+        raise ValueError(
+            f"Force trajectory metrics must be provided together; missing {missing}."
+        )
+    if (
+        force_bonus.numel()
+        and has_force_trajectory_metrics
+        and (force_bonus.numel() != force_mean.numel())
+    ):
+        raise ValueError(
+            "Force bonus and trajectory force metrics must align; "
+            f"bonus={force_bonus.numel()}, trajectory={force_mean.numel()}."
+        )
+
+    metrics: dict[str, float | int] = {}
+    if force_bonus.numel():
+        if not torch.isfinite(force_bonus).all():
+            raise ValueError("Force bonus metrics must be finite.")
+        metrics.update(
+            {
+                "force_bonus_mean": float(force_bonus.mean().item()),
+                "force_bonus_sum": float(force_bonus.sum().item()),
+                "force_bonus_max": float(force_bonus.max().item()),
+            }
+        )
+
+    if has_force_trajectory_metrics and force_mean.numel():
+        force_count = force_count.to(torch.float32)
+        invalid_count_rows = ~torch.isfinite(force_count) | (force_count < 0)
+        if invalid_count_rows.any():
+            raise ValueError(
+                "Force valid sample counts must be finite and non-negative."
+            )
+        invalid_mean_rows = (force_count > 0) & ~torch.isfinite(force_mean)
+        if invalid_mean_rows.any():
+            raise ValueError(
+                "Trajectory mean measured squeeze must be finite when force samples exist."
+            )
+        valid_rows = (force_count > 0) & torch.isfinite(force_mean)
+        valid_force_means = force_mean[valid_rows].to(torch.float32)
+        valid_force_counts = force_count[valid_rows]
+        metrics.update(
+            {
+                "trajectory_mean_measured_squeeze_mean": (
+                    float(valid_force_means.mean().item())
+                    if valid_force_means.numel()
+                    else float("nan")
+                ),
+                "trajectory_mean_measured_squeeze_median": (
+                    float(torch.quantile(valid_force_means, 0.5).item())
+                    if valid_force_means.numel()
+                    else float("nan")
+                ),
+                "force_valid_sample_count_mean": (
+                    float(valid_force_counts.mean().item())
+                    if valid_force_counts.numel()
+                    else float("nan")
+                ),
+                "force_trajectory_count": int(valid_rows.sum().item()),
+                "force_missing_trajectory_count": int(
+                    force_count.numel() - valid_rows.sum().item()
+                ),
+            }
+        )
+    return metrics
+
+
 def compute_evaluate_metrics(eval_metrics_list):
     """
     List of evaluate metrics, list length stands for rollout process
@@ -364,6 +471,7 @@ def compute_evaluate_metrics(eval_metrics_list):
 
     # Add total trajectory count to metrics
     all_eval_metrics["num_trajectories"] = sum(trajectory_counts)
+    all_eval_metrics.update(aggregate_force_env_metrics(eval_metrics_list))
 
     return all_eval_metrics
 
