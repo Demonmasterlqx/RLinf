@@ -56,6 +56,7 @@ TABERO_PI05_TACFIELD_CONFIG_NAME = "pi05_lora_tacfield_tabero_xarm_gripper"
 TABERO_PI05_TACFIELD_CONFIG_NAMES = (
     TABERO_PI05_TACFIELD_CONFIG_NAME,
     "pi05_lora_tacfield_realworld_replayed_task820",
+    "pi05_lora_tacfield_realworld_replayed_task820_firm_mixed_no_state",
 )
 TABERO_PI05_TACIMG_CONFIG_NAME = "pi05_lora_tacimg_realworld_replayed_task820_force"
 

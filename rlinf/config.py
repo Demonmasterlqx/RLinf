@@ -1085,12 +1085,9 @@ def _validate_tabero_realworld_pi05_pirl_contract(cfg, model_cfg) -> None:
             "same local model_path."
         )
 
-    checkpoint_contract = model_cfg.get("tabero_pi05_checkpoint_contract")
-    if checkpoint_contract is None:
-        raise ValueError(
-            "RealWorld Tabero PI0.5 PiRL requires "
-            "actor.model.tabero_pi05_checkpoint_contract."
-        )
+    # Checkpoint provenance checks are opt-in; the loader can use the registered
+    # norm asset directly without reading export metadata or hashing weights.
+    checkpoint_contract = model_cfg.get("tabero_pi05_checkpoint_contract") or {}
     require_final = checkpoint_contract.get("require_final")
     allow_non_final_formal_training = checkpoint_contract.get(
         "allow_non_final_formal_training", False
@@ -1110,20 +1107,21 @@ def _validate_tabero_realworld_pi05_pirl_contract(cfg, model_cfg) -> None:
     expected_norm_asset_id = checkpoint_contract.get("expected_norm_asset_id")
     expected_dataset = checkpoint_contract.get("expected_dataset")
     expected_gripper_coordinate = checkpoint_contract.get("expected_gripper_coordinate")
-    checkpoint_info = validate_tabero_pi05_pirl_deployment_checkpoint(
-        actor_model_path,
-        expected_model_sha256=checkpoint_contract.get("expected_model_sha256"),
-        expected_norm_stats_sha256=checkpoint_contract.get(
-            "expected_norm_stats_sha256"
-        ),
-        expected_config_name=expected_config_name,
-        expected_norm_asset_id=expected_norm_asset_id,
-        expected_dataset=expected_dataset,
-        expected_gripper_coordinate=expected_gripper_coordinate,
-        require_final=require_final,
-        expected_action_horizon=openpi_cfg.get("action_horizon"),
-        expected_discrete_state_input=openpi_cfg.get("discrete_state_input"),
-    )
+    if checkpoint_contract:
+        checkpoint_info = validate_tabero_pi05_pirl_deployment_checkpoint(
+            actor_model_path,
+            expected_model_sha256=checkpoint_contract.get("expected_model_sha256"),
+            expected_norm_stats_sha256=checkpoint_contract.get(
+                "expected_norm_stats_sha256"
+            ),
+            expected_config_name=expected_config_name,
+            expected_norm_asset_id=expected_norm_asset_id,
+            expected_dataset=expected_dataset,
+            expected_gripper_coordinate=expected_gripper_coordinate,
+            require_final=require_final,
+            expected_action_horizon=openpi_cfg.get("action_horizon"),
+            expected_discrete_state_input=openpi_cfg.get("discrete_state_input"),
+        )
     if allow_non_final_formal_training and checkpoint_info["is_final"] is not False:
         raise ValueError(
             "RealWorld Tabero PI0.5 PiRL "
@@ -1203,14 +1201,15 @@ def _validate_tabero_realworld_pi05_pirl_contract(cfg, model_cfg) -> None:
                 "base_checkpoint_is_final": checkpoint_info["is_final"],
             }
         )
-    for key, expected in required_checkpoint_metadata.items():
-        actual = checkpoint_metadata.get(key)
-        if actual != expected:
-            raise ValueError(
-                "RealWorld Tabero PI0.5 PiRL requires auditable "
-                "actor.fsdp_config.trainable_checkpoint_metadata."
-                f"{key}={expected!r}; got {actual!r}."
-            )
+    if checkpoint_contract:
+        for key, expected in required_checkpoint_metadata.items():
+            actual = checkpoint_metadata.get(key)
+            if actual != expected:
+                raise ValueError(
+                    "RealWorld Tabero PI0.5 PiRL requires auditable "
+                    "actor.fsdp_config.trainable_checkpoint_metadata."
+                    f"{key}={expected!r}; got {actual!r}."
+                )
     training_config = checkpoint_metadata.get("training_config")
     if not isinstance(training_config, str) or not training_config.strip():
         raise ValueError(

@@ -1317,7 +1317,10 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             "tabero" in self.config.config_name
             or "tacimg" in self.config.config_name
             or self.config.config_name
-            == "pi05_lora_tacfield_realworld_replayed_task820"
+            in (
+                "pi05_lora_tacfield_realworld_replayed_task820",
+                "pi05_lora_tacfield_realworld_replayed_task820_firm_mixed_no_state",
+            )
             or self.config.config_name == "pi05_lora_tacforce_tcn_real"
         )
         if is_tabero_config:
