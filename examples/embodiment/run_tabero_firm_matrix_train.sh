@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+export ROOT="${ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}"
+
 usage() {
   echo "Usage: $0 <rlt|pirl|dsrl> <0|5> <smoke|formal> [--target-steps 50|60] [--resume-dir PATH] [--restore-only] [--dry-run]" >&2
 }
@@ -94,9 +96,9 @@ TRAIN_SCRIPT="${SCRIPT_DIR}/train_embodied_agent.py"
 PROVENANCE_SCRIPT="${SCRIPT_DIR}/tabero_formal_provenance.py"
 CONFIG_DIR="${REPO_ROOT}/${CONFIG_DIR_REL}"
 CONFIG_PATH="${CONFIG_DIR}/${CONFIG_NAME}.yaml"
-ISAAC_SETUP="${REPO_ROOT}/isaac_sim/setup_conda_env.sh"
-RESULTS_ROOT="${TABERO_RESULTS_ROOT:-/data/home/sim6g/code/tabero/results}"
-MODEL_PATH="/data/home/sim6g/code/tabero/models/pi0_lora_tacfield_tabero_safetensors"
+ISAAC_SETUP="${TABERO_ISAAC_SETUP:-${ROOT}/isaacsim/setup_conda_env.sh}"
+RESULTS_ROOT="${TABERO_RESULTS_ROOT:-${ROOT}/results}"
+MODEL_PATH="${TABERO_MODEL_PATH:-${ROOT}/models/pi0_lora_tacfield_tabero_safetensors}"
 MODEL_WEIGHTS_PATH="${MODEL_PATH}/model.safetensors"
 GPU_LOCK_DIR="/tmp/tabero-formal-gpu-locks-${UID}"
 if [[ -n "${TABERO_GPU_LOCK_DIR:-}" ]]; then
@@ -105,7 +107,6 @@ if [[ -n "${TABERO_GPU_LOCK_DIR:-}" ]]; then
 fi
 MIN_FREE_KIB=1073741824
 if [[ -n "${TABERO_MIN_FREE_KIB:-}" ]]; then
-  [[ "${DRY_RUN}" == true ]] || die "TABERO_MIN_FREE_KIB is only allowed with --dry-run"
   [[ "${TABERO_MIN_FREE_KIB}" =~ ^[1-9][0-9]*$ ]] || die "TABERO_MIN_FREE_KIB must be a positive integer"
   MIN_FREE_KIB="${TABERO_MIN_FREE_KIB}"
 fi
@@ -132,22 +133,33 @@ while IFS= read -r gpu_id; do
 done < <(nvidia-smi --query-gpu=index --format=csv,noheader)
 [[ "${#installed_gpus[@]}" -gt 0 ]] || die "nvidia-smi reported no installed GPUs"
 
-if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
-  IFS=',' read -r -a visible_gpus <<<"${CUDA_VISIBLE_DEVICES}"
-  GPU_COUNT="${#visible_gpus[@]}"
-  declare -A seen_gpus=()
-  for gpu_id in "${visible_gpus[@]}"; do
-    [[ "${gpu_id}" =~ ^[0-9]+$ ]] || die "CUDA_VISIBLE_DEVICES must contain physical numeric GPU IDs"
-    [[ -z "${seen_gpus[${gpu_id}]:-}" ]] || die "CUDA_VISIBLE_DEVICES must contain 8 unique physical GPU IDs"
-    [[ -n "${installed_gpus[${gpu_id}]:-}" ]] || die "CUDA_VISIBLE_DEVICES GPU ${gpu_id} is not installed"
-    seen_gpus["${gpu_id}"]=1
-  done
-else
-  CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
-  IFS=',' read -r -a visible_gpus <<<"${CUDA_VISIBLE_DEVICES}"
-  GPU_COUNT="${#visible_gpus[@]}"
-fi
-[[ "${GPU_COUNT}" -eq 8 ]] || die "exactly 8 visible GPUs are required; found ${GPU_COUNT}"
+[[ -z "${CUDA_VISIBLE_DEVICES:-}" ]] || die "Set GPUs in cluster.component_placement, not CUDA_VISIBLE_DEVICES"
+CONFIGURED_GPUS="$("${PYTHON_BIN}" - "${CONFIG_DIR}/${CONFIG_NAME}.yaml" <<'PY'
+import sys
+from omegaconf import OmegaConf
+cfg = OmegaConf.load(sys.argv[1])
+if cfg.cluster.num_nodes != 1:
+    raise ValueError("This launcher only supports a single node")
+ranks = set()
+for placement in cfg.cluster.component_placement.values():
+    # These launchers use explicit, flat single-node placements.
+    for segment in str(placement).split(","):
+        bounds = segment.split(":")[0].split("-")
+        if len(bounds) not in (1, 2) or not all(x.isdigit() for x in bounds):
+            raise ValueError("Use explicit flat GPU ranks in cluster.component_placement")
+        lo, hi = int(bounds[0]), int(bounds[-1])
+        if lo > hi:
+            raise ValueError("Invalid GPU rank range")
+        ranks.update(range(lo, hi + 1))
+if not ranks:
+    raise ValueError("Empty cluster.component_placement")
+print(",".join(map(str, sorted(ranks))))
+PY
+)" || die "Could not read GPU placement from training config"
+IFS=',' read -r -a visible_gpus <<<"${CONFIGURED_GPUS}"
+for gpu_id in "${visible_gpus[@]}"; do
+  [[ -n "${installed_gpus[${gpu_id}]:-}" ]] || die "Configured GPU ${gpu_id} is not installed"
+done
 command -v flock >/dev/null 2>&1 || die "flock is required for exclusive formal runs"
 mkdir -p "${GPU_LOCK_DIR}"
 mapfile -t sorted_visible_gpus < <(printf '%s\n' "${visible_gpus[@]}" | sort -n)
@@ -203,15 +215,8 @@ load_run_env() {
     TABERO_EXPERIMENT_NAME TABERO_START_TIME_UTC TABERO_START_TIME_LOCAL; do
     [[ -n "${seen[${required_key}]:-}" ]] || die "invalid run.env: missing ${required_key}"
   done
-  [[ "${field_count}" -eq 12 || "${field_count}" -eq 13 ]] || \
-    die "invalid run.env: expected 12 legacy or 13 current fields"
-  if [[ "${field_count}" -eq 12 ]]; then
-    [[ -z "${seen[TABERO_LAUNCH_KIND]:-}" ]] || die "invalid legacy run.env keyspace"
-    RUN_ENV_FORMAT="legacy"
-  else
-    [[ -n "${seen[TABERO_LAUNCH_KIND]:-}" ]] || die "invalid current run.env keyspace"
-    RUN_ENV_FORMAT="current"
-  fi
+  [[ "${field_count}" -eq 13 && -n "${seen[TABERO_LAUNCH_KIND]:-}" ]] || \
+    die "unsupported run.env: current format requires all 13 fields"
 }
 
 START_TIME_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -285,7 +290,6 @@ else
     printf 'TABERO_LAUNCH_KIND=new\n'
   } >"${metadata_tmp}"
   mv "${metadata_tmp}" "${RUN_ENV}"
-  RUN_ENV_FORMAT="current"
 fi
 
 exec {OUTPUT_LOCK_FD}>"${OUTPUT_DIR}/.formal_run.lock"
@@ -296,34 +300,14 @@ FREE_DISK_KIB="$(df -Pk "${OUTPUT_DIR}" | awk 'NR == 2 {print $4}')"
 [[ "${FREE_DISK_KIB}" -ge "${MIN_FREE_KIB}" ]] || \
   die "insufficient disk space on ${OUTPUT_DIR}: ${FREE_DISK_KIB} KiB free, require ${MIN_FREE_KIB} KiB"
 
-if [[ -n "${TABERO_TEST_MODEL_SHA256:-}" ]]; then
-  [[ "${DRY_RUN}" == true ]] || die "TABERO_TEST_MODEL_SHA256 is only allowed with --dry-run"
-  BASE_MODEL_SHA256="${TABERO_TEST_MODEL_SHA256}"
-else
-  command -v sha256sum >/dev/null 2>&1 || die "sha256sum is required"
-  BASE_MODEL_SHA256="$(sha256sum "${MODEL_WEIGHTS_PATH}" | awk '{print $1}')"
-fi
-[[ "${BASE_MODEL_SHA256}" =~ ^[0-9a-f]{64}$ ]] || die "invalid base model SHA-256"
-
 provenance_args=(
   --output-dir "${OUTPUT_DIR}"
   --config-path "${CONFIG_PATH}"
   --model-path "${MODEL_PATH}"
-  --base-model-sha256 "${BASE_MODEL_SHA256}"
   --repo-root "${REPO_ROOT}"
 )
-if [[ "${DRY_RUN}" == true ]]; then
-  provenance_args+=(--allow-dirty)
-fi
 if [[ -n "${RESUME_DIR}" ]]; then
-  if [[ -f "${OUTPUT_DIR}/provenance.env" || -f "${OUTPUT_DIR}/config_snapshot.yaml" ]]; then
-    "${PYTHON_BIN}" "${PROVENANCE_SCRIPT}" verify "${provenance_args[@]}"
-  elif [[ "${RUN_ENV_FORMAT}" == "legacy" ]]; then
-    "${PYTHON_BIN}" "${PROVENANCE_SCRIPT}" capture "${provenance_args[@]}" \
-      --legacy-source-config "${OUTPUT_DIR}/tensorboard/config.yaml"
-  else
-    die "current run.env requires provenance.env and config_snapshot.yaml"
-  fi
+  "${PYTHON_BIN}" "${PROVENANCE_SCRIPT}" verify "${provenance_args[@]}"
 
   artifact_base="$(date +%Y%m%d_%H%M%S)_${BASHPID}_${LAUNCH_KIND}"
   artifact_id="${artifact_base}"
@@ -341,7 +325,7 @@ else
   "${PYTHON_BIN}" "${PROVENANCE_SCRIPT}" capture "${provenance_args[@]}"
 fi
 
-export TABERO_MATRIX_RUN_ID WANDB_RUN_ID WANDB_RESUME CUDA_VISIBLE_DEVICES
+export TABERO_MATRIX_RUN_ID WANDB_RUN_ID WANDB_RESUME
 export EMBODIED_PATH="${SCRIPT_DIR}"
 export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
@@ -352,6 +336,11 @@ command=(
   "runner.logger.log_path=${OUTPUT_DIR}"
   "runner.logger.experiment_name=${EXPERIMENT_NAME}"
 )
+if [[ "${METHOD}" != "rlt" ]]; then
+  command+=("actor.model.model_path=${MODEL_PATH}" "rollout.model.model_path=${MODEL_PATH}")
+else
+  command+=("rollout.rlt_feature_model.openpi_data.norm_stats_path=${MODEL_PATH}/assets/NathanWu7/tabero/norm_stats.json")
+fi
 if [[ "${MODE}" == "smoke" ]]; then
   command+=("runner.max_epochs=1" "runner.save_interval=1")
   if [[ "${METHOD}" == "dsrl" ]]; then

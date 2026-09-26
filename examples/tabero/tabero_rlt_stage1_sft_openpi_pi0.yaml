@@ -19,7 +19,7 @@ cluster:
 runner:
   task_type: sft
   logger:
-    log_path: "/data/home/sim6g/code/tabero/results/tabero_rlt_stage1"
+    log_path: "${oc.env:ROOT}/results/tabero_rlt_stage1"
     project_name: "tabero-rlinf"
     experiment_name: "tabero_rlt_stage1_tacfield"
     logger_backends: ["tensorboard", "wandb"]
@@ -30,7 +30,7 @@ runner:
 
 data:
   train_data_paths:
-    - dataset_path: "/data/home/sim6g/code/tabero/datas/tabero"
+    - dataset_path: "${oc.env:ROOT}/datas/tabero"
       weight: 1.0
 
 actor:
@@ -42,7 +42,7 @@ actor:
 
   model:
     model_type: "openpi"
-    model_path: "/data/home/sim6g/code/tabero/models/pi0_lora_tacfield_tabero_safetensors"
+    model_path: "${oc.env:ROOT}/models/pi0_lora_tacfield_tabero_safetensors"
     # OpenPI preprocessing must receive FP32 images. The model internally keeps
     # its selected backbone and RLT parameters in BF16.
     precision: null
@@ -53,7 +53,7 @@ actor:
     num_steps: 10
 
     openpi_data:
-      norm_stats_path: "/data/home/sim6g/code/tabero/models/pi0_lora_tacfield_tabero_safetensors/assets/NathanWu7/tabero/norm_stats.json"
+      norm_stats_path: "${oc.env:ROOT}/models/pi0_lora_tacfield_tabero_safetensors/assets/NathanWu7/tabero/norm_stats.json"
 
     openpi:
       config_name: "pi0_lora_tacfield_tabero"

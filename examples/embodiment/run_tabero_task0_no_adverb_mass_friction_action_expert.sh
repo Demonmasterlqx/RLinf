@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+export ROOT="${ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}"
+
 readonly CONFIG_NAME="${TABERO_PIRL_CONFIG_NAME:-isaaclab_pi0_peft_lora_tacfield_tabero_task0_no_adverb_mass_friction_2gpu_100step}"
-readonly MODEL_PATH="/data/home/sim6g/code/tabero/models/pi0_lora_tacfield_tabero_all_firm_safetensors"
-readonly PROFILE_DIR="${TABERO_PIRL_PROFILE_DIR:-/data/home/sim6g/code/tabero/Tabero/benchmarks/datasets/libero/config_profiles/firm_damage_fixed_friction_05_from_rlinf_sft_20k}"
-readonly HDF5_PATH="${TABERO_PIRL_HDF5_PATH:-/data/home/sim6g/code/tabero/Tabero/benchmarks/datasets/libero/assembled_hdf5/libero_object_task0_pick_up_the_alphabet_soup_and_place_it_in_the_basket_demo.hdf5}"
+readonly MODEL_PATH="${TABERO_MODEL_PATH:-${ROOT}/models/pi0_lora_tacfield_tabero_all_firm_safetensors}"
+readonly PROFILE_DIR="${TABERO_PIRL_PROFILE_DIR:-${ROOT}/Tabero_X/benchmarks/datasets/libero/config_profiles/firm_damage_fixed_friction_05_from_rlinf_sft_20k}"
+readonly HDF5_PATH="${TABERO_PIRL_HDF5_PATH:-${ROOT}/Tabero_X/benchmarks/datasets/libero/assembled_hdf5/libero_object_task0_pick_up_the_alphabet_soup_and_place_it_in_the_basket_demo.hdf5}"
 readonly PPO_BOUNDARY_SEMANTICS="terminal_observation_first_done_prefix_logprob_hdf5_reset_v1"
 
 usage() {
@@ -97,7 +99,7 @@ load_run_env() {
   [[ "${TABERO_RUN_MODE}" == "smoke" || "${TABERO_RUN_MODE}" == "formal" ]] || die "invalid run.env mode"
   [[ "${TABERO_OUTPUT_DIR}" == /* ]] || die "invalid run.env output directory"
   [[ "${TABERO_CONFIG_NAME}" == "${CONFIG_NAME}" ]] || die "invalid run.env config name"
-  [[ "${TABERO_VISIBLE_GPUS}" =~ ^[0-9]+,[0-9]+$ ]] || die "invalid run.env visible GPU mapping"
+  [[ "${TABERO_VISIBLE_GPUS}" =~ ^[0-9]+(,[0-9]+)*$ ]] || die "invalid run.env visible GPU mapping"
   [[ "${TABERO_START_TIME_UTC}" =~ ^[0-9T:Z+-]+$ ]] || die "invalid run.env UTC start time"
   [[ "${TABERO_START_TIME_LOCAL}" =~ ^[0-9T:+-]+$ ]] || die "invalid run.env local start time"
   [[ "${TABERO_PPO_TRANSITION_BOUNDARY_SEMANTICS}" == "${PPO_BOUNDARY_SEMANTICS}" ]] || die "invalid run.env PPO boundary semantics"
@@ -131,7 +133,7 @@ done
 
 LAUNCHER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${LAUNCHER_DIR}/../.." && pwd)"
-ISAAC_SETUP="${REPO_ROOT}/isaac_sim/setup_conda_env.sh"
+ISAAC_SETUP="${TABERO_ISAAC_SETUP:-${ROOT}/isaacsim/setup_conda_env.sh}"
 [[ -f "${ISAAC_SETUP}" ]] || die "Isaac environment setup not found: ${ISAAC_SETUP}"
 # NVIDIA's setup script probes optional variables without nounset guards.
 set +u
@@ -140,26 +142,39 @@ set -u
 PYTHON_BIN="${REPO_ROOT}/.venv/bin/python"
 TRAIN_SCRIPT="${LAUNCHER_DIR}/train_embodied_agent.py"
 CONFIG_DIR="${LAUNCHER_DIR}/config"
-RESULTS_ROOT="${TABERO_RESULTS_ROOT:-/data/home/sim6g/code/tabero/results}"
+RESULTS_ROOT="${TABERO_RESULTS_ROOT:-${ROOT}/results}"
 
 [[ -x "${PYTHON_BIN}" ]] || die "RLinf Python not found: ${PYTHON_BIN}"
 [[ -f "${TRAIN_SCRIPT}" ]] || die "training entrypoint not found: ${TRAIN_SCRIPT}"
 [[ -f "${MODEL_PATH}/model.safetensors" ]] || die "model not found: ${MODEL_PATH}"
 [[ -f "${MODEL_PATH}/config.json" ]] || die "model config not found: ${MODEL_PATH}"
-[[ -f "${MODEL_PATH}/export_meta.json" ]] || die "model metadata not found: ${MODEL_PATH}"
 [[ -f "${PROFILE_DIR}/libero_object.json" ]] || die "profile not found: ${PROFILE_DIR}"
 [[ -f "${HDF5_PATH}" ]] || die "HDF5 initial states not found: ${HDF5_PATH}"
 
-VISIBLE_GPUS="${CUDA_VISIBLE_DEVICES:-0,1}"
-IFS=',' read -r -a visible_gpu_ids <<<"${VISIBLE_GPUS}"
-[[ "${#visible_gpu_ids[@]}" -eq 2 ]] || die "exactly 2 visible GPUs are required"
-declare -A seen_gpus=()
-for gpu_id in "${visible_gpu_ids[@]}"; do
-  [[ "${gpu_id}" =~ ^[0-9]+$ ]] || die "CUDA_VISIBLE_DEVICES must contain physical numeric GPU IDs"
-  [[ -z "${seen_gpus[${gpu_id}]:-}" ]] || die "CUDA_VISIBLE_DEVICES must contain 2 unique physical GPU IDs"
-  seen_gpus["${gpu_id}"]=1
-done
-export CUDA_VISIBLE_DEVICES="${VISIBLE_GPUS}"
+[[ -z "${CUDA_VISIBLE_DEVICES:-}" ]] || die "Set GPUs in cluster.component_placement, not CUDA_VISIBLE_DEVICES"
+CONFIGURED_GPUS="$("${PYTHON_BIN}" - "${CONFIG_DIR}/${CONFIG_NAME}.yaml" <<'PY'
+import sys
+from omegaconf import OmegaConf
+cfg = OmegaConf.load(sys.argv[1])
+if cfg.cluster.num_nodes != 1:
+    raise ValueError("This launcher only supports a single node")
+ranks = set()
+for placement in cfg.cluster.component_placement.values():
+    # These launchers use explicit, flat single-node placements.
+    for segment in str(placement).split(","):
+        bounds = segment.split(":")[0].split("-")
+        if len(bounds) not in (1, 2) or not all(x.isdigit() for x in bounds):
+            raise ValueError("Use explicit flat GPU ranks in cluster.component_placement")
+        lo, hi = int(bounds[0]), int(bounds[-1])
+        if lo > hi:
+            raise ValueError("Invalid GPU rank range")
+        ranks.update(range(lo, hi + 1))
+if not ranks:
+    raise ValueError("Empty cluster.component_placement")
+print(",".join(map(str, sorted(ranks))))
+PY
+)" || die "Could not read GPU placement from training config"
+VISIBLE_GPUS="${CONFIGURED_GPUS}"
 
 START_TIME_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 START_TIME_LOCAL="$(date +%Y-%m-%dT%H:%M:%S%z)"
@@ -263,6 +278,12 @@ command=(
   "${PYTHON_BIN}" "${TRAIN_SCRIPT}"
   --config-path "${CONFIG_DIR}"
   --config-name "${CONFIG_NAME}"
+  "env.train.init_params.hdf5_initial_states_path=${HDF5_PATH}"
+  "env.eval.init_params.hdf5_initial_states_path=${HDF5_PATH}"
+  "env.train.init_params.libero_config_dir=${PROFILE_DIR}"
+  "env.eval.init_params.libero_config_dir=${PROFILE_DIR}"
+  "actor.model.model_path=${MODEL_PATH}"
+  "rollout.model.model_path=${MODEL_PATH}"
   "runner.logger.log_path=${OUTPUT_DIR}"
   "runner.logger.experiment_name=$(basename "${OUTPUT_DIR}")"
 )
@@ -279,7 +300,7 @@ fi
 
 printf 'Output directory: %s\n' "${OUTPUT_DIR}"
 printf 'Log file: %s\n' "${LOG_FILE}"
-printf 'CUDA_VISIBLE_DEVICES: %s\n' "${CUDA_VISIBLE_DEVICES}"
+printf 'Configured GPUs: %s\n' "${CONFIGURED_GPUS}"
 printf 'Command:'
 printf ' %q' "${command[@]}"
 printf '\n'

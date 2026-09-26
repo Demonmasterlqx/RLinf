@@ -28,7 +28,7 @@ cluster:
 runner:
   task_type: embodied
   logger:
-    log_path: /data/home/sim6g/code/tabero/results/tabero_action_expert_stable_success_2task_smoke
+    log_path: ${oc.env:ROOT}/results/tabero_action_expert_stable_success_2task_smoke
     project_name: rlinf
     experiment_name: tabero_action_expert_stable_success_2task_smoke
     logger_backends: ["tensorboard"]
@@ -103,9 +103,9 @@ env:
       num_envs: null
       max_episode_steps: ${..max_episode_steps}
       task_description: "pick up the alphabet soup and place it in the basket"
-      extension_path: "/data/home/sim6g/code/tabero/Tabero/source/tac_manip"
-      libero_config_dir: "/data/home/sim6g/code/tabero/Tabero/benchmarks/datasets/libero/config"
-      libero_assets_dir: "/data/home/sim6g/code/tabero/Tabero/benchmarks/datasets/libero/USD"
+      extension_path: "${oc.env:ROOT}/Tabero_X/source/tac_manip"
+      libero_config_dir: "${oc.env:ROOT}/Tabero_X/benchmarks/datasets/libero/config"
+      libero_assets_dir: "${oc.env:ROOT}/Tabero_X/benchmarks/datasets/libero/USD"
       task_suite: "libero_object"
       task_id: 0
       require_all_tasks_active: True
@@ -160,9 +160,9 @@ env:
       num_envs: null
       max_episode_steps: ${..max_episode_steps}
       task_description: "pick up the alphabet soup and place it in the basket"
-      extension_path: "/data/home/sim6g/code/tabero/Tabero/source/tac_manip"
-      libero_config_dir: "/data/home/sim6g/code/tabero/Tabero/benchmarks/datasets/libero/config"
-      libero_assets_dir: "/data/home/sim6g/code/tabero/Tabero/benchmarks/datasets/libero/USD"
+      extension_path: "${oc.env:ROOT}/Tabero_X/source/tac_manip"
+      libero_config_dir: "${oc.env:ROOT}/Tabero_X/benchmarks/datasets/libero/config"
+      libero_assets_dir: "${oc.env:ROOT}/Tabero_X/benchmarks/datasets/libero/USD"
       task_suite: "libero_object"
       task_id: 0
       require_all_tasks_active: True
@@ -200,7 +200,7 @@ rollout:
   enable_offload: True
   pipeline_stage_num: 1
   model:
-    model_path: "/data/home/sim6g/code/tabero/models/pi0_lora_tacfield_tabero_safetensors"
+    model_path: "${oc.env:ROOT}/models/pi0_lora_tacfield_tabero_safetensors"
     precision: ${actor.model.precision}
 
 actor:
@@ -212,7 +212,7 @@ actor:
   enable_offload: True
   combine_reference_model: True
   model:
-    model_path: "/data/home/sim6g/code/tabero/models/pi0_lora_tacfield_tabero_safetensors"
+    model_path: "${oc.env:ROOT}/models/pi0_lora_tacfield_tabero_safetensors"
     model_type: "openpi"
     precision: null
     num_action_chunks: 5

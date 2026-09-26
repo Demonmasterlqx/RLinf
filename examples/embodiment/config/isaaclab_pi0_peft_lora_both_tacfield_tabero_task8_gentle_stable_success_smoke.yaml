@@ -29,7 +29,7 @@ cluster:
 runner:
   task_type: embodied
   logger:
-    log_path: /data/home/sim6g/code/tabero/results/tabero_task8_gentle_full_lora_4env_smoke
+    log_path: ${oc.env:ROOT}/results/tabero_task8_gentle_full_lora_4env_smoke
     project_name: tabero-rlinf
     experiment_name: tabero_task8_gentle_full_lora_4env_smoke
     logger_backends: ["tensorboard", "wandb"]
@@ -104,10 +104,10 @@ env:
       num_envs: null
       max_episode_steps: ${..max_episode_steps}
       task_description: "pick up the chocolate pudding and place it in the basket"
-      extension_path: "/data/home/sim6g/code/tabero/Tabero/source/tac_manip"
-      libero_config_dir: "/data/home/sim6g/code/tabero/Tabero/benchmarks/datasets/libero/config"
-      libero_assets_dir: "/data/home/sim6g/code/tabero/Tabero/benchmarks/datasets/libero/USD"
-      hdf5_initial_states_path: "/data/home/sim6g/code/tabero/Tabero/benchmarks/datasets/libero/assembled_hdf5/libero_object_task8_pick_up_the_chocolate_pudding_and_place_it_in_the_basket_demo.hdf5"
+      extension_path: "${oc.env:ROOT}/Tabero_X/source/tac_manip"
+      libero_config_dir: "${oc.env:ROOT}/Tabero_X/benchmarks/datasets/libero/config"
+      libero_assets_dir: "${oc.env:ROOT}/Tabero_X/benchmarks/datasets/libero/USD"
+      hdf5_initial_states_path: "${oc.env:ROOT}/Tabero_X/benchmarks/datasets/libero/assembled_hdf5/libero_object_task8_pick_up_the_chocolate_pudding_and_place_it_in_the_basket_demo.hdf5"
       hdf5_reset_assignment: cyclic
       task_suite: "libero_object"
       task_id: 8
@@ -163,9 +163,9 @@ env:
       num_envs: null
       max_episode_steps: ${..max_episode_steps}
       task_description: "pick up the chocolate pudding and place it in the basket"
-      extension_path: "/data/home/sim6g/code/tabero/Tabero/source/tac_manip"
-      libero_config_dir: "/data/home/sim6g/code/tabero/Tabero/benchmarks/datasets/libero/config"
-      libero_assets_dir: "/data/home/sim6g/code/tabero/Tabero/benchmarks/datasets/libero/USD"
+      extension_path: "${oc.env:ROOT}/Tabero_X/source/tac_manip"
+      libero_config_dir: "${oc.env:ROOT}/Tabero_X/benchmarks/datasets/libero/config"
+      libero_assets_dir: "${oc.env:ROOT}/Tabero_X/benchmarks/datasets/libero/USD"
       task_suite: "libero_object"
       task_id: 8
       require_all_tasks_active: True
@@ -198,7 +198,7 @@ rollout:
   enable_offload: True
   pipeline_stage_num: 1
   model:
-    model_path: "/data/home/sim6g/code/tabero/models/pi0_lora_tacfield_tabero_safetensors"
+    model_path: "${oc.env:ROOT}/models/pi0_lora_tacfield_tabero_safetensors"
     precision: ${actor.model.precision}
 
 actor:
@@ -210,7 +210,7 @@ actor:
   enable_offload: True
   combine_reference_model: True
   model:
-    model_path: "/data/home/sim6g/code/tabero/models/pi0_lora_tacfield_tabero_safetensors"
+    model_path: "${oc.env:ROOT}/models/pi0_lora_tacfield_tabero_safetensors"
     model_type: "openpi"
     precision: null
     num_action_chunks: 10

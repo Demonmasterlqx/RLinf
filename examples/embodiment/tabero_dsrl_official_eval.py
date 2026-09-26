@@ -391,6 +391,38 @@ def _validate_source_artifacts(
             raise ValueError("legacy source config hash mismatch")
 
     provenance = _read_env(source_paths["source_provenance"], "source provenance")
+    if provenance.get("TABERO_PROVENANCE_VERSION") == "2":
+        # Training provenance v2 records paths and Git state, not integrity hashes.
+        required = {
+            "TABERO_PROVENANCE_VERSION",
+            "TABERO_PROVENANCE_MODE",
+            "TABERO_CONFIG_PATH",
+            "TABERO_GIT_COMMIT",
+            "TABERO_GIT_DIRTY",
+            "TABERO_BASE_MODEL_PATH",
+            "TABERO_SOURCE_CONFIG_PATH",
+        }
+        if set(provenance) != required:
+            raise ValueError("source provenance keyspace mismatch")
+        if provenance["TABERO_GIT_COMMIT"] != manifest["source_git_commit"]:
+            raise ValueError("source Git commit does not match provenance")
+        if provenance["TABERO_GIT_DIRTY"] not in {"true", "false"}:
+            raise ValueError("source provenance Git dirty state must be boolean")
+        if Path(provenance["TABERO_BASE_MODEL_PATH"]).resolve() != base_model_path:
+            raise ValueError("source provenance base model path mismatch")
+        mode = provenance["TABERO_PROVENANCE_MODE"]
+        source = provenance["TABERO_SOURCE_CONFIG_PATH"]
+        if mode == "fresh":
+            if legacy_path is not None or source != "none":
+                raise ValueError(
+                    "fresh source provenance must not reference legacy config"
+                )
+        elif mode == "legacy_migration":
+            if legacy_path is None or Path(source).resolve() != legacy_path:
+                raise ValueError("legacy source provenance config path mismatch")
+        else:
+            raise ValueError(f"source provenance mode is invalid: {mode}")
+        return
     if set(provenance) != PROVENANCE_KEYS:
         raise ValueError("source provenance keyspace mismatch")
     _require_exact(

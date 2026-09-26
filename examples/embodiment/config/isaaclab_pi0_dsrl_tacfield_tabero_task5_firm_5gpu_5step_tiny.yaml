@@ -28,7 +28,7 @@ cluster:
 runner:
   task_type: embodied
   logger:
-    log_path: "/data/home/sim6g/code/tabero/results/tabero_task5_firm_dsrl_5gpu_5step_tiny_${oc.env:TABERO_MATRIX_RUN_ID}"
+    log_path: "${oc.env:ROOT}/results/tabero_task5_firm_dsrl_5gpu_5step_tiny_${oc.env:TABERO_MATRIX_RUN_ID}"
     project_name: tabero-rlinf
     experiment_name: "tabero_task5_firm_dsrl_5gpu_5step_tiny_${oc.env:TABERO_MATRIX_RUN_ID}"
     logger_backends:
@@ -116,10 +116,10 @@ env:
       num_envs: null
       max_episode_steps: 360
       task_description: pick up the tomato sauce and place it in the basket
-      extension_path: /data/home/sim6g/code/tabero/Tabero/source/tac_manip
-      libero_config_dir: /data/home/sim6g/code/tabero/Tabero/benchmarks/datasets/libero/config
-      libero_assets_dir: /data/home/sim6g/code/tabero/Tabero/benchmarks/datasets/libero/USD
-      hdf5_initial_states_path: /data/home/sim6g/code/tabero/Tabero/benchmarks/datasets/libero/assembled_hdf5/libero_object_task5_pick_up_the_tomato_sauce_and_place_it_in_the_basket_demo.hdf5
+      extension_path: ${oc.env:ROOT}/Tabero_X/source/tac_manip
+      libero_config_dir: ${oc.env:ROOT}/Tabero_X/benchmarks/datasets/libero/config
+      libero_assets_dir: ${oc.env:ROOT}/Tabero_X/benchmarks/datasets/libero/USD
+      hdf5_initial_states_path: ${oc.env:ROOT}/Tabero_X/benchmarks/datasets/libero/assembled_hdf5/libero_object_task5_pick_up_the_tomato_sauce_and_place_it_in_the_basket_demo.hdf5
       hdf5_reset_assignment: cyclic
       chunk_boundary_mode: terminal_safe_hdf5_v1
       task_suite: libero_object
@@ -181,10 +181,10 @@ env:
       num_envs: null
       max_episode_steps: 360
       task_description: pick up the tomato sauce and place it in the basket
-      extension_path: /data/home/sim6g/code/tabero/Tabero/source/tac_manip
-      libero_config_dir: /data/home/sim6g/code/tabero/Tabero/benchmarks/datasets/libero/config
-      libero_assets_dir: /data/home/sim6g/code/tabero/Tabero/benchmarks/datasets/libero/USD
-      hdf5_initial_states_path: /data/home/sim6g/code/tabero/Tabero/benchmarks/datasets/libero/assembled_hdf5/libero_object_task5_pick_up_the_tomato_sauce_and_place_it_in_the_basket_demo.hdf5
+      extension_path: ${oc.env:ROOT}/Tabero_X/source/tac_manip
+      libero_config_dir: ${oc.env:ROOT}/Tabero_X/benchmarks/datasets/libero/config
+      libero_assets_dir: ${oc.env:ROOT}/Tabero_X/benchmarks/datasets/libero/USD
+      hdf5_initial_states_path: ${oc.env:ROOT}/Tabero_X/benchmarks/datasets/libero/assembled_hdf5/libero_object_task5_pick_up_the_tomato_sauce_and_place_it_in_the_basket_demo.hdf5
       hdf5_reset_assignment: cyclic
       chunk_boundary_mode: terminal_safe_hdf5_v1
       task_suite: libero_object
@@ -231,7 +231,7 @@ rollout:
   collect_transitions: true
   collect_prev_infos: false
   model:
-    model_path: /data/home/sim6g/code/tabero/models/pi0_lora_tacfield_tabero_safetensors
+    model_path: ${oc.env:ROOT}/models/pi0_lora_tacfield_tabero_safetensors
     precision: null
 actor:
   group_name: ActorGroup
@@ -247,7 +247,7 @@ actor:
   - actor_state_encoder.
   - actor_tactile_encoder.
   model:
-    model_path: /data/home/sim6g/code/tabero/models/pi0_lora_tacfield_tabero_safetensors
+    model_path: ${oc.env:ROOT}/models/pi0_lora_tacfield_tabero_safetensors
     model_type: openpi
     precision: null
     num_action_chunks: 10

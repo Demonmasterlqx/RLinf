@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+export ROOT="${ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}"
+
 readonly CONFIG_NAME="isaaclab_pi0_dsrl_tacfield_tabero_task0_firm_8gpu_smoke"
-readonly MODEL_PATH="/data/home/sim6g/code/tabero/models/pi0_lora_tacfield_tabero_safetensors"
-readonly HDF5_PATH="/data/home/sim6g/code/tabero/Tabero/benchmarks/datasets/libero/assembled_hdf5/libero_object_task0_pick_up_the_alphabet_soup_and_place_it_in_the_basket_demo.hdf5"
+readonly MODEL_PATH="${TABERO_MODEL_PATH:-${ROOT}/models/pi0_lora_tacfield_tabero_safetensors}"
+readonly HDF5_PATH="${ROOT}/Tabero_X/benchmarks/datasets/libero/assembled_hdf5/libero_object_task0_pick_up_the_alphabet_soup_and_place_it_in_the_basket_demo.hdf5"
 
 usage() {
   echo "Usage: $0 [--resume-dir PATH] [--dry-run]" >&2
@@ -149,7 +151,7 @@ done
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly LAUNCHER_DIR="${SCRIPT_DIR}"
 REPO_ROOT="$(cd "${LAUNCHER_DIR}/../.." && pwd)"
-ISAAC_SETUP="${REPO_ROOT}/isaac_sim/setup_conda_env.sh"
+ISAAC_SETUP="${TABERO_ISAAC_SETUP:-${ROOT}/isaacsim/setup_conda_env.sh}"
 [[ -f "${ISAAC_SETUP}" ]] || die "Isaac environment setup not found: ${ISAAC_SETUP}"
 set +u
 source "${ISAAC_SETUP}"
@@ -159,7 +161,7 @@ PYTHON_BIN="${REPO_ROOT}/.venv/bin/python"
 TRAIN_SCRIPT="${SCRIPT_DIR}/train_embodied_agent.py"
 CONFIG_DIR="${SCRIPT_DIR}/config"
 CONFIG_PATH="${CONFIG_DIR}/${CONFIG_NAME}.yaml"
-RESULTS_ROOT="${TABERO_RESULTS_ROOT:-/data/home/sim6g/code/tabero/results}"
+RESULTS_ROOT="${TABERO_RESULTS_ROOT:-${ROOT}/results}"
 
 [[ -x "${PYTHON_BIN}" ]] || die "RLinf Python not found: ${PYTHON_BIN}"
 [[ -f "${TRAIN_SCRIPT}" ]] || die "training entrypoint not found: ${TRAIN_SCRIPT}"
@@ -177,20 +179,7 @@ while IFS= read -r gpu_id; do
 done < <(nvidia-smi --query-gpu=index --format=csv,noheader)
 [[ "${#installed_gpus[@]}" -gt 0 ]] || die "nvidia-smi reported no installed GPUs"
 
-if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
-  IFS=',' read -r -a visible_gpus <<<"${CUDA_VISIBLE_DEVICES}"
-  GPU_COUNT="${#visible_gpus[@]}"
-  declare -A seen_gpus=()
-  for gpu_id in "${visible_gpus[@]}"; do
-    [[ "${gpu_id}" =~ ^[0-9]+$ ]] || die "CUDA_VISIBLE_DEVICES must contain physical numeric GPU IDs"
-    [[ -z "${seen_gpus[${gpu_id}]:-}" ]] || die "CUDA_VISIBLE_DEVICES must contain 8 unique physical GPU IDs"
-    [[ -n "${installed_gpus[${gpu_id}]:-}" ]] || die "CUDA_VISIBLE_DEVICES GPU ${gpu_id} is not installed"
-    seen_gpus["${gpu_id}"]=1
-  done
-else
-  GPU_COUNT="${#installed_gpus[@]}"
-fi
-[[ "${GPU_COUNT}" -eq 8 ]] || die "exactly 8 visible GPUs are required; found ${GPU_COUNT}"
+[[ -z "${CUDA_VISIBLE_DEVICES:-}" ]] || die "Set GPUs in cluster.component_placement, not CUDA_VISIBLE_DEVICES"
 
 mapfile -t existing_compute_processes < <(
   nvidia-smi \
@@ -277,6 +266,10 @@ command=(
   "${PYTHON_BIN}" "${TRAIN_SCRIPT}"
   --config-path "${CONFIG_DIR}"
   --config-name "${CONFIG_NAME}"
+  "env.train.init_params.hdf5_initial_states_path=${HDF5_PATH}"
+  "env.eval.init_params.hdf5_initial_states_path=${HDF5_PATH}"
+  "actor.model.model_path=${MODEL_PATH}"
+  "rollout.model.model_path=${MODEL_PATH}"
   "runner.logger.log_path=${OUTPUT_DIR}"
   "runner.logger.experiment_name=$(basename "${OUTPUT_DIR}")"
 )

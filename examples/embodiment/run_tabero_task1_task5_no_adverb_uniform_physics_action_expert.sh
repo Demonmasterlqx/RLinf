@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+export ROOT="${ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}"
+
 usage() {
   echo "Usage: $0 <1|5> <smoke|formal> [--resume-dir PATH] [--dry-run]" >&2
 }
@@ -12,15 +14,15 @@ TASK_ID="${1:-}"
 }
 shift
 
-readonly PROFILE_DIR="/data/home/sim6g/code/tabero/Tabero/benchmarks/datasets/libero/config_profiles/alltask_damage_uniform_mass_05_16_friction_04_08_from_rlinf_sft_20k"
+readonly PROFILE_DIR="${ROOT}/Tabero_X/benchmarks/datasets/libero/config_profiles/alltask_damage_uniform_mass_05_16_friction_04_08_from_rlinf_sft_20k"
 case "${TASK_ID}" in
   1)
     readonly CONFIG_NAME="isaaclab_pi0_peft_lora_tacfield_tabero_task1_no_adverb_uniform_physics_2gpu_100step"
-    readonly HDF5_PATH="/data/home/sim6g/code/tabero/Tabero/benchmarks/datasets/libero/assembled_hdf5/libero_object_task1_pick_up_the_cream_cheese_and_place_it_in_the_basket_demo.hdf5"
+    readonly HDF5_PATH="${ROOT}/Tabero_X/benchmarks/datasets/libero/assembled_hdf5/libero_object_task1_pick_up_the_cream_cheese_and_place_it_in_the_basket_demo.hdf5"
     ;;
   5)
     readonly CONFIG_NAME="isaaclab_pi0_peft_lora_tacfield_tabero_task5_no_adverb_uniform_physics_2gpu_100step"
-    readonly HDF5_PATH="/data/home/sim6g/code/tabero/Tabero/benchmarks/datasets/libero/assembled_hdf5/libero_object_task5_pick_up_the_tomato_sauce_and_place_it_in_the_basket_demo.hdf5"
+    readonly HDF5_PATH="${ROOT}/Tabero_X/benchmarks/datasets/libero/assembled_hdf5/libero_object_task5_pick_up_the_tomato_sauce_and_place_it_in_the_basket_demo.hdf5"
     ;;
 esac
 

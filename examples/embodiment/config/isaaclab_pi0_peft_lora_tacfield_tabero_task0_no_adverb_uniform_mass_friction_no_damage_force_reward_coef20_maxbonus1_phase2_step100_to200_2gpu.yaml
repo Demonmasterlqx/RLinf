@@ -29,7 +29,7 @@ cluster:
 runner:
   task_type: embodied
   logger:
-    log_path: "/data/home/sim6g/code/tabero/results/tabero_task0_no_adverb_uniform_mass_friction_no_damage_force_reward_coef20_maxbonus1_action_expert_lora_phase2_step100_to200_2gpu_${oc.env:TABERO_TASK0_PHASE2_RUN_ID}"
+    log_path: "${oc.env:ROOT}/results/tabero_task0_no_adverb_uniform_mass_friction_no_damage_force_reward_coef20_maxbonus1_action_expert_lora_phase2_step100_to200_2gpu_${oc.env:TABERO_TASK0_PHASE2_RUN_ID}"
     project_name: tabero-rlinf
     experiment_name: "tabero_task0_no_adverb_uniform_mass_friction_no_damage_force_reward_coef20_maxbonus1_action_expert_lora_phase2_step100_to200_2gpu_${oc.env:TABERO_TASK0_PHASE2_RUN_ID}"
     logger_backends: ["tensorboard", "wandb"]
@@ -64,8 +64,6 @@ algorithm:
   gamma: 0.99
   gae_lambda: 0.95
   filter_rewards: False
-  rewards_lower_bound: 0.1
-  rewards_upper_bound: 0.9
 
 env:
   group_name: "EnvGroup"
@@ -92,10 +90,10 @@ env:
       num_envs: null
       max_episode_steps: ${..max_episode_steps}
       task_description: "pick up the alphabet soup and place it in the basket"
-      extension_path: "/data/home/sim6g/code/tabero/Tabero/source/tac_manip"
-      libero_config_dir: "/data/home/sim6g/code/tabero/Tabero/benchmarks/datasets/libero/config_profiles/alltask_fixed_damage_1000000_uniform_mass_05_16_friction_04_08_from_rlinf_sft_20k"
-      libero_assets_dir: "/data/home/sim6g/code/tabero/Tabero/benchmarks/datasets/libero/USD"
-      hdf5_initial_states_path: "/data/home/sim6g/code/tabero/Tabero/benchmarks/datasets/libero/assembled_hdf5/libero_object_task0_pick_up_the_alphabet_soup_and_place_it_in_the_basket_demo.hdf5"
+      extension_path: "${oc.env:ROOT}/Tabero_X/source/tac_manip"
+      libero_config_dir: "${oc.env:ROOT}/Tabero_X/benchmarks/datasets/libero/config_profiles/alltask_fixed_damage_1000000_uniform_mass_05_16_friction_04_08_from_rlinf_sft_20k"
+      libero_assets_dir: "${oc.env:ROOT}/Tabero_X/benchmarks/datasets/libero/USD"
+      hdf5_initial_states_path: "${oc.env:ROOT}/Tabero_X/benchmarks/datasets/libero/assembled_hdf5/libero_object_task0_pick_up_the_alphabet_soup_and_place_it_in_the_basket_demo.hdf5"
       hdf5_reset_assignment: cyclic
       chunk_boundary_mode: terminal_safe_hdf5_v1
       task_suite: "libero_object"
@@ -154,10 +152,10 @@ env:
       num_envs: null
       max_episode_steps: ${..max_episode_steps}
       task_description: "pick up the alphabet soup and place it in the basket"
-      extension_path: "/data/home/sim6g/code/tabero/Tabero/source/tac_manip"
-      libero_config_dir: "/data/home/sim6g/code/tabero/Tabero/benchmarks/datasets/libero/config_profiles/alltask_fixed_damage_1000000_uniform_mass_05_16_friction_04_08_from_rlinf_sft_20k"
-      libero_assets_dir: "/data/home/sim6g/code/tabero/Tabero/benchmarks/datasets/libero/USD"
-      hdf5_initial_states_path: "/data/home/sim6g/code/tabero/Tabero/benchmarks/datasets/libero/assembled_hdf5/libero_object_task0_pick_up_the_alphabet_soup_and_place_it_in_the_basket_demo.hdf5"
+      extension_path: "${oc.env:ROOT}/Tabero_X/source/tac_manip"
+      libero_config_dir: "${oc.env:ROOT}/Tabero_X/benchmarks/datasets/libero/config_profiles/alltask_fixed_damage_1000000_uniform_mass_05_16_friction_04_08_from_rlinf_sft_20k"
+      libero_assets_dir: "${oc.env:ROOT}/Tabero_X/benchmarks/datasets/libero/USD"
+      hdf5_initial_states_path: "${oc.env:ROOT}/Tabero_X/benchmarks/datasets/libero/assembled_hdf5/libero_object_task0_pick_up_the_alphabet_soup_and_place_it_in_the_basket_demo.hdf5"
       hdf5_reset_assignment: cyclic
       chunk_boundary_mode: terminal_safe_hdf5_v1
       task_suite: "libero_object"
@@ -199,7 +197,7 @@ rollout:
   enable_offload: True
   pipeline_stage_num: 1
   model:
-    model_path: "/data/home/sim6g/code/tabero/models/pi0_lora_tacfield_tabero_all_firm_safetensors"
+    model_path: "${oc.env:ROOT}/models/pi0_lora_tacfield_tabero_all_firm_safetensors"
     precision: ${actor.model.precision}
 
 actor:
@@ -211,7 +209,7 @@ actor:
   enable_offload: False
   combine_reference_model: True
   model:
-    model_path: "/data/home/sim6g/code/tabero/models/pi0_lora_tacfield_tabero_all_firm_safetensors"
+    model_path: "${oc.env:ROOT}/models/pi0_lora_tacfield_tabero_all_firm_safetensors"
     model_type: "openpi"
     precision: null
     num_action_chunks: 10
@@ -290,8 +288,6 @@ actor:
       phase: uniform_mass_friction_continuation
       source_global_step: 100
       source_training_config: isaaclab_pi0_peft_lora_tacfield_tabero_task0_no_adverb_fixed_mean_no_random_force_reward_coef20_maxbonus1_2gpu_100step
-      source_checkpoint_sidecar_sha256: 65f97ebe7cbc62c71038e5da6e7b1f724530e8ea5c8cd281519773352c376d2b
-      physics_profile_sha256: 6e1a446027fde35f591a3c6584be61a3073fc0cc7485225bb1e378c3c473c342
       tabero_ppo_transition_boundary_semantics: terminal_observation_first_done_prefix_logprob_hdf5_reset_v1
 
 reward:

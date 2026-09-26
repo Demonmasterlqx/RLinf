@@ -46,7 +46,7 @@ cluster:
 runner:
   task_type: embodied
   logger:
-    log_path: "/data/home/sim6g/code/tabero/results/tabero_rlt_stage2_task0_firm_${oc.env:TABERO_MATRIX_RUN_ID}"
+    log_path: "${oc.env:ROOT}/results/tabero_rlt_stage2_task0_firm_${oc.env:TABERO_MATRIX_RUN_ID}"
     project_name: "tabero-rlinf"
     experiment_name: "tabero_rlt_stage2_task0_firm_${oc.env:TABERO_MATRIX_RUN_ID}"
     logger_backends: ["tensorboard", "wandb"]
@@ -141,10 +141,10 @@ env:
       num_envs: null
       max_episode_steps: ${..max_episode_steps}
       task_description: "pick up the alphabet soup and place it in the basket"
-      extension_path: "/data/home/sim6g/code/tabero/Tabero/source/tac_manip"
-      libero_config_dir: "/data/home/sim6g/code/tabero/Tabero/benchmarks/datasets/libero/config"
-      libero_assets_dir: "/data/home/sim6g/code/tabero/Tabero/benchmarks/datasets/libero/USD"
-      hdf5_initial_states_path: "/data/home/sim6g/code/tabero/Tabero/benchmarks/datasets/libero/assembled_hdf5/libero_object_task0_pick_up_the_alphabet_soup_and_place_it_in_the_basket_demo.hdf5"
+      extension_path: "${oc.env:ROOT}/Tabero_X/source/tac_manip"
+      libero_config_dir: "${oc.env:ROOT}/Tabero_X/benchmarks/datasets/libero/config"
+      libero_assets_dir: "${oc.env:ROOT}/Tabero_X/benchmarks/datasets/libero/USD"
+      hdf5_initial_states_path: "${oc.env:ROOT}/Tabero_X/benchmarks/datasets/libero/assembled_hdf5/libero_object_task0_pick_up_the_alphabet_soup_and_place_it_in_the_basket_demo.hdf5"
       hdf5_reset_assignment: "cyclic"
       task_suite: "libero_object"
       task_id: 0
@@ -200,10 +200,10 @@ env:
       num_envs: null
       max_episode_steps: ${..max_episode_steps}
       task_description: "pick up the alphabet soup and place it in the basket"
-      extension_path: "/data/home/sim6g/code/tabero/Tabero/source/tac_manip"
-      libero_config_dir: "/data/home/sim6g/code/tabero/Tabero/benchmarks/datasets/libero/config"
-      libero_assets_dir: "/data/home/sim6g/code/tabero/Tabero/benchmarks/datasets/libero/USD"
-      hdf5_initial_states_path: "/data/home/sim6g/code/tabero/Tabero/benchmarks/datasets/libero/assembled_hdf5/libero_object_task0_pick_up_the_alphabet_soup_and_place_it_in_the_basket_demo.hdf5"
+      extension_path: "${oc.env:ROOT}/Tabero_X/source/tac_manip"
+      libero_config_dir: "${oc.env:ROOT}/Tabero_X/benchmarks/datasets/libero/config"
+      libero_assets_dir: "${oc.env:ROOT}/Tabero_X/benchmarks/datasets/libero/USD"
+      hdf5_initial_states_path: "${oc.env:ROOT}/Tabero_X/benchmarks/datasets/libero/assembled_hdf5/libero_object_task0_pick_up_the_alphabet_soup_and_place_it_in_the_basket_demo.hdf5"
       hdf5_reset_assignment: "cyclic"
       task_suite: "libero_object"
       task_id: 0
@@ -261,7 +261,7 @@ rollout:
     lora_rank: 32
   rlt_feature_model:
     model_type: "openpi"
-    model_path: "/data/home/sim6g/code/tabero/results/tabero_rlt_stage1_20260721_tactile_fixed/tabero_rlt_stage1_tacfield_tactile_fixed/checkpoints/global_step_2000/actor"
+    model_path: "${oc.env:ROOT}/results/tabero_rlt_stage1_20260721_tactile_fixed/tabero_rlt_stage1_tacfield_tactile_fixed/checkpoints/global_step_2000/actor"
     precision: null
     num_action_chunks: 10
     action_dim: 13
@@ -269,7 +269,7 @@ rollout:
     is_lora: false
     lora_rank: 32
     openpi_data:
-      norm_stats_path: "/data/home/sim6g/code/tabero/models/pi0_lora_tacfield_tabero_safetensors/assets/NathanWu7/tabero/norm_stats.json"
+      norm_stats_path: "${oc.env:ROOT}/models/pi0_lora_tacfield_tabero_safetensors/assets/NathanWu7/tabero/norm_stats.json"
     openpi:
       config_name: "pi0_lora_tacfield_tabero"
       num_images_in_input: 2
