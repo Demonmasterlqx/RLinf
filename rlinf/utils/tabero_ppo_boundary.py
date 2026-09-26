@@ -14,9 +14,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
-import math
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -27,20 +24,10 @@ TABERO_PPO_TRANSITION_BOUNDARY_SEMANTICS = (
     "terminal_observation_first_done_prefix_logprob_hdf5_reset_v1"
 )
 TABERO_PPO_CHUNK_BOUNDARY_MODE = "terminal_safe_hdf5_v1"
-TABERO_PPO_DEFAULT_RESET_TRANSITION_BOUNDARY_SEMANTICS = (
-    "terminal_observation_first_done_prefix_logprob_default_reset_gripper_map_v2"
-)
+TABERO_PPO_DEFAULT_RESET_TRANSITION_BOUNDARY_SEMANTICS = "realworld_terminal_prefix"
 TABERO_PPO_DEFAULT_RESET_CHUNK_BOUNDARY_MODE = "terminal_safe_v1"
-TABERO_XARM_GRIPPER_MAPPING_VERSION = "xarm_unit_inverse_v1"
-TABERO_XARM_POLICY_GRIPPER_COORDINATE = "unit_0_closed_1_open"
-TABERO_XARM_SIM_GRIPPER_COORDINATE = "meters_0_open_0045_close"
 TABERO_XARM_GRIPPER_TRAVEL_M = 0.045
-TABERO_XARM_GRIPPER_MAPPING_CONTRACT = {
-    "version": TABERO_XARM_GRIPPER_MAPPING_VERSION,
-    "policy_coordinate": TABERO_XARM_POLICY_GRIPPER_COORDINATE,
-    "sim_coordinate": TABERO_XARM_SIM_GRIPPER_COORDINATE,
-    "travel_m": TABERO_XARM_GRIPPER_TRAVEL_M,
-}
+TABERO_REALWORLD_CHECKPOINT_FORMAT = "realworld_pirl_v1"
 TABERO_PPO_BOUNDARY_CONTRACTS = {
     TABERO_PPO_TRANSITION_BOUNDARY_SEMANTICS: {
         "chunk_boundary_mode": TABERO_PPO_CHUNK_BOUNDARY_MODE,
@@ -52,356 +39,7 @@ TABERO_PPO_BOUNDARY_CONTRACTS = {
     },
 }
 TABERO_PPO_CHECKPOINT_METADATA_KEY = "tabero_ppo_transition_boundary_semantics"
-TABERO_PI05_TACFIELD_CONFIG_NAME = "pi05_lora_tacfield_tabero_xarm_gripper"
-TABERO_PI05_TACFIELD_CONFIG_NAMES = (
-    TABERO_PI05_TACFIELD_CONFIG_NAME,
-    "pi05_lora_tacfield_realworld_replayed_task820",
-    "pi05_lora_tacfield_realworld_replayed_task820_firm_mixed_no_state",
-)
 TABERO_PI05_TACIMG_CONFIG_NAME = "pi05_lora_tacimg_realworld_replayed_task820_force"
-
-
-def _load_json_mapping(path: Path, *, label: str) -> dict[str, Any]:
-    if not path.is_file():
-        raise ValueError(f"Tabero PiRL {label} file does not exist: {path}.")
-    try:
-        payload = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError) as error:
-        raise ValueError(
-            f"Tabero PiRL could not read {label} {path}: {error}"
-        ) from error
-    if not isinstance(payload, dict):
-        raise ValueError(
-            f"Tabero PiRL {label} must contain a JSON object; "
-            f"got {type(payload).__name__}."
-        )
-    return payload
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    try:
-        with path.open("rb") as file:
-            for block in iter(lambda: file.read(8 * 1024 * 1024), b""):
-                digest.update(block)
-    except OSError as error:
-        raise ValueError(f"Tabero PiRL could not hash {path}: {error}") from error
-    return digest.hexdigest()
-
-
-def _validate_expected_sha256(value: Any, *, field: str) -> str:
-    if (
-        not isinstance(value, str)
-        or len(value) != 64
-        or any(character not in "0123456789abcdef" for character in value)
-    ):
-        raise ValueError(
-            f"Tabero PiRL {field} must be a lowercase 64-character SHA-256."
-        )
-    return value
-
-
-def _validate_expected_string(value: Any, *, field: str) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"Tabero PiRL {field} must be a non-empty string.")
-    return value.strip()
-
-
-def _require_exact_values(
-    payload: Mapping[str, Any],
-    expected: Mapping[str, Any],
-    *,
-    label: str,
-) -> None:
-    mismatches = {
-        key: {"expected": expected_value, "actual": payload.get(key)}
-        for key, expected_value in expected.items()
-        if payload.get(key) != expected_value
-    }
-    if mismatches:
-        raise ValueError(f"Tabero PiRL {label} mismatch: {mismatches}.")
-
-
-def _validate_norm_stats_vector(
-    stats: Mapping[str, Any],
-    *,
-    name: str,
-    expected_dim: int,
-) -> None:
-    for statistic in ("mean", "std", "q01", "q99"):
-        values = stats.get(statistic)
-        if not isinstance(values, list) or len(values) != expected_dim:
-            actual_dim = len(values) if isinstance(values, list) else None
-            raise ValueError(
-                f"Tabero PiRL normalization {name}.{statistic} must have "
-                f"dimension {expected_dim}; got {actual_dim}."
-            )
-        if any(
-            isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or not math.isfinite(value)
-            for value in values
-        ):
-            raise ValueError(
-                f"Tabero PiRL normalization {name}.{statistic} contains "
-                "a non-finite or non-numeric value."
-            )
-
-
-def validate_tabero_pi05_pirl_deployment_checkpoint(
-    model_path: str | Path,
-    *,
-    expected_model_sha256: str,
-    expected_norm_stats_sha256: str,
-    expected_config_name: str,
-    expected_norm_asset_id: str,
-    expected_dataset: str,
-    expected_gripper_coordinate: str,
-    require_final: bool,
-    expected_action_horizon: int | None = None,
-    expected_discrete_state_input: bool = True,
-) -> dict[str, Any]:
-    """Validate a local merged PI0.5 tactile checkpoint before Ray starts.
-
-    This gate deliberately verifies the model and normalization files rather
-    than accepting a directory name as checkpoint provenance. A non-final SFT
-    export may be used only when the caller explicitly marks a smoke run.
-    """
-
-    if not isinstance(require_final, bool):
-        raise ValueError("Tabero PiRL checkpoint require_final must be boolean.")
-    if type(expected_discrete_state_input) is not bool:
-        raise ValueError("Tabero PiRL discrete_state_input must be boolean.")
-    expected_model_sha256 = _validate_expected_sha256(
-        expected_model_sha256, field="expected_model_sha256"
-    )
-    expected_norm_stats_sha256 = _validate_expected_sha256(
-        expected_norm_stats_sha256, field="expected_norm_stats_sha256"
-    )
-    expected_config_name = _validate_expected_string(
-        expected_config_name, field="expected_config_name"
-    )
-    expected_norm_asset_id = _validate_expected_string(
-        expected_norm_asset_id, field="expected_norm_asset_id"
-    )
-    if Path(expected_norm_asset_id).name != expected_norm_asset_id:
-        raise ValueError(
-            "Tabero PiRL expected_norm_asset_id must be one checkpoint-relative "
-            f"directory name; got {expected_norm_asset_id!r}."
-        )
-    expected_dataset = _validate_expected_string(
-        expected_dataset, field="expected_dataset"
-    )
-    expected_gripper_coordinate = _validate_expected_string(
-        expected_gripper_coordinate, field="expected_gripper_coordinate"
-    )
-    if expected_config_name in TABERO_PI05_TACFIELD_CONFIG_NAMES:
-        action_horizon = (
-            10 if expected_action_horizon is None else expected_action_horizon
-        )
-        if type(action_horizon) is not int or action_horizon not in (10, 50):
-            raise ValueError("Tabero TacField PiRL action horizon must be 10 or 50.")
-        export_method = "sft_full_lora_tacfield"
-        source_metadata_contract = {
-            "dataset": expected_dataset,
-            "model_family": "pi05",
-            "openpi_config_name": expected_config_name,
-            "deployment_config_name": expected_config_name,
-            "action_horizon": action_horizon,
-            "effective_action_dim": 13,
-            "tactile_prefix_dim_in": 9 * 440 * 2,
-            "tactile_prefix_history": 8,
-            "gripper_coordinate": expected_gripper_coordinate,
-        }
-        model_config_contract = {
-            "action_dim": 32,
-            "action_horizon": action_horizon,
-            "pi05": True,
-            "discrete_state_input": expected_discrete_state_input,
-            "config_name": expected_config_name,
-            "num_images_in_input": 2,
-            "action_chunk": action_horizon,
-            "action_env_dim": 13,
-            "num_steps": 10,
-            "tactile_type": "expert_his_c_fut",
-            "tactile_dim": 6,
-            "tactile_dim_in": 0,
-            "effective_action_dim": 13,
-            "tactile_prefix_dim_in": 9 * 440 * 2,
-            "tactile_prefix_history": 8,
-            "tactile_prefix_encoder_type": "tcn",
-            "tactile_prefix_use_reference_frame": True,
-            "tactile_prefix_diff_from_reference": False,
-            "tactile_streams": ["tactile_prefix"],
-        }
-        norm_dimensions = {
-            "state": 7,
-            "actions": 13,
-            "tactile_prefix": 440 * 2,
-        }
-        tactile_input = "tactile_prefix"
-    elif expected_config_name == TABERO_PI05_TACIMG_CONFIG_NAME:
-        export_method = "sft_full_lora_tacimg"
-        source_metadata_contract = {
-            "dataset": expected_dataset,
-            "model_family": "pi05",
-            "openpi_config_name": expected_config_name,
-            "deployment_config_name": expected_config_name,
-            "action_horizon": 50,
-            "execution_steps": 10,
-            "effective_action_dim": 13,
-            "tactile_input": "tactile_image",
-            "num_images_in_input": 3,
-            "excluded_tactile_inputs": [
-                "tactile_gripper_force",
-                "tactile_marker_motion",
-            ],
-            "gripper_coordinate": expected_gripper_coordinate,
-        }
-        model_config_contract = {
-            "action_dim": 32,
-            "action_horizon": 50,
-            "pi05": True,
-            "discrete_state_input": expected_discrete_state_input,
-            "config_name": expected_config_name,
-            "num_images_in_input": 3,
-            "action_chunk": 50,
-            "action_env_dim": 13,
-            "num_steps": 10,
-            "tactile_type": "expert_his_c_fut",
-            "tactile_dim": 6,
-            "tactile_dim_in": 0,
-            "effective_action_dim": 13,
-            "tactile_prefix_dim_in": None,
-            "tactile_prefix_history": None,
-            "tactile_prefix_encoder_type": None,
-            "tactile_prefix_use_reference_frame": None,
-            "tactile_prefix_diff_from_reference": None,
-            "tactile_streams": [],
-        }
-        norm_dimensions = {"state": 7, "actions": 13}
-        tactile_input = "tactile_image"
-    else:
-        raise ValueError(
-            "Tabero PiRL expected_config_name is not a supported tactile PI0.5 "
-            f"contract: {expected_config_name!r}."
-        )
-
-    checkpoint_dir = Path(model_path).expanduser().resolve()
-    if not checkpoint_dir.is_dir():
-        raise ValueError(
-            "Tabero PiRL model_path must be an existing local checkpoint "
-            f"directory; got {checkpoint_dir}."
-        )
-
-    model_file = checkpoint_dir / "model.safetensors"
-    if not model_file.is_file():
-        raise ValueError(
-            f"Tabero PiRL checkpoint is missing model.safetensors: {model_file}."
-        )
-    export_metadata = _load_json_mapping(
-        checkpoint_dir / "export_meta.json", label="export metadata"
-    )
-    model_config = _load_json_mapping(
-        checkpoint_dir / "config.json", label="model config"
-    )
-    norm_stats_path = checkpoint_dir / expected_norm_asset_id / "norm_stats.json"
-    norm_payload = _load_json_mapping(norm_stats_path, label="normalization statistics")
-
-    actual_model_sha256 = _sha256(model_file)
-    metadata_model_sha256 = export_metadata.get("model_sha256")
-    if (
-        actual_model_sha256 != expected_model_sha256
-        or metadata_model_sha256 != expected_model_sha256
-    ):
-        raise ValueError(
-            "Tabero PiRL model SHA-256 mismatch: "
-            f"expected={expected_model_sha256!r}, "
-            f"export_meta={metadata_model_sha256!r}, "
-            f"actual={actual_model_sha256!r}."
-        )
-
-    actual_norm_stats_sha256 = _sha256(norm_stats_path)
-    if actual_norm_stats_sha256 != expected_norm_stats_sha256:
-        raise ValueError(
-            "Tabero PiRL normalization SHA-256 mismatch: "
-            f"expected={expected_norm_stats_sha256!r}, "
-            f"actual={actual_norm_stats_sha256!r}."
-        )
-
-    _require_exact_values(
-        export_metadata,
-        {
-            "format": "t2vla_openpi_pytorch_merged_lora",
-            "method": export_method,
-            "dataset": expected_dataset,
-        },
-        label="export metadata",
-    )
-    source_metadata = export_metadata.get("source_ckpt_metadata")
-    if not isinstance(source_metadata, Mapping):
-        raise ValueError(
-            "Tabero PiRL export metadata must include source_ckpt_metadata."
-        )
-    _require_exact_values(
-        source_metadata,
-        source_metadata_contract,
-        label="source checkpoint metadata",
-    )
-    is_final = export_metadata.get("is_final")
-    global_step = export_metadata.get("global_step")
-    target_global_step = export_metadata.get("target_global_step")
-    if (
-        not isinstance(is_final, bool)
-        or isinstance(global_step, bool)
-        or not isinstance(global_step, int)
-        or global_step <= 0
-        or isinstance(target_global_step, bool)
-        or not isinstance(target_global_step, int)
-        or target_global_step <= 0
-    ):
-        raise ValueError(
-            "Tabero PiRL export metadata must contain valid is_final, "
-            "global_step, and target_global_step fields."
-        )
-    if require_final and (not is_final or global_step != target_global_step):
-        raise ValueError(
-            "Tabero PiRL formal training requires a final SFT export; got "
-            f"is_final={is_final}, global_step={global_step}, "
-            f"target_global_step={target_global_step}."
-        )
-
-    _require_exact_values(
-        model_config,
-        model_config_contract,
-        label="model config",
-    )
-
-    norm_stats = norm_payload.get("norm_stats")
-    if not isinstance(norm_stats, Mapping):
-        raise ValueError(
-            "Tabero PiRL normalization file must contain a norm_stats mapping."
-        )
-    for name, expected_dim in norm_dimensions.items():
-        stats = norm_stats.get(name)
-        if not isinstance(stats, Mapping):
-            raise ValueError(f"Tabero PiRL normalization is missing mapping {name!r}.")
-        _validate_norm_stats_vector(stats, name=name, expected_dim=expected_dim)
-
-    return {
-        "checkpoint_dir": str(checkpoint_dir),
-        "model_sha256": actual_model_sha256,
-        "norm_stats_path": str(norm_stats_path),
-        "norm_stats_sha256": actual_norm_stats_sha256,
-        "global_step": global_step,
-        "target_global_step": target_global_step,
-        "is_final": is_final,
-        "config_name": expected_config_name,
-        "norm_asset_id": expected_norm_asset_id,
-        "dataset": expected_dataset,
-        "gripper_coordinate": expected_gripper_coordinate,
-        "tactile_input": tactile_input,
-    }
 
 
 def uses_tabero_primitive_prefix_boundary(semantics: str | None) -> bool:
@@ -440,6 +78,10 @@ def validate_tabero_ppo_checkpoint_boundary_metadata(
             "Tabero PPO boundary-safe checkpoint sidecar is missing mapping metadata."
         )
 
+    if expected_semantics == TABERO_PPO_DEFAULT_RESET_TRANSITION_BOUNDARY_SEMANTICS:
+        validate_realworld_pirl_checkpoint_format(metadata)
+        return dict(metadata)
+
     actual_semantics = metadata.get(TABERO_PPO_CHECKPOINT_METADATA_KEY)
     if actual_semantics != expected_semantics:
         raise ValueError(
@@ -448,3 +90,42 @@ def validate_tabero_ppo_checkpoint_boundary_metadata(
             "checkpoints must restart from the base model."
         )
     return dict(metadata)
+
+
+def build_realworld_pirl_checkpoint_metadata(cfg) -> dict[str, Any]:
+    """Describe the actual runtime configuration, not a handwritten YAML copy."""
+    model = cfg.actor.model
+    openpi = model.openpi
+    env = cfg.env.train.init_params
+    target_step = cfg.runner.max_epochs
+    if cfg.runner.get("max_steps", -1) >= 0:
+        target_step = min(target_step, cfg.runner.max_steps)
+    return {
+        "checkpoint_format": TABERO_REALWORLD_CHECKPOINT_FORMAT,
+        "method": "pirl",
+        "task_domain": "realworld",
+        "task_suite": env.task_suite,
+        "task_id": env.task_id,
+        "target_object": env.target_object,
+        "task_description": env.task_description,
+        "reset_source": env.reset_source,
+        "deployment_config_name": model.deployment_config_name,
+        "normalization_asset_id": model.export_norm_asset_id,
+        "model_family": "pi05",
+        "action_horizon": openpi.action_horizon,
+        "execution_horizon": model.num_action_chunks,
+        "effective_action_dim": openpi.effective_action_dim,
+        "tactile_prefix_dim_in": openpi.get("tactile_prefix_dim_in"),
+        "tactile_prefix_history": openpi.get("tactile_prefix_history"),
+        "discrete_state_input": openpi.discrete_state_input,
+        "target_global_step": target_step,
+        "gradient_checkpointing": cfg.actor.fsdp_config.gradient_checkpointing,
+    }
+
+
+def validate_realworld_pirl_checkpoint_format(metadata: Mapping) -> None:
+    """Only the current runtime-generated RealWorld format is supported."""
+    if metadata.get("checkpoint_format") != TABERO_REALWORLD_CHECKPOINT_FORMAT:
+        raise ValueError(
+            "Unsupported RealWorld PiRL checkpoint format; old checkpoints are not supported."
+        )

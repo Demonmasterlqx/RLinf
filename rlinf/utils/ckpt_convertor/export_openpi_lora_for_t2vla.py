@@ -696,11 +696,18 @@ def _build_export_metadata(
     output_model = _checkpoint_path(model_path)
     expected_training_config = train_config.stem
     method = checkpoint_meta.get("method")
+    if checkpoint_meta.get("task_domain") == "realworld" and method == "pirl":
+        from rlinf.utils.tabero_ppo_boundary import (
+            validate_realworld_pirl_checkpoint_format,
+        )
+
+        validate_realworld_pirl_checkpoint_format(checkpoint_meta)
     required = {
         "format": "trainable_weights",
         "method": method,
-        "training_config": expected_training_config,
     }
+    if checkpoint_meta.get("task_domain") != "realworld" or method != "pirl":
+        required["training_config"] = expected_training_config
     if method not in {"pirl", *TABERO_SFT_METHODS}:
         raise ValueError(
             "OpenPI checkpoint provenance method must be 'pirl', "
@@ -1008,11 +1015,19 @@ def export_checkpoint(
     if not model_cfg.get("is_lora", False):
         raise ValueError("actor.model.is_lora must be true for LoRA export.")
 
+    checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+    checkpoint_meta = _checkpoint_metadata(checkpoint)
+    if model_cfg.get("deployment_config_name") or (
+        checkpoint_meta.get("task_domain") == "realworld"
+        and checkpoint_meta.get("method") == "pirl"
+    ):
+        from rlinf.utils.tabero_ppo_boundary import (
+            validate_realworld_pirl_checkpoint_format,
+        )
+
+        validate_realworld_pirl_checkpoint_format(checkpoint_meta)
     model_cfg.load_to_device = False
     model = get_model(model_cfg)
-
-    checkpoint = torch.load(ckpt_path, map_location="cpu")
-    checkpoint_meta = _checkpoint_metadata(checkpoint)
     is_trainable_checkpoint = checkpoint_meta.get("format") == "trainable_weights"
     state_dict = _normalize_state_dict_keys(_extract_state_dict(checkpoint))
     if is_trainable_checkpoint:

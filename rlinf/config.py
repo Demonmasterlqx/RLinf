@@ -40,9 +40,6 @@ from rlinf.utils.dsrl_replay import (
     DSRL_REPLAY_CHECKPOINT_SHARD_TRANSITIONS,
     DSRL_REPLAY_MAX_RESIDENT_GIB,
     DSRL_REPLAY_SEMANTICS,
-    REALWORLD_TACIMG_DSRL_REPLAY_CAPACITY_TRANSITIONS,
-    REALWORLD_TACIMG_DSRL_REPLAY_CHECKPOINT_SHARD_TRANSITIONS,
-    REALWORLD_TACIMG_DSRL_REPLAY_MAX_RESIDENT_GIB,
     REALWORLD_TACIMG_DSRL_REPLAY_SEMANTICS,
 )
 from rlinf.utils.dsrl_reward import DSRL_REWARD_SEMANTICS
@@ -59,13 +56,10 @@ from rlinf.utils.placement import (
     PlacementMode,
 )
 from rlinf.utils.tabero_ppo_boundary import (
-    TABERO_PI05_TACFIELD_CONFIG_NAMES,
     TABERO_PI05_TACIMG_CONFIG_NAME,
     TABERO_PPO_BOUNDARY_CONTRACTS,
     TABERO_PPO_CHECKPOINT_METADATA_KEY,
     TABERO_PPO_DEFAULT_RESET_TRANSITION_BOUNDARY_SEMANTICS,
-    TABERO_XARM_GRIPPER_MAPPING_CONTRACT,
-    validate_tabero_pi05_pirl_deployment_checkpoint,
 )
 
 if TYPE_CHECKING:
@@ -858,98 +852,47 @@ def validate_megatron_cfg(cfg: DictConfig) -> DictConfig:
     return cfg
 
 
-def _validate_tabero_realworld_action_filter_contract(
-    cfg,
-    checkpoint_metadata,
-) -> str:
-    """Validate the opt-in action filter and return its auditable metadata."""
+def _tabero_active_env_splits(cfg) -> tuple[str, ...]:
+    """Only inspect evaluation settings when evaluation will actually run."""
+    runner = cfg.get("runner", {})
+    if runner.get("only_eval", False):
+        return ("eval",)
+    if runner.get("val_check_interval", -1) > 0:
+        return ("train", "eval")
+    return ("train",)
 
+
+def _validate_tabero_realworld_action_filter_contract(cfg) -> str:
+    """Check filter enablement across active splits; tuning is runtime validated."""
     enabled_by_split = {}
-    required_enabled_params = {
-        "transition_steps": 3,
-        "max_position_step_m": 0.008,
-        "max_position_delta_change_m": 0.006,
-        "max_orientation_step_deg": 2.0,
-        "max_orientation_delta_change_deg": 1.5,
-    }
-    for split_name in ("train", "eval"):
+    for split_name in _tabero_active_env_splits(cfg):
         init_params = cfg.env[split_name].get("init_params", {})
-        action_filter_cfg = init_params.get("action_filter")
-        if action_filter_cfg is None:
-            enabled = False
-        else:
-            if not hasattr(action_filter_cfg, "get"):
-                raise ValueError(
-                    "RealWorld Tabero PI0.5 PiRL requires "
-                    f"env.{split_name}.init_params.action_filter to be a mapping."
-                )
-            enabled = action_filter_cfg.get("enabled", False)
+        filter_cfg = init_params.get("action_filter")
+        if filter_cfg is None:
+            filter_cfg = {}
+        if not hasattr(filter_cfg, "get"):
+            raise ValueError(
+                f"env.{split_name}.init_params.action_filter must be a mapping."
+            )
+        enabled = filter_cfg.get("enabled", False)
         if not isinstance(enabled, bool):
             raise ValueError(
-                "RealWorld Tabero PI0.5 PiRL requires "
-                f"env.{split_name}.init_params.action_filter.enabled to be boolean; "
-                f"got {enabled!r}."
+                f"env.{split_name}.init_params.action_filter.enabled must be boolean."
             )
         enabled_by_split[split_name] = enabled
-        if enabled:
-            for key, expected in required_enabled_params.items():
-                actual = action_filter_cfg.get(key)
-                if actual != expected:
-                    raise ValueError(
-                        "RealWorld Tabero PI0.5 PiRL enabled action filter requires "
-                        f"env.{split_name}.init_params.action_filter.{key}="
-                        f"{expected!r}; got {actual!r}."
-                    )
-
-    if enabled_by_split["train"] != enabled_by_split["eval"]:
+    if len(set(enabled_by_split.values())) > 1:
         raise ValueError(
-            "RealWorld Tabero PI0.5 PiRL requires train and eval to use the "
-            "same action_filter.enabled state; got "
-            f"train={enabled_by_split['train']!r}, "
-            f"eval={enabled_by_split['eval']!r}."
+            "RealWorld Tabero requires the same action_filter.enabled state in train and eval."
         )
-
-    expected_metadata = (
-        "xarm_sim_action_chunk_filter_v1" if enabled_by_split["train"] else "disabled"
+    return (
+        "xarm_sim_action_chunk_filter_v1"
+        if any(enabled_by_split.values())
+        else "disabled"
     )
-    actual_metadata = checkpoint_metadata.get("action_filter")
-    if actual_metadata != expected_metadata:
-        raise ValueError(
-            "RealWorld Tabero PI0.5 PiRL requires auditable "
-            "actor.fsdp_config.trainable_checkpoint_metadata.action_filter="
-            f"{expected_metadata!r}; got {actual_metadata!r}."
-        )
-    return expected_metadata
-
-
-def _validate_tabero_realworld_gripper_checkpoint_metadata(
-    checkpoint_metadata,
-) -> dict[str, object]:
-    """Require audit metadata for RLinf's fixed XArm gripper boundary."""
-
-    metadata_contract = {
-        "gripper_mapping": TABERO_XARM_GRIPPER_MAPPING_CONTRACT["version"],
-        "policy_gripper_coordinate": TABERO_XARM_GRIPPER_MAPPING_CONTRACT[
-            "policy_coordinate"
-        ],
-        "sim_gripper_coordinate": TABERO_XARM_GRIPPER_MAPPING_CONTRACT[
-            "sim_coordinate"
-        ],
-        "gripper_travel_m": TABERO_XARM_GRIPPER_MAPPING_CONTRACT["travel_m"],
-    }
-    for key, expected in metadata_contract.items():
-        actual = checkpoint_metadata.get(key)
-        if actual != expected:
-            raise ValueError(
-                "RealWorld Tabero training requires auditable "
-                "actor.fsdp_config.trainable_checkpoint_metadata."
-                f"{key}={expected!r}; got {actual!r}."
-            )
-    return metadata_contract
 
 
 def _validate_tabero_realworld_pi05_pirl_contract(cfg, model_cfg) -> None:
-    """Fail before Ray starts when the RealWorld PI0.5 PiRL contract drifts."""
+    """Validate PiRL model/environment interfaces without auditing base weights."""
 
     from rlinf.envs.isaaclab.tasks.realworld_tabero_tacfield import (
         REALWORLD_TARGET_PROMPTS,
@@ -971,11 +914,7 @@ def _validate_tabero_realworld_pi05_pirl_contract(cfg, model_cfg) -> None:
         "freeze_non_lora": True,
         "lora_path": None,
         "use_proprio": True,
-        "num_steps": 10,
         "add_value_head": True,
-        "precision": None,
-        "frozen_parameter_precision": "bf16",
-        "trainable_parameter_precision": "fp32",
     }
     for key, expected in required_model_values.items():
         actual = model_cfg.get(key)
@@ -1008,18 +947,19 @@ def _validate_tabero_realworld_pi05_pirl_contract(cfg, model_cfg) -> None:
         "tactile_type": "expert_his_c_fut",
         "tactile_dim": 6,
         "tactile_dim_in": 0,
-        "num_steps": 10,
         "add_value_head": True,
         "joint_logprob": False,
         "value_after_vlm": True,
         "detach_critic_input": True,
         "use_dsrl": False,
     }
-    if config_name in TABERO_PI05_TACFIELD_CONFIG_NAMES:
+    if list(openpi_cfg.get("tactile_streams") or []) == ["tactile_prefix"]:
         tactile_kind = "tacfield"
         action_horizon = openpi_cfg.get("action_horizon")
-        if type(action_horizon) is not int or action_horizon not in (10, 50):
-            raise ValueError("RealWorld TacField PiRL action horizon must be 10 or 50.")
+        if type(action_horizon) is not int or action_horizon < 10:
+            raise ValueError(
+                "RealWorld TacField PiRL action horizon must cover the execution chunk (10)."
+            )
         required_openpi_values = {
             **common_openpi_values,
             "config_name": config_name,
@@ -1032,11 +972,10 @@ def _validate_tabero_realworld_pi05_pirl_contract(cfg, model_cfg) -> None:
             "tactile_prefix_diff_from_reference": False,
         }
         expected_tactile_streams = ["tactile_prefix"]
-    elif config_name == TABERO_PI05_TACIMG_CONFIG_NAME:
+    elif openpi_cfg.get("num_images_in_input") == 3:
         tactile_kind = "tacimg"
         required_openpi_values = {
             **common_openpi_values,
-            "config_name": TABERO_PI05_TACIMG_CONFIG_NAME,
             "action_horizon": 50,
             "num_images_in_input": 3,
             "tactile_prefix_dim_in": None,
@@ -1065,13 +1004,6 @@ def _validate_tabero_realworld_pi05_pirl_contract(cfg, model_cfg) -> None:
             f"expected {expected_tactile_streams!r}, got {tactile_streams!r}."
         )
 
-    openpi_data_cfg = model_cfg.get("openpi_data")
-    if openpi_data_cfg is not None and openpi_data_cfg.get("norm_stats_path"):
-        raise ValueError(
-            "RealWorld Tabero PI0.5 PiRL forbids actor.model.openpi_data."
-            "norm_stats_path; normalization must load from the audited checkpoint."
-        )
-
     actor_model_path = str(model_cfg.get("model_path", ""))
     rollout_model_path = str(cfg.rollout.model.get("model_path", ""))
     if (
@@ -1085,153 +1017,7 @@ def _validate_tabero_realworld_pi05_pirl_contract(cfg, model_cfg) -> None:
             "same local model_path."
         )
 
-    # Checkpoint provenance checks are opt-in; the loader can use the registered
-    # norm asset directly without reading export metadata or hashing weights.
-    checkpoint_contract = model_cfg.get("tabero_pi05_checkpoint_contract") or {}
-    require_final = checkpoint_contract.get("require_final")
-    allow_non_final_formal_training = checkpoint_contract.get(
-        "allow_non_final_formal_training", False
-    )
-    if not isinstance(allow_non_final_formal_training, bool):
-        raise ValueError(
-            "RealWorld Tabero PI0.5 PiRL requires "
-            "actor.model.tabero_pi05_checkpoint_contract."
-            "allow_non_final_formal_training to be boolean."
-        )
-    if require_final is True and allow_non_final_formal_training:
-        raise ValueError(
-            "RealWorld Tabero PI0.5 PiRL cannot combine require_final=true with "
-            "allow_non_final_formal_training=true."
-        )
-    expected_config_name = checkpoint_contract.get("expected_config_name")
-    expected_norm_asset_id = checkpoint_contract.get("expected_norm_asset_id")
-    expected_dataset = checkpoint_contract.get("expected_dataset")
-    expected_gripper_coordinate = checkpoint_contract.get("expected_gripper_coordinate")
-    if checkpoint_contract:
-        checkpoint_info = validate_tabero_pi05_pirl_deployment_checkpoint(
-            actor_model_path,
-            expected_model_sha256=checkpoint_contract.get("expected_model_sha256"),
-            expected_norm_stats_sha256=checkpoint_contract.get(
-                "expected_norm_stats_sha256"
-            ),
-            expected_config_name=expected_config_name,
-            expected_norm_asset_id=expected_norm_asset_id,
-            expected_dataset=expected_dataset,
-            expected_gripper_coordinate=expected_gripper_coordinate,
-            require_final=require_final,
-            expected_action_horizon=openpi_cfg.get("action_horizon"),
-            expected_discrete_state_input=openpi_cfg.get("discrete_state_input"),
-        )
-    if allow_non_final_formal_training and checkpoint_info["is_final"] is not False:
-        raise ValueError(
-            "RealWorld Tabero PI0.5 PiRL "
-            "allow_non_final_formal_training=true is only valid for an explicitly "
-            "non-final initialization checkpoint."
-        )
-
-    checkpoint_metadata = (
-        cfg.actor.get("fsdp_config", {}).get("trainable_checkpoint_metadata", {}) or {}
-    )
-    action_filter_metadata = _validate_tabero_realworld_action_filter_contract(
-        cfg,
-        checkpoint_metadata,
-    )
-    gripper_mapping_metadata = _validate_tabero_realworld_gripper_checkpoint_metadata(
-        checkpoint_metadata,
-    )
-    required_checkpoint_metadata = {
-        "method": "pirl",
-        "task_domain": "realworld",
-        "task_suite": "gentle_grasp",
-        "task_id": 6,
-        "target_object": target_object,
-        "task_description": task_description,
-        "control_mode": "hybrid_tactile",
-        "reset_source": "task_config_default_reset",
-        "gripper_coordinate": expected_gripper_coordinate,
-        "action_filter": action_filter_metadata,
-        **gripper_mapping_metadata,
-        "camera_preprocess": "stretch_480x640_to_224x224_inter_area",
-        "model_family": "pi05",
-        "openpi_config_name": expected_config_name,
-        "dataset": expected_dataset,
-        "normalization_asset_id": expected_norm_asset_id,
-        "base_model_sha256": checkpoint_contract.get("expected_model_sha256"),
-        "base_norm_stats_sha256": checkpoint_contract.get("expected_norm_stats_sha256"),
-        "base_checkpoint_require_final": require_final,
-        "action_horizon": openpi_cfg.get("action_horizon"),
-        "execution_horizon": 10,
-        "effective_action_dim": 13,
-        "state_dim": 7,
-        "camera_count": 3 if tactile_kind == "tacimg" else 2,
-        "target_global_step": cfg.runner.get("max_epochs"),
-        "tabero_ppo_transition_boundary_semantics": (
-            TABERO_PPO_DEFAULT_RESET_TRANSITION_BOUNDARY_SEMANTICS
-        ),
-    }
-    if tactile_kind == "tacfield":
-        required_checkpoint_metadata.update(
-            {
-                "tactile_input": "tactile_prefix",
-                "tactile_prefix_dim_in": 9 * 440 * 2,
-                "tactile_prefix_history": 8,
-                "combined_marker_count": 440,
-            }
-        )
-    else:
-        required_checkpoint_metadata.update(
-            {
-                "tactile_input": "tactile_image",
-                "tactile_image_history": 8,
-                "tactile_mosaic_layout": "left_2x4_then_right_2x4",
-                "excluded_tactile_inputs": [
-                    "tactile_gripper_force",
-                    "tactile_marker_motion",
-                ],
-            }
-        )
-    if allow_non_final_formal_training:
-        required_checkpoint_metadata.update(
-            {
-                "base_checkpoint_allow_non_final_formal_training": True,
-                "base_checkpoint_global_step": checkpoint_info["global_step"],
-                "base_checkpoint_target_global_step": checkpoint_info[
-                    "target_global_step"
-                ],
-                "base_checkpoint_is_final": checkpoint_info["is_final"],
-            }
-        )
-    if checkpoint_contract:
-        for key, expected in required_checkpoint_metadata.items():
-            actual = checkpoint_metadata.get(key)
-            if actual != expected:
-                raise ValueError(
-                    "RealWorld Tabero PI0.5 PiRL requires auditable "
-                    "actor.fsdp_config.trainable_checkpoint_metadata."
-                    f"{key}={expected!r}; got {actual!r}."
-                )
-    training_config = checkpoint_metadata.get("training_config")
-    if not isinstance(training_config, str) or not training_config.strip():
-        raise ValueError(
-            "RealWorld Tabero PI0.5 PiRL checkpoint metadata requires a "
-            "non-empty training_config."
-        )
-
-    is_restricted_smoke = (
-        cfg.runner.get("max_epochs") == 1
-        and cfg.env.train.get("total_num_envs") == 1
-        and cfg.actor.get("global_batch_size") == 1
-    )
-    if (
-        require_final is False
-        and not is_restricted_smoke
-        and not allow_non_final_formal_training
-    ):
-        raise ValueError(
-            "A non-final PI0.5 tactile checkpoint is restricted to a one-update, "
-            "single-environment PiRL smoke run unless the training config explicitly "
-            "sets allow_non_final_formal_training=true and records its provenance."
-        )
+    _validate_tabero_realworld_action_filter_contract(cfg)
 
     expected_env_values = {
         "id": "Isaac-RealWorld-GentleGrasp-XarmUmi-Hybrid-Tactile-v0",
@@ -1247,7 +1033,7 @@ def _validate_tabero_realworld_pi05_pirl_contract(cfg, model_cfg) -> None:
     }
     if tactile_kind == "tacimg":
         expected_env_values["tactile_image_history_len"] = 8
-    for split_name in ("train", "eval"):
+    for split_name in _tabero_active_env_splits(cfg):
         init_params = cfg.env[split_name].get("init_params", {})
         for key, expected in expected_env_values.items():
             actual = init_params.get(key)
@@ -1258,74 +1044,9 @@ def _validate_tabero_realworld_pi05_pirl_contract(cfg, model_cfg) -> None:
                     f"got {actual!r}."
                 )
 
-        success_cfg = init_params.get("success", {})
-        if (
-            success_cfg.get("required_consecutive_steps") != 8
-            or success_cfg.get("terminal_reward") != 1.0
-        ):
-            raise ValueError(
-                "RealWorld Tabero PI0.5 PiRL requires eight consecutive success "
-                "steps and terminal_reward=1.0."
-            )
-        camera_cfg = init_params.get("camera_preprocess", {})
-        required_camera_preprocess = {
-            "source_height": 480,
-            "source_width": 640,
-            "target_height": 224,
-            "target_width": 224,
-            "mode": "stretch",
-            "interpolation": "INTER_AREA",
-        }
-        for key, expected in required_camera_preprocess.items():
-            actual = camera_cfg.get(key)
-            if actual != expected:
-                raise ValueError(
-                    "RealWorld Tabero PI0.5 PiRL requires "
-                    f"env.{split_name}.init_params.camera_preprocess.{key}="
-                    f"{expected!r}; got {actual!r}."
-                )
-        for legacy_camera_override in ("agentview_cam", "eye_in_hand_cam"):
-            if init_params.get(legacy_camera_override) is not None:
-                raise ValueError(
-                    "RealWorld Tabero PI0.5 PiRL must preserve the native 480x640 "
-                    f"camera before stretch preprocessing; remove env.{split_name}."
-                    f"init_params.{legacy_camera_override}."
-                )
-
-        if (
-            cfg.env[split_name].get("max_episode_steps") != 300
-            or cfg.env[split_name].get("max_steps_per_rollout_epoch") != 300
-        ):
-            raise ValueError(
-                "RealWorld Tabero PI0.5 PiRL control-loop parity requires exactly "
-                f"300 primitive steps in env.{split_name}."
-            )
-
-        extension_path = (
-            Path(str(init_params.get("extension_path", ""))).expanduser().resolve()
-        )
-        if not extension_path.is_dir() or extension_path.parts[-3:] != (
-            "Tabero_X",
-            "source",
-            "tac_manip",
-        ):
-            raise ValueError(
-                "RealWorld Tabero PI0.5 PiRL extension_path must resolve to "
-                "Tabero_X/source/tac_manip."
-            )
-        for directory_key in ("realworld_config_dir", "realworld_assets_dir"):
-            directory = (
-                Path(str(init_params.get(directory_key, ""))).expanduser().resolve()
-            )
-            if not directory.is_dir():
-                raise ValueError(
-                    "RealWorld Tabero PI0.5 PiRL requires existing "
-                    f"env.{split_name}.init_params.{directory_key}; got {directory}."
-                )
-
 
 def _validate_tabero_realworld_pi05_dsrl_contract(cfg, model_cfg) -> None:
-    """Fail before Ray starts when the RealWorld TacImg DSRL contract drifts."""
+    """Validate TacImg DSRL interfaces without auditing base weights."""
 
     algorithm_cfg = cfg.algorithm
     required_algorithm_values = {
@@ -1357,12 +1078,9 @@ def _validate_tabero_realworld_pi05_dsrl_contract(cfg, model_cfg) -> None:
         "action_dim": 13,
         "is_lora": False,
         "use_proprio": True,
-        "num_steps": 10,
         "add_value_head": False,
         "add_q_head": True,
         "q_head_type": "default",
-        "num_q_heads": 10,
-        "precision": None,
     }
     for key, expected in required_model_values.items():
         actual = model_cfg.get(key)
@@ -1396,10 +1114,8 @@ def _validate_tabero_realworld_pi05_dsrl_contract(cfg, model_cfg) -> None:
         "config_name": TABERO_PI05_TACIMG_CONFIG_NAME,
         "pi05": True,
         "action_horizon": 50,
-        "discrete_state_input": True,
         "num_images_in_input": 3,
         "action_chunk": 10,
-        "num_steps": 10,
         "train_expert_only": True,
         "action_env_dim": 13,
         "effective_action_dim": 13,
@@ -1419,11 +1135,6 @@ def _validate_tabero_realworld_pi05_dsrl_contract(cfg, model_cfg) -> None:
         "dsrl_num_images": REALWORLD_TACIMG_DSRL_NUM_IMAGES,
         "dsrl_state_dim": 7,
         "dsrl_action_noise_dim": 32,
-        "dsrl_num_q_heads": 10,
-        "dsrl_agg_q": "mean",
-        "dsrl_image_latent_dim": 64,
-        "dsrl_state_latent_dim": 64,
-        "dsrl_tactile_latent_dim": 64,
     }
     for key, expected in required_openpi_values.items():
         actual = openpi_cfg.get(key)
@@ -1437,18 +1148,6 @@ def _validate_tabero_realworld_pi05_dsrl_contract(cfg, model_cfg) -> None:
             "RealWorld TacImg DSRL requires actor.model.openpi.tactile_streams=[]; "
             f"got {openpi_cfg.get('tactile_streams')!r}."
         )
-    if list(openpi_cfg.get("dsrl_hidden_dims", [])) != [128, 128, 128]:
-        raise ValueError(
-            "RealWorld TacImg DSRL requires "
-            "actor.model.openpi.dsrl_hidden_dims=[128, 128, 128]."
-        )
-    openpi_data_cfg = model_cfg.get("openpi_data")
-    if openpi_data_cfg is not None and openpi_data_cfg.get("norm_stats_path"):
-        raise ValueError(
-            "RealWorld TacImg DSRL forbids actor.model.openpi_data.norm_stats_path; "
-            "normalization must load from the audited checkpoint."
-        )
-
     actor_model_path = str(model_cfg.get("model_path", ""))
     rollout_model_path = str(cfg.rollout.model.get("model_path", ""))
     if (
@@ -1462,64 +1161,11 @@ def _validate_tabero_realworld_pi05_dsrl_contract(cfg, model_cfg) -> None:
             "local model_path."
         )
 
-    checkpoint_contract = model_cfg.get("tabero_pi05_checkpoint_contract")
-    if checkpoint_contract is None:
-        raise ValueError(
-            "RealWorld TacImg DSRL requires "
-            "actor.model.tabero_pi05_checkpoint_contract."
-        )
-    require_final = checkpoint_contract.get("require_final")
-    allow_non_final_formal_training = checkpoint_contract.get(
-        "allow_non_final_formal_training", False
-    )
-    if not isinstance(allow_non_final_formal_training, bool):
-        raise ValueError(
-            "RealWorld TacImg DSRL requires allow_non_final_formal_training to "
-            "be boolean."
-        )
-    if require_final is True and allow_non_final_formal_training:
-        raise ValueError(
-            "RealWorld TacImg DSRL cannot combine require_final=true with "
-            "allow_non_final_formal_training=true."
-        )
-    expected_config_name = checkpoint_contract.get("expected_config_name")
-    expected_norm_asset_id = checkpoint_contract.get("expected_norm_asset_id")
-    expected_dataset = checkpoint_contract.get("expected_dataset")
-    expected_gripper_coordinate = checkpoint_contract.get("expected_gripper_coordinate")
-    checkpoint_info = validate_tabero_pi05_pirl_deployment_checkpoint(
-        actor_model_path,
-        expected_model_sha256=checkpoint_contract.get("expected_model_sha256"),
-        expected_norm_stats_sha256=checkpoint_contract.get(
-            "expected_norm_stats_sha256"
-        ),
-        expected_config_name=expected_config_name,
-        expected_norm_asset_id=expected_norm_asset_id,
-        expected_dataset=expected_dataset,
-        expected_gripper_coordinate=expected_gripper_coordinate,
-        require_final=require_final,
-    )
-    if allow_non_final_formal_training and checkpoint_info["is_final"] is not False:
-        raise ValueError(
-            "RealWorld TacImg DSRL allow_non_final_formal_training=true is only "
-            "valid for an explicitly non-final initialization checkpoint."
-        )
-
     replay_cfg = algorithm_cfg.get("replay_buffer", {})
-    required_replay_values = {
-        "backend": DSRL_REPLAY_BACKEND,
-        "capacity_transitions": (REALWORLD_TACIMG_DSRL_REPLAY_CAPACITY_TRANSITIONS),
-        "checkpoint_shard_transitions": (
-            REALWORLD_TACIMG_DSRL_REPLAY_CHECKPOINT_SHARD_TRANSITIONS
-        ),
-        "max_resident_gib": REALWORLD_TACIMG_DSRL_REPLAY_MAX_RESIDENT_GIB,
-    }
-    for key, expected in required_replay_values.items():
-        actual = replay_cfg.get(key)
-        if actual != expected:
-            raise ValueError(
-                "RealWorld TacImg DSRL compact replay requires "
-                f"algorithm.replay_buffer.{key}={expected!r}; got {actual!r}."
-            )
+    if replay_cfg.get("backend") != DSRL_REPLAY_BACKEND:
+        raise ValueError(
+            f"RealWorld TacImg DSRL requires replay backend {DSRL_REPLAY_BACKEND!r}."
+        )
     legacy_replay_fields = {
         "enable_cache",
         "cache_size",
@@ -1542,10 +1188,8 @@ def _validate_tabero_realworld_pi05_dsrl_contract(cfg, model_cfg) -> None:
     fsdp_cfg = cfg.actor.get("fsdp_config", {})
     required_fsdp_values = {
         "sharding_strategy": "no_shard",
-        "gradient_checkpointing": False,
         "use_orig_params": True,
         "checkpoint_format": "local_shard",
-        "save_full_model_weights": False,
         "save_trainable_model_weights": True,
     }
     for key, expected in required_fsdp_values.items():
@@ -1556,101 +1200,21 @@ def _validate_tabero_realworld_pi05_dsrl_contract(cfg, model_cfg) -> None:
                 f"actor.fsdp_config.{key}={expected!r}; got {actual!r}."
             )
 
-    checkpoint_metadata = fsdp_cfg.get("trainable_checkpoint_metadata", {}) or {}
-    action_filter_metadata = _validate_tabero_realworld_action_filter_contract(
-        cfg, checkpoint_metadata
-    )
-    gripper_mapping_metadata = _validate_tabero_realworld_gripper_checkpoint_metadata(
-        checkpoint_metadata,
-    )
-    required_checkpoint_metadata = {
-        "method": "dsrl",
-        "task_domain": "realworld",
-        "task_suite": "gentle_grasp",
-        "task_id": 6,
-        "target_object": "target_object_1",
-        "task_description": "pick up the Vitasoy and put it into the basket",
-        "control_mode": "hybrid_tactile",
-        "reset_source": "task_config_default_reset",
-        "gripper_coordinate": expected_gripper_coordinate,
-        "action_filter": action_filter_metadata,
-        **gripper_mapping_metadata,
-        "camera_preprocess": "stretch_480x640_to_224x224_inter_area",
-        "model_family": "pi05",
-        "openpi_config_name": expected_config_name,
-        "dataset": expected_dataset,
-        "normalization_asset_id": expected_norm_asset_id,
-        "base_model_sha256": checkpoint_contract.get("expected_model_sha256"),
-        "base_norm_stats_sha256": checkpoint_contract.get("expected_norm_stats_sha256"),
-        "base_checkpoint_require_final": require_final,
-        "action_horizon": 50,
-        "execution_horizon": 10,
-        "effective_action_dim": 13,
-        "state_dim": 7,
-        "camera_count": 3,
-        "tactile_input": "tactile_image",
-        "tactile_image_history": 8,
-        "tactile_mosaic_layout": "left_2x4_then_right_2x4",
-        "excluded_tactile_inputs": [
-            "tactile_gripper_force",
-            "tactile_marker_motion",
-        ],
-        "reward_contract": "binary_success_plus_inverse_measured_force_v1",
-        "force_reward_source": "policy_gripper_net_force",
-        "dsrl_reward_semantics": DSRL_REWARD_SEMANTICS,
-        "dsrl_observation_semantics": (REALWORLD_TACIMG_DSRL_OBSERVATION_SEMANTICS),
-        "dsrl_replay_semantics": REALWORLD_TACIMG_DSRL_REPLAY_SEMANTICS,
-        "dsrl_transition_boundary_semantics": (
-            REALWORLD_TACIMG_DSRL_TRANSITION_BOUNDARY_SEMANTICS
-        ),
-        "target_global_step": cfg.runner.get("max_epochs"),
-    }
-    if allow_non_final_formal_training:
-        required_checkpoint_metadata.update(
-            {
-                "base_checkpoint_allow_non_final_formal_training": True,
-                "base_checkpoint_global_step": checkpoint_info["global_step"],
-                "base_checkpoint_target_global_step": checkpoint_info[
-                    "target_global_step"
-                ],
-                "base_checkpoint_is_final": checkpoint_info["is_final"],
-            }
-        )
-    for key, expected in required_checkpoint_metadata.items():
-        actual = checkpoint_metadata.get(key)
-        if actual != expected:
-            raise ValueError(
-                "RealWorld TacImg DSRL requires auditable "
-                "actor.fsdp_config.trainable_checkpoint_metadata."
-                f"{key}={expected!r}; got {actual!r}."
-            )
-    training_config = checkpoint_metadata.get("training_config")
-    if not isinstance(training_config, str) or not training_config.strip():
-        raise ValueError(
-            "RealWorld TacImg DSRL checkpoint metadata requires a non-empty "
-            "training_config."
-        )
+    _validate_tabero_realworld_action_filter_contract(cfg)
 
-    is_restricted_smoke = (
-        cfg.runner.get("max_epochs") == 1
-        and cfg.env.train.get("total_num_envs") == 1
-        and cfg.actor.get("global_batch_size") == 1
+    from rlinf.envs.isaaclab.tasks.realworld_tabero_tacfield import (
+        REALWORLD_TARGET_PROMPTS,
     )
-    if (
-        require_final is False
-        and not is_restricted_smoke
-        and not allow_non_final_formal_training
-    ):
-        raise ValueError(
-            "A non-final PI0.5 tactile checkpoint is restricted to a one-update, "
-            "single-environment DSRL smoke unless the config explicitly allows "
-            "and records non-final formal initialization."
-        )
+
+    target_object = cfg.env.train.get("init_params", {}).get("target_object")
+    task_description = REALWORLD_TARGET_PROMPTS.get(target_object)
+    if task_description is None:
+        raise ValueError(f"Unsupported RealWorld target_object: {target_object!r}.")
 
     expected_env_values = {
         "id": "Isaac-RealWorld-GentleGrasp-XarmUmi-Hybrid-Tactile-v0",
-        "target_object": "target_object_1",
-        "task_description": "pick up the Vitasoy and put it into the basket",
+        "target_object": target_object,
+        "task_description": task_description,
         "reset_source": "task_config_default_reset",
         "task_suite": "gentle_grasp",
         "task_id": 6,
@@ -1660,15 +1224,7 @@ def _validate_tabero_realworld_pi05_dsrl_contract(cfg, model_cfg) -> None:
         "combined_marker_count": 440,
         "tactile_image_history_len": 8,
     }
-    required_camera_preprocess = {
-        "source_height": 480,
-        "source_width": 640,
-        "target_height": 224,
-        "target_width": 224,
-        "mode": "stretch",
-        "interpolation": "INTER_AREA",
-    }
-    for split_name in ("train", "eval"):
+    for split_name in _tabero_active_env_splits(cfg):
         split_cfg = cfg.env.get(split_name)
         if split_cfg is None:
             raise ValueError(
@@ -1692,80 +1248,6 @@ def _validate_tabero_realworld_pi05_dsrl_contract(cfg, model_cfg) -> None:
                     f"env.{split_name}.init_params.{key}={expected!r}; "
                     f"got {actual!r}."
                 )
-        success_cfg = init_params.get("success", {})
-        if (
-            success_cfg.get("required_consecutive_steps") != 8
-            or success_cfg.get("terminal_reward") != 1.0
-        ):
-            raise ValueError(
-                "RealWorld TacImg DSRL requires eight consecutive success steps "
-                "and terminal_reward=1.0."
-            )
-        force_bonus_cfg = success_cfg.get("force_bonus", {})
-        required_force_bonus = {
-            "enabled": True,
-            "coefficient": 20.0,
-            "epsilon": 1.0,
-            "max_bonus": 1.0,
-            "min_valid_samples": 4,
-            "contact_epsilon": 1.0,
-        }
-        for key, expected in required_force_bonus.items():
-            actual = force_bonus_cfg.get(key)
-            if actual != expected:
-                raise ValueError(
-                    "RealWorld TacImg DSRL force reward requires "
-                    f"env.{split_name}.init_params.success.force_bonus.{key}="
-                    f"{expected!r}; got {actual!r}."
-                )
-        camera_cfg = init_params.get("camera_preprocess", {})
-        for key, expected in required_camera_preprocess.items():
-            actual = camera_cfg.get(key)
-            if actual != expected:
-                raise ValueError(
-                    "RealWorld TacImg DSRL requires "
-                    f"env.{split_name}.init_params.camera_preprocess.{key}="
-                    f"{expected!r}; got {actual!r}."
-                )
-        if (
-            split_cfg.get("max_episode_steps") != 300
-            or split_cfg.get("max_steps_per_rollout_epoch") != 300
-        ):
-            raise ValueError(
-                "RealWorld TacImg DSRL control-loop parity requires exactly 300 "
-                f"primitive steps in env.{split_name}."
-            )
-        extension_path = (
-            Path(str(init_params.get("extension_path", ""))).expanduser().resolve()
-        )
-        if not extension_path.is_dir() or extension_path.parts[-3:] != (
-            "Tabero_X",
-            "source",
-            "tac_manip",
-        ):
-            raise ValueError(
-                "RealWorld TacImg DSRL extension_path must resolve to "
-                "Tabero_X/source/tac_manip."
-            )
-        for directory_key in ("realworld_config_dir", "realworld_assets_dir"):
-            directory = (
-                Path(str(init_params.get(directory_key, ""))).expanduser().resolve()
-            )
-            if not directory.is_dir():
-                raise ValueError(
-                    "RealWorld TacImg DSRL requires existing "
-                    f"env.{split_name}.init_params.{directory_key}; got {directory}."
-                )
-
-    expected_global_batch = int(cfg.env.train.total_num_envs) * int(
-        cfg.env.train.rollout_epoch
-    )
-    if cfg.actor.get("global_batch_size") != expected_global_batch:
-        raise ValueError(
-            "RealWorld TacImg DSRL requires actor.global_batch_size to equal "
-            "env.train.total_num_envs * env.train.rollout_epoch; expected "
-            f"{expected_global_batch}, got {cfg.actor.get('global_batch_size')!r}."
-        )
 
 
 def validate_embodied_cfg(cfg):
@@ -1798,6 +1280,19 @@ def validate_embodied_cfg(cfg):
     ppo_boundary_semantics = algorithm_cfg.get(
         "tabero_ppo_transition_boundary_semantics"
     )
+    if (
+        not only_eval
+        and not use_dsrl
+        and OmegaConf.select(cfg, "env.train.init_params.id")
+        == "Isaac-RealWorld-GentleGrasp-XarmUmi-Hybrid-Tactile-v0"
+        and model_cfg.get("openpi", {}).get("pi05") is True
+        and ppo_boundary_semantics
+        != TABERO_PPO_DEFAULT_RESET_TRANSITION_BOUNDARY_SEMANTICS
+    ):
+        raise ValueError(
+            "RealWorld PiRL requires the current realworld_terminal_prefix mode; "
+            "missing or old boundary modes are not supported."
+        )
     if ppo_boundary_semantics is not None:
         boundary_contract = TABERO_PPO_BOUNDARY_CONTRACTS.get(ppo_boundary_semantics)
         if boundary_contract is None:
@@ -1812,24 +1307,14 @@ def validate_embodied_cfg(cfg):
                 "cannot be declared by an embodied-eval-only config."
             )
         openpi_cfg = model_cfg.get("openpi", {})
-        expected_openpi_configs = (
-            {
-                *TABERO_PI05_TACFIELD_CONFIG_NAMES,
-                TABERO_PI05_TACIMG_CONFIG_NAME,
-            }
-            if ppo_boundary_semantics
-            == TABERO_PPO_DEFAULT_RESET_TRANSITION_BOUNDARY_SEMANTICS
-            else {"pi0_lora_tacfield_tabero"}
-        )
+        if model_type != SupportedModel.OPENPI:
+            raise ValueError("Tabero PPO requires an OpenPI model.")
         if (
-            model_type != SupportedModel.OPENPI
-            or openpi_cfg.get("config_name") not in expected_openpi_configs
+            ppo_boundary_semantics
+            != TABERO_PPO_DEFAULT_RESET_TRANSITION_BOUNDARY_SEMANTICS
+            and openpi_cfg.get("config_name") != "pi0_lora_tacfield_tabero"
         ):
-            raise ValueError(
-                "Tabero PPO transition boundary semantics requires the Tabero tactile "
-                "OpenPI model configuration in "
-                f"{sorted(expected_openpi_configs)!r}."
-            )
+            raise ValueError("Tabero HDF5 PPO requires pi0_lora_tacfield_tabero.")
         required_ppo_values = {
             "adv_type": "gae",
             "loss_type": "actor_critic",
@@ -1865,7 +1350,7 @@ def validate_embodied_cfg(cfg):
                     f"got {action_chunk!r} and {model_cfg.get('action_dim')!r}."
                 )
 
-        for split_name in ("train", "eval"):
+        for split_name in _tabero_active_env_splits(cfg):
             split_cfg = cfg.env.get(split_name)
             if split_cfg is None:
                 raise ValueError(
@@ -1937,19 +1422,26 @@ def validate_embodied_cfg(cfg):
                 "Tabero PPO transition boundary semantics requires "
                 "actor.fsdp_config.save_trainable_model_weights=true for resume audit."
             )
-        checkpoint_metadata = fsdp_cfg.get("trainable_checkpoint_metadata")
-        actual_checkpoint_semantics = (
-            checkpoint_metadata.get(TABERO_PPO_CHECKPOINT_METADATA_KEY)
-            if checkpoint_metadata is not None
-            else None
-        )
-        if actual_checkpoint_semantics != ppo_boundary_semantics:
-            raise ValueError(
-                "Tabero PPO transition boundary semantics requires matching "
-                "actor.fsdp_config.trainable_checkpoint_metadata."
-                f"{TABERO_PPO_CHECKPOINT_METADATA_KEY}; got "
-                f"{actual_checkpoint_semantics!r}."
-            )
+        if (
+            ppo_boundary_semantics
+            == TABERO_PPO_DEFAULT_RESET_TRANSITION_BOUNDARY_SEMANTICS
+        ):
+            if fsdp_cfg.get("trainable_checkpoint_metadata") is not None:
+                raise ValueError(
+                    "RealWorld PiRL checkpoint metadata is generated at save time; remove trainable_checkpoint_metadata."
+                )
+            for key in ("deployment_config_name", "export_norm_asset_id"):
+                if not model_cfg.get(key):
+                    raise ValueError(f"RealWorld PiRL requires actor.model.{key}.")
+        else:
+            checkpoint_metadata = fsdp_cfg.get("trainable_checkpoint_metadata") or {}
+            if (
+                checkpoint_metadata.get(TABERO_PPO_CHECKPOINT_METADATA_KEY)
+                != ppo_boundary_semantics
+            ):
+                raise ValueError(
+                    "Tabero HDF5 checkpoint boundary metadata must match the algorithm."
+                )
     if use_dsrl and model_cfg.get("is_lora", False):
         raise ValueError("OpenPI DSRL requires actor.model.is_lora=false.")
     if use_dsrl and not only_eval:

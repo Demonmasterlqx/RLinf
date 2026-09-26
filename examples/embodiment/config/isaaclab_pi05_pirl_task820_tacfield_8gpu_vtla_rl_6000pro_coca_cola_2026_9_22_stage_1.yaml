@@ -37,7 +37,7 @@ runner:
   overlap_env_bootstrap: true
   weight_sync_interval: 1
 algorithm:
-  tabero_ppo_transition_boundary_semantics: terminal_observation_first_done_prefix_logprob_default_reset_gripper_map_v2
+  tabero_ppo_transition_boundary_semantics: realworld_terminal_prefix
   normalize_advantages: false
   kl_penalty: kl
   group_size: 1
@@ -59,8 +59,6 @@ algorithm:
   gamma: 0.99
   gae_lambda: 0.95
   filter_rewards: false
-  rewards_lower_bound: 0.1
-  rewards_upper_bound: 0.9
 env:
   group_name: EnvGroup
   train:
@@ -92,11 +90,6 @@ env:
         terminal_reward: 1.0
         force_bonus:
           enabled: false
-          coefficient: 20.0
-          epsilon: 1.0
-          max_bonus: 1.0
-          min_valid_samples: 4
-          contact_epsilon: 1.0
       target_object: target_object_2
       task_description: Pick up the Coca-Cola and put it into the basket
   eval:
@@ -127,11 +120,6 @@ env:
         terminal_reward: 1.0
         force_bonus:
           enabled: false
-          coefficient: 20.0
-          epsilon: 1.0
-          max_bonus: 1.0
-          min_valid_samples: 4
-          contact_epsilon: 1.0
       target_object: target_object_2
       task_description: Pick up the Coca-Cola and put it into the basket
 rollout:
@@ -151,6 +139,8 @@ actor:
   enable_offload: true
   combine_reference_model: true
   model:
+    deployment_config_name: pi05_lora_tacfield_realworld_replayed_task820_firm_mixed_no_state
+    export_norm_asset_id: pi05_horizon50_tacfield_task820_firm_mixed
     model_path: ${oc.env:ROOT}/models/VTLA-RL-sft-lora-xarm-no-adverb/global_step_30000/model
     model_type: openpi
     precision: null
@@ -236,50 +226,6 @@ actor:
     checkpoint_format: dcp
     save_full_model_weights: false
     save_trainable_model_weights: true
-    trainable_checkpoint_metadata:
-      method: pirl
-      task_domain: realworld
-      task_suite: gentle_grasp
-      task_id: 6
-      success_scene_task_id: 6
-      semantic_task_ids:
-      - 2
-      target_object: target_object_2
-      task_description: Pick up the Coca-Cola and put it into the basket
-      control_mode: hybrid_tactile
-      reset_source: task_config_default_reset
-      gripper_coordinate: xarm_positive_open
-      action_filter: disabled
-      gripper_mapping: xarm_unit_inverse_v1
-      policy_gripper_coordinate: unit_0_closed_1_open
-      sim_gripper_coordinate: meters_0_open_0045_close
-      gripper_travel_m: 0.045
-      camera_preprocess: stretch_480x640_to_224x224_inter_area
-      model_family: pi05
-      openpi_config_name: pi05_lora_tacfield_realworld_replayed_task820
-      dataset: datasets/realworld_replay_task820_firm_mixed
-      normalization_asset_id: pi05_horizon50_tacfield_task820_firm_mixed
-      action_horizon: 50
-      execution_horizon: 10
-      effective_action_dim: 13
-      state_dim: 7
-      camera_count: 2
-      tactile_input: tactile_prefix
-      reward_contract: binary_success_v1
-      force_reward_source: disabled
-      training_config: isaaclab_pi05_pirl_task820_tacfield_8gpu_vtla_rl_6000pro_coca_cola_2026_9_22_stage_1
-      target_global_step: 100
-      gradient_checkpointing: false
-      gradient_checkpointing_use_reentrant: false
-      tabero_ppo_transition_boundary_semantics: terminal_observation_first_done_prefix_logprob_default_reset_gripper_map_v2
-      tactile_prefix_dim_in: 7920
-      tactile_prefix_history: 8
-      combined_marker_count: 440
-      base_checkpoint_global_step: 30000
-      base_checkpoint_target_global_step: 30000
-      base_checkpoint_is_final: true
-      discrete_state_input: false
-      deployment_config_name: pi05_lora_tacfield_realworld_replayed_task820_firm_mixed_no_state
 reward:
   use_reward_model: false
 critic:

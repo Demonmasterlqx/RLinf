@@ -42,21 +42,3 @@ actor:
   fsdp_config:
     gradient_checkpointing: true
     gradient_checkpointing_use_reentrant: false
-    trainable_checkpoint_metadata:
-      training_config: isaaclab_pi05_pirl_realworld_tabero_tacimg_task6_step23000_uniform_randomization_shared_sim_smoke
-      target_global_step: 1
-      gradient_checkpointing: true
-      gradient_checkpointing_use_reentrant: false
-      randomization_profile: gentle_grasp_task6_uniform_randomization
-      randomization_reset_scope: full_environment
-      object_mass_ranges_kg:
-        target_object_1: [0.08, 0.12]
-        target_object_2: [0.16, 0.24]
-        target_object_3: [0.1224, 0.1836]
-        target_object_4: [0.16, 0.24]
-      object_static_friction_range: [0.5, 0.7]
-      object_dynamic_friction_range: [0.3, 0.5]
-      gripper_static_friction_range: [0.2, 0.4]
-      gripper_dynamic_friction_range: [0.1, 0.2]
-      light_intensity_range: [1600.0, 2400.0]
-      fill_light_intensity_range: [320.0, 480.0]

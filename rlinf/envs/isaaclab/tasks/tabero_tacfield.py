@@ -42,11 +42,8 @@ logger = logging.getLogger(__name__)
 
 _TERMINAL_RAW_OBSERVATION_KEY = "tabero_terminal_raw_observation"
 _TERMINAL_OBSERVATION_MASK_KEY = "tabero_terminal_observation_mask"
-_LEGACY_CHUNK_BOUNDARY_MODE = "legacy"
 _TERMINAL_SAFE_HDF5_MODE = "terminal_safe_hdf5_v1"
-_VALID_CHUNK_BOUNDARY_MODES = frozenset(
-    {_LEGACY_CHUNK_BOUNDARY_MODE, _TERMINAL_SAFE_HDF5_MODE}
-)
+_VALID_CHUNK_BOUNDARY_MODES = frozenset({_TERMINAL_SAFE_HDF5_MODE})
 _CHUNK_EPISODE_RECORDS_KEY = "_tabero_chunk_episode_records"
 _EPISODE_CONDITION_ID_KEY = "_tabero_condition_id"
 _EPISODE_SQUEEZE_PRED_MEAN_KEY = "_tabero_squeeze_pred_mean"
@@ -94,7 +91,7 @@ def validate_tabero_firm_prompts(
 
 
 def validate_tabero_chunk_boundary_mode(mode: Any) -> str:
-    """Validate the adapter boundary mode without silently selecting legacy."""
+    """Accept only the current terminal-safe HDF5 adapter."""
 
     normalized = str(mode)
     if normalized not in _VALID_CHUNK_BOUNDARY_MODES:
@@ -1458,7 +1455,7 @@ class IsaaclabTaberoTacFieldEnv(IsaaclabBaseEnv):
             _cfg_get(init_params, "hdf5_reset_assignment", "cyclic")
         )
         self._chunk_boundary_mode = validate_tabero_chunk_boundary_mode(
-            _cfg_get(init_params, "chunk_boundary_mode", _LEGACY_CHUNK_BOUNDARY_MODE)
+            _cfg_get(init_params, "chunk_boundary_mode", None)
         )
         if self._hdf5_initial_states_path is not None:
             hdf5_path = Path(str(self._hdf5_initial_states_path)).expanduser()
@@ -1471,10 +1468,7 @@ class IsaaclabTaberoTacFieldEnv(IsaaclabBaseEnv):
                     "Tabero hdf5_reset_assignment currently supports only 'cyclic'."
                 )
             self._hdf5_initial_states_path = str(hdf5_path)
-        if (
-            self._chunk_boundary_mode == _TERMINAL_SAFE_HDF5_MODE
-            and self._hdf5_initial_states_path is None
-        ):
+        if self._hdf5_initial_states_path is None:
             raise ValueError(
                 "Tabero terminal-safe HDF5 mode requires hdf5_initial_states_path."
             )
@@ -1645,9 +1639,7 @@ class IsaaclabTaberoTacFieldEnv(IsaaclabBaseEnv):
                     episode_names=episode_names,
                     shard_id=self._tabero_task_shard_id,
                     total_shards=self.total_num_processes,
-                    capture_terminal_observation=(
-                        self._chunk_boundary_mode == _TERMINAL_SAFE_HDF5_MODE
-                    ),
+                    capture_terminal_observation=True,
                 )
             return env, sim_app
 
@@ -1709,17 +1701,8 @@ class IsaaclabTaberoTacFieldEnv(IsaaclabBaseEnv):
         return obs, {}
 
     def step(self, actions=None, auto_reset=True):
-        if self._chunk_boundary_mode == _TERMINAL_SAFE_HDF5_MODE:
-            active_mask = torch.ones(
-                self.num_envs, device=self.device, dtype=torch.bool
-            )
-            return self._terminal_safe_step(actions, active_mask=active_mask)
-        if getattr(self, "_prompt_condition_ids", ()) and actions is not None:
-            actions_tensor = torch.as_tensor(actions, device=self.device)
-            squeeze = compute_tabero_predicted_squeeze(actions_tensor)
-            self._condition_squeeze_sum += squeeze.to(dtype=torch.float32)
-            self._condition_squeeze_count += 1
-        return super().step(actions=actions, auto_reset=auto_reset)
+        active_mask = torch.ones(self.num_envs, device=self.device, dtype=torch.bool)
+        return self._terminal_safe_step(actions, active_mask=active_mask)
 
     def _terminal_safe_step(
         self,
@@ -1869,8 +1852,6 @@ class IsaaclabTaberoTacFieldEnv(IsaaclabBaseEnv):
         return hold_actions
 
     def chunk_step(self, chunk_actions: torch.Tensor):
-        if self._chunk_boundary_mode != _TERMINAL_SAFE_HDF5_MODE:
-            return super().chunk_step(chunk_actions)
         if chunk_actions.ndim != 3 or chunk_actions.shape[-1] != 13:
             raise ValueError(
                 "Tabero terminal-safe chunk expects shape (N, chunk, 13); "

@@ -25,9 +25,9 @@ init_params:
   task_description: "pick up the Vitasoy and put it into the basket"
   reset_source: task_config_default_reset
 
-  extension_path: "/data/home/sim6g/code/tabero/Tabero_X/source/tac_manip"
-  realworld_config_dir: "/data/home/sim6g/code/tabero/Tabero_X/benchmarks/datasets/realworld/config"
-  realworld_assets_dir: "/data/home/sim6g/code/tabero/Tabero_X/benchmarks/datasets/realworld/USD"
+  extension_path: "${oc.env:ROOT}/Tabero_X/source/tac_manip"
+  realworld_config_dir: "${oc.env:ROOT}/Tabero_X/benchmarks/datasets/realworld/config"
+  realworld_assets_dir: "${oc.env:ROOT}/Tabero_X/benchmarks/datasets/realworld/USD"
   tactile_backend: taxim_fots
   chunk_boundary_mode: terminal_safe_v1
   # RLinf fixes model units to 0=closed, 1=open and converts to the XArm

@@ -14,9 +14,7 @@
 
 from __future__ import annotations
 
-import hashlib
 import importlib.util
-import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -29,7 +27,6 @@ from omegaconf import OmegaConf
 
 from rlinf.config import (
     _validate_tabero_realworld_action_filter_contract,
-    _validate_tabero_realworld_gripper_checkpoint_metadata,
     _validate_tabero_realworld_pi05_pirl_contract,
 )
 from rlinf.envs.isaaclab.isaaclab_env import IsaaclabBaseEnv
@@ -53,14 +50,10 @@ from rlinf.models.embodiment.openpi.openpi_action_model import (
 from rlinf.models.embodiment.openpi.policies.tabero_policy import (
     stretch_camera_image_to_224,
 )
-from rlinf.utils.tabero_ppo_boundary import (
-    validate_tabero_pi05_pirl_deployment_checkpoint,
-)
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 GENTLE_GRASP_CONFIG_DIR = REPO_ROOT / "Tabero_X/benchmarks/datasets/realworld/config"
 RLINF_CONFIG_DIR = REPO_ROOT / "RLinf/examples/embodiment/config"
-LOCAL_MODEL_PATH = REPO_ROOT / "models/pi05_realworld_replayed_task820_23000_lora"
 
 
 def _load_client_gripper_mapping_module():
@@ -92,10 +85,11 @@ def _make_torch_filter(num_envs: int) -> _RealWorldActionChunkFilter:
 def _action_filter_contract_cfg(train_cfg, eval_cfg):
     return OmegaConf.create(
         {
+            "runner": {"val_check_interval": 1},
             "env": {
                 "train": {"init_params": {"action_filter": train_cfg}},
                 "eval": {"init_params": {"action_filter": eval_cfg}},
-            }
+            },
         }
     )
 
@@ -552,9 +546,7 @@ def test_terminal_safe_step_maps_gripper_once_and_keeps_hold_state_in_model_unit
             seen_actions.append(actions.clone())
             raw_obs = {
                 "policy": {
-                    "eef_pose": torch.tensor(
-                        [[0.4, 0.0, 0.3, 1.0, 0.0, 0.0, 0.0]]
-                    ),
+                    "eef_pose": torch.tensor([[0.4, 0.0, 0.3, 1.0, 0.0, 0.0, 0.0]]),
                     "gripper_pos": actions[:, 6:7].clone(),
                 }
             }
@@ -611,29 +603,6 @@ def test_reset_skips_disabled_action_filter_for_full_and_selected_resets():
     assert torch.equal(reset_calls[1][1], selected)
 
 
-def test_fixed_gripper_config_disables_action_filter_by_default():
-    config_name = (
-        "isaaclab_pi05_pirl_realworld_tabero_tacimg_task6_step23000_"
-        "fixed_gripper_shared_sim_smoke"
-    )
-    with initialize_config_dir(version_base="1.1", config_dir=str(RLINF_CONFIG_DIR)):
-        cfg = compose(config_name=config_name)
-
-    for split_name in ("train", "eval"):
-        assert cfg.env[split_name].init_params.action_filter.enabled is False
-        assert list(cfg.env[split_name].init_params.action_filter.keys()) == ["enabled"]
-        assert "gripper_mapping" not in cfg.env[split_name].init_params
-    metadata = cfg.actor.fsdp_config.trainable_checkpoint_metadata
-    assert metadata.action_filter == "disabled"
-    assert metadata.gripper_mapping == "xarm_unit_inverse_v1"
-    assert metadata.policy_gripper_coordinate == "unit_0_closed_1_open"
-    assert metadata.sim_gripper_coordinate == "meters_0_open_0045_close"
-    assert metadata.gripper_travel_m == pytest.approx(0.045)
-    assert (
-        _validate_tabero_realworld_action_filter_contract(cfg, metadata) == "disabled"
-    )
-
-
 def test_action_filter_contract_keeps_explicit_enable_as_opt_in():
     cfg = _action_filter_contract_cfg(
         _enabled_action_filter_cfg(),
@@ -642,72 +611,9 @@ def test_action_filter_contract_keeps_explicit_enable_as_opt_in():
     assert (
         _validate_tabero_realworld_action_filter_contract(
             cfg,
-            {"action_filter": "xarm_sim_action_chunk_filter_v1"},
         )
         == "xarm_sim_action_chunk_filter_v1"
     )
-
-
-def test_fixed_gripper_checkpoint_metadata_rejects_drift():
-    metadata = {
-        "gripper_mapping": "xarm_unit_inverse_v1",
-        "policy_gripper_coordinate": "unit_0_closed_1_open",
-        "sim_gripper_coordinate": "meters_0_open_0045_close",
-        "gripper_travel_m": 0.045,
-    }
-    assert _validate_tabero_realworld_gripper_checkpoint_metadata(metadata) == {
-        "gripper_mapping": "xarm_unit_inverse_v1",
-        "policy_gripper_coordinate": "unit_0_closed_1_open",
-        "sim_gripper_coordinate": "meters_0_open_0045_close",
-        "gripper_travel_m": 0.045,
-    }
-
-    drifted_metadata = dict(metadata)
-    drifted_metadata["gripper_mapping"] = "legacy_direct"
-    with pytest.raises(ValueError, match="gripper_mapping='xarm_unit_inverse_v1'"):
-        _validate_tabero_realworld_gripper_checkpoint_metadata(drifted_metadata)
-
-
-def test_fixed_gripper_shared_sim_smoke_contract(monkeypatch):
-    config_name = (
-        "isaaclab_pi05_pirl_realworld_tabero_tacimg_task6_"
-        "step23000_fixed_gripper_shared_sim_smoke"
-    )
-    monkeypatch.setenv("REALWORLD_TABERO_TACIMG_PIRL_RUN_ID", "unit_test")
-    with initialize_config_dir(version_base="1.1", config_dir=str(RLINF_CONFIG_DIR)):
-        cfg = compose(config_name=config_name)
-
-    assert cfg.actor.fsdp_config.gradient_checkpointing is True
-    assert cfg.actor.fsdp_config.gradient_checkpointing_use_reentrant is False
-    assert cfg.cluster.component_placement.actor.placement == 0
-    assert cfg.cluster.component_placement.rollout.placement == 2
-    assert cfg.cluster.component_placement.env.placement == 3
-    assert cfg.env.train.total_num_envs == 1
-    assert cfg.env.train.max_steps_per_rollout_epoch == 300
-    assert cfg.env.train.max_episode_steps == 300
-    assert cfg.runner.max_epochs == 1
-    assert cfg.runner.max_steps == 1
-    assert cfg.env.train.video_cfg.save_video is True
-    assert cfg.env.eval.video_cfg.save_video is True
-    assert list(cfg.env.train.video_cfg.image_names) == ["agentview", "eye_in_hand"]
-    assert cfg.env.train.video_cfg.composite_name == "combined"
-    assert cfg.actor.model.model_path == str(LOCAL_MODEL_PATH)
-    assert cfg.rollout.model.model_path == str(LOCAL_MODEL_PATH)
-    metadata = cfg.actor.fsdp_config.trainable_checkpoint_metadata
-    assert metadata.gripper_mapping == "xarm_unit_inverse_v1"
-    assert metadata.gradient_checkpointing is True
-    assert metadata.gradient_checkpointing_use_reentrant is False
-    assert (
-        _validate_tabero_realworld_gripper_checkpoint_metadata(metadata)[
-            "gripper_mapping"
-        ]
-        == "xarm_unit_inverse_v1"
-    )
-    assert cfg.actor.model.openpi.action_horizon == 50
-    assert cfg.actor.model.openpi.action_chunk == 10
-    assert cfg.actor.model.openpi.num_images_in_input == 3
-    assert cfg.env.train.init_params.tactile_image_history_len == 8
-    _validate_tabero_realworld_pi05_pirl_contract(cfg, cfg.actor.model)
 
 
 def test_openpi_gradient_checkpointing_bridge_is_non_reentrant(monkeypatch):
@@ -736,46 +642,129 @@ def test_openpi_gradient_checkpointing_bridge_is_non_reentrant(monkeypatch):
         )
 
 
-def test_action_filter_contract_rejects_state_and_metadata_drift():
-    disabled_cfg = _action_filter_contract_cfg(
-        {"enabled": False},
-        {"enabled": False},
-    )
-    with pytest.raises(ValueError, match="metadata.action_filter='disabled'"):
-        _validate_tabero_realworld_action_filter_contract(
-            disabled_cfg,
-            {"action_filter": "xarm_sim_action_chunk_filter_v1"},
-        )
-
-    mismatched_cfg = _action_filter_contract_cfg(
-        {"enabled": False},
-        _enabled_action_filter_cfg(),
-    )
+def test_action_filter_contract_validates_active_splits_only():
+    cfg = _action_filter_contract_cfg({"enabled": False}, {"enabled": True})
     with pytest.raises(ValueError, match="same action_filter.enabled state"):
-        _validate_tabero_realworld_action_filter_contract(
-            mismatched_cfg,
-            {"action_filter": "disabled"},
-        )
+        _validate_tabero_realworld_action_filter_contract(cfg)
+    cfg.runner.val_check_interval = -1
+    assert _validate_tabero_realworld_action_filter_contract(cfg) == "disabled"
+    del cfg.env.eval
+    assert _validate_tabero_realworld_action_filter_contract(cfg) == "disabled"
 
-    non_boolean_cfg = _action_filter_contract_cfg(
-        {"enabled": "false"},
-        {"enabled": False},
-    )
-    with pytest.raises(ValueError, match="enabled to be boolean"):
-        _validate_tabero_realworld_action_filter_contract(
-            non_boolean_cfg,
-            {"action_filter": "disabled"},
-        )
 
-    missing_parameter_cfg = _action_filter_contract_cfg(
-        {"enabled": True},
-        {"enabled": True},
+def test_action_filter_contract_rejects_non_boolean_enablement():
+    cfg = _action_filter_contract_cfg({"enabled": "false"}, {"enabled": False})
+    with pytest.raises(ValueError, match="enabled must be boolean"):
+        _validate_tabero_realworld_action_filter_contract(cfg)
+
+
+def test_action_filter_tuning_is_not_locked_to_an_experiment():
+    tuning = _enabled_action_filter_cfg()
+    tuning.update(transition_steps=5, max_position_step_m=0.012)
+    cfg = _action_filter_contract_cfg(tuning, tuning)
+    assert (
+        _validate_tabero_realworld_action_filter_contract(cfg)
+        == "xarm_sim_action_chunk_filter_v1"
     )
-    with pytest.raises(ValueError, match="enabled action filter requires"):
-        _validate_tabero_realworld_action_filter_contract(
-            missing_parameter_cfg,
-            {"action_filter": "xarm_sim_action_chunk_filter_v1"},
-        )
+
+
+def test_pirl_interface_validation_does_not_read_initialization_artifacts(monkeypatch):
+    # Synthetic interface values, intentionally no local checkpoint or dataset.
+    model = {
+        "num_action_chunks": 10,
+        "action_dim": 13,
+        "is_lora": True,
+        "lora_target": "action_expert",
+        "freeze_non_lora": True,
+        "lora_path": None,
+        "use_proprio": True,
+        "add_value_head": True,
+        "checkpoint_load_allowed_missing_prefixes": ["value_head."],
+        "model_path": "/synthetic/base",
+        "openpi_data": {"norm_stats_path": "/synthetic/stats"},
+        "tabero_pi05_checkpoint_contract": {"expected_model_sha256": "obsolete"},
+        "openpi": {
+            "config_name": "pi05_lora_tacfield_tabero_xarm_gripper",
+            "pi05": True,
+            "discrete_state_input": False,
+            "train_expert_only": True,
+            "action_chunk": 10,
+            "action_horizon": 30,
+            "action_env_dim": 13,
+            "effective_action_dim": 13,
+            "tactile_type": "expert_his_c_fut",
+            "tactile_dim": 6,
+            "tactile_dim_in": 0,
+            "add_value_head": True,
+            "joint_logprob": False,
+            "value_after_vlm": True,
+            "detach_critic_input": True,
+            "use_dsrl": False,
+            "num_images_in_input": 2,
+            "tactile_prefix_dim_in": 7920,
+            "tactile_prefix_history": 8,
+            "tactile_prefix_encoder_type": "tcn",
+            "tactile_prefix_use_reference_frame": True,
+            "tactile_prefix_diff_from_reference": False,
+            "tactile_streams": ["tactile_prefix"],
+        },
+    }
+    cfg = OmegaConf.create(
+        {
+            "runner": {"val_check_interval": -1},
+            "actor": {"model": model},
+            "rollout": {"model": {"model_path": "/synthetic/base"}},
+            "env": {
+                "train": {
+                    "max_episode_steps": 200,
+                    "init_params": {
+                        "id": "Isaac-RealWorld-GentleGrasp-XarmUmi-Hybrid-Tactile-v0",
+                        "target_object": "target_object_2",
+                        "task_description": "Pick up the Coca-Cola and put it into the basket",
+                        "reset_source": "task_config_default_reset",
+                        "task_suite": "gentle_grasp",
+                        "task_id": 6,
+                        "tactile_backend": "taxim_fots",
+                        "chunk_boundary_mode": "terminal_safe_v1",
+                        "marker_history_len": 8,
+                        "combined_marker_count": 440,
+                        "success": {
+                            "required_consecutive_steps": 4,
+                            "terminal_reward": 2.0,
+                        },
+                    },
+                }
+            },
+        }
+    )
+
+    def forbid_artifact_read(*args, **kwargs):
+        pytest.fail("Preflight must not read initialization artifacts")
+
+    monkeypatch.setattr(Path, "open", forbid_artifact_read)
+    _validate_tabero_realworld_pi05_pirl_contract(cfg, cfg.actor.model)
+    cfg.actor.model.action_dim = 12
+    with pytest.raises(ValueError, match="action_dim=13"):
+        _validate_tabero_realworld_pi05_pirl_contract(cfg, cfg.actor.model)
+
+
+def test_extension_directory_can_be_renamed(tmp_path):
+    from rlinf.envs.isaaclab.tasks.realworld_tabero_tacfield import (
+        _validate_extension_import,
+        _validate_extension_path,
+    )
+
+    extension = tmp_path / "custom_checkout"
+    package = extension / "tac_manip"
+    package.mkdir(parents=True)
+    module = package / "__init__.py"
+    module.touch()
+    _validate_extension_path(extension)
+    _validate_extension_import(module, extension)
+    with pytest.raises(RuntimeError, match="wrong checkout"):
+        _validate_extension_import(tmp_path / "__init__.py", extension)
+    with pytest.raises(ValueError, match="contain the tac_manip package"):
+        _validate_extension_path(tmp_path)
 
 
 def test_realworld_direct_force_reward_uses_contact_only_mean():
@@ -840,171 +829,3 @@ def test_realworld_direct_force_reward_uses_contact_only_mean():
     torch.testing.assert_close(reward_term.trajectory_mean_force, torch.tensor([3.0]))
     torch.testing.assert_close(reward_term.current_force_bonus, torch.tensor([0.1]))
     assert rewards[-1].item() == pytest.approx(1.1 / 0.05)
-
-
-def _write_checkpoint_contract_fixture(checkpoint_dir: Path) -> tuple[str, str]:
-    model_file = checkpoint_dir / "model.safetensors"
-    model_file.write_bytes(b"small model fixture")
-    model_sha = hashlib.sha256(model_file.read_bytes()).hexdigest()
-    config_name = "pi05_lora_tacfield_tabero_xarm_gripper"
-    dataset = "datas/replay_firm_tabero_xarm_gripper"
-    asset_id = "replay_firm_tabero_xarm_gripper"
-    source_metadata = {
-        "dataset": dataset,
-        "model_family": "pi05",
-        "openpi_config_name": config_name,
-        "deployment_config_name": config_name,
-        "action_horizon": 10,
-        "effective_action_dim": 13,
-        "tactile_prefix_dim_in": 7920,
-        "tactile_prefix_history": 8,
-        "gripper_coordinate": "xarm_positive_open",
-    }
-    export_meta = {
-        "format": "t2vla_openpi_pytorch_merged_lora",
-        "method": "sft_full_lora_tacfield",
-        "dataset": dataset,
-        "model_sha256": model_sha,
-        "source_ckpt_metadata": source_metadata,
-        "is_final": False,
-        "global_step": 10000,
-        "target_global_step": 20000,
-    }
-    (checkpoint_dir / "export_meta.json").write_text(json.dumps(export_meta))
-    model_config = {
-        "action_dim": 32,
-        "action_horizon": 10,
-        "pi05": True,
-        "discrete_state_input": True,
-        "config_name": config_name,
-        "num_images_in_input": 2,
-        "action_chunk": 10,
-        "action_env_dim": 13,
-        "num_steps": 10,
-        "tactile_type": "expert_his_c_fut",
-        "tactile_dim": 6,
-        "tactile_dim_in": 0,
-        "effective_action_dim": 13,
-        "tactile_prefix_dim_in": 7920,
-        "tactile_prefix_history": 8,
-        "tactile_prefix_encoder_type": "tcn",
-        "tactile_prefix_use_reference_frame": True,
-        "tactile_prefix_diff_from_reference": False,
-        "tactile_streams": ["tactile_prefix"],
-    }
-    (checkpoint_dir / "config.json").write_text(json.dumps(model_config))
-    norm_dir = checkpoint_dir / asset_id
-    norm_dir.mkdir()
-    norm_stats = {
-        "norm_stats": {
-            name: {
-                statistic: [0.0] * dim for statistic in ("mean", "std", "q01", "q99")
-            }
-            for name, dim in {"state": 7, "actions": 13, "tactile_prefix": 880}.items()
-        }
-    }
-    norm_file = norm_dir / "norm_stats.json"
-    norm_file.write_text(json.dumps(norm_stats))
-    norm_sha = hashlib.sha256(norm_file.read_bytes()).hexdigest()
-    return model_sha, norm_sha
-
-
-def test_checkpoint_contract_is_parameterized_for_xarm_asset(tmp_path: Path):
-    model_sha, norm_sha = _write_checkpoint_contract_fixture(tmp_path)
-    result = validate_tabero_pi05_pirl_deployment_checkpoint(
-        tmp_path,
-        expected_model_sha256=model_sha,
-        expected_norm_stats_sha256=norm_sha,
-        expected_config_name="pi05_lora_tacfield_tabero_xarm_gripper",
-        expected_norm_asset_id="replay_firm_tabero_xarm_gripper",
-        expected_dataset="datas/replay_firm_tabero_xarm_gripper",
-        expected_gripper_coordinate="xarm_positive_open",
-        require_final=False,
-    )
-    assert result["global_step"] == 10000
-    assert result["norm_asset_id"] == "replay_firm_tabero_xarm_gripper"
-
-
-def test_checkpoint_contract_accepts_tacimg_horizon50_export(tmp_path: Path):
-    model_file = tmp_path / "model.safetensors"
-    model_file.write_bytes(b"small tacimg model fixture")
-    model_sha = hashlib.sha256(model_file.read_bytes()).hexdigest()
-    config_name = "pi05_lora_tacimg_realworld_replayed_task820_force"
-    dataset = "datas/realworld_replayed_task820_firm"
-    asset_id = "pi05_horizon50_tacimg_task820_firm"
-    source_metadata = {
-        "dataset": dataset,
-        "model_family": "pi05",
-        "openpi_config_name": config_name,
-        "deployment_config_name": config_name,
-        "action_horizon": 50,
-        "execution_steps": 10,
-        "effective_action_dim": 13,
-        "tactile_input": "tactile_image",
-        "num_images_in_input": 3,
-        "excluded_tactile_inputs": [
-            "tactile_gripper_force",
-            "tactile_marker_motion",
-        ],
-        "gripper_coordinate": "xarm_positive_open",
-    }
-    export_meta = {
-        "format": "t2vla_openpi_pytorch_merged_lora",
-        "method": "sft_full_lora_tacimg",
-        "dataset": dataset,
-        "model_sha256": model_sha,
-        "source_ckpt_metadata": source_metadata,
-        "is_final": False,
-        "global_step": 23000,
-        "target_global_step": 30000,
-    }
-    (tmp_path / "export_meta.json").write_text(json.dumps(export_meta))
-    model_config = {
-        "action_dim": 32,
-        "action_horizon": 50,
-        "pi05": True,
-        "discrete_state_input": True,
-        "config_name": config_name,
-        "num_images_in_input": 3,
-        "action_chunk": 50,
-        "action_env_dim": 13,
-        "num_steps": 10,
-        "tactile_type": "expert_his_c_fut",
-        "tactile_dim": 6,
-        "tactile_dim_in": 0,
-        "effective_action_dim": 13,
-        "tactile_prefix_dim_in": None,
-        "tactile_prefix_history": None,
-        "tactile_prefix_encoder_type": None,
-        "tactile_prefix_use_reference_frame": None,
-        "tactile_prefix_diff_from_reference": None,
-        "tactile_streams": [],
-    }
-    (tmp_path / "config.json").write_text(json.dumps(model_config))
-    norm_dir = tmp_path / asset_id
-    norm_dir.mkdir()
-    norm_stats = {
-        "norm_stats": {
-            name: {
-                statistic: [0.0] * dim for statistic in ("mean", "std", "q01", "q99")
-            }
-            for name, dim in {"state": 7, "actions": 13}.items()
-        }
-    }
-    norm_file = norm_dir / "norm_stats.json"
-    norm_file.write_text(json.dumps(norm_stats))
-    norm_sha = hashlib.sha256(norm_file.read_bytes()).hexdigest()
-
-    result = validate_tabero_pi05_pirl_deployment_checkpoint(
-        tmp_path,
-        expected_model_sha256=model_sha,
-        expected_norm_stats_sha256=norm_sha,
-        expected_config_name=config_name,
-        expected_norm_asset_id=asset_id,
-        expected_dataset=dataset,
-        expected_gripper_coordinate="xarm_positive_open",
-        require_final=False,
-    )
-
-    assert result["global_step"] == 23000
-    assert result["tactile_input"] == "tactile_image"

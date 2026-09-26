@@ -208,7 +208,8 @@ def test_terminal_safe_firm_prompt_validator_rejects_condition_pollution():
 
 
 def test_chunk_boundary_mode_rejects_unknown_values_without_legacy_fallback():
-    assert validate_tabero_chunk_boundary_mode("legacy") == "legacy"
+    with pytest.raises(ValueError, match="Unsupported Tabero chunk_boundary_mode"):
+        validate_tabero_chunk_boundary_mode("legacy")
     assert (
         validate_tabero_chunk_boundary_mode("terminal_safe_hdf5_v1")
         == "terminal_safe_hdf5_v1"

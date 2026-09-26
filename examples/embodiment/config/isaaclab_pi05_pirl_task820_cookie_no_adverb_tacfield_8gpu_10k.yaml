@@ -6,7 +6,7 @@ defaults:
 
 runner:
   logger:
-    log_path: /data/home/chenxiangyu/Tabero/results/2026-09-08_18-08-35-task820-cookie-no_adverb-pirl_action_expert_lora-8gpu-10k
+    log_path: ${oc.env:ROOT}/results/2026-09-08_18-08-35-task820-cookie-no_adverb-pirl_action_expert_lora-8gpu-10k
     experiment_name: 2026-09-08_18-08-35-task820-cookie-no_adverb-pirl_action_expert_lora-8gpu-10k
   max_epochs: 10000
   max_steps: 10000
@@ -17,26 +17,20 @@ runner:
 env:
   train:
     init_params:
-      realworld_config_dir: /data/home/chenxiangyu/Tabero/Tabero_X/benchmarks/datasets/realworld/config/pos_random_config
+      realworld_config_dir: ${oc.env:ROOT}/Tabero_X/benchmarks/datasets/realworld/config/pos_random_config
       target_object: target_object_3
       task_description: pick up the cookie and put it into the basket
   eval:
     init_params:
-      realworld_config_dir: /data/home/chenxiangyu/Tabero/Tabero_X/benchmarks/datasets/realworld/config/pos_random_config
+      realworld_config_dir: ${oc.env:ROOT}/Tabero_X/benchmarks/datasets/realworld/config/pos_random_config
       target_object: target_object_3
       task_description: pick up the cookie and put it into the basket
 
 rollout:
   model:
-    model_path: /data/home/chenxiangyu/Tabero/models/pi05_realworld_replay_task820_firm_mixed_tacfield_sft_step18000
+    model_path: ${oc.env:ROOT}/models/pi05_realworld_replay_task820_firm_mixed_tacfield_sft_step18000
 
 actor:
   model:
-    model_path: /data/home/chenxiangyu/Tabero/models/pi05_realworld_replay_task820_firm_mixed_tacfield_sft_step18000
-  fsdp_config:
-    trainable_checkpoint_metadata:
-      semantic_task_ids: [4]
-      target_object: target_object_3
-      task_description: pick up the cookie and put it into the basket
-      training_config: isaaclab_pi05_pirl_task820_cookie_no_adverb_tacfield_8gpu_10k
-      target_global_step: 10000
+    model_path: ${oc.env:ROOT}/models/pi05_realworld_replay_task820_firm_mixed_tacfield_sft_step18000
+  fsdp_config: {}

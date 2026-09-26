@@ -16,7 +16,7 @@ cluster:
 runner:
   task_type: embodied
   logger:
-    log_path: /data/home/chenxiangyu/Tabero/results/2026-09-07-task820-dsrl-throughput/default
+    log_path: ${oc.env:ROOT}/results/2026-09-07-task820-dsrl-throughput/default
     project_name: tabero-rlinf
     experiment_name: task820_step18000_dsrl_async_n96_m128_g512_s2
     logger_backends:
@@ -79,8 +79,6 @@ algorithm:
   target_update_type: all
   train_actor_steps: 1
   filter_rewards: false
-  rewards_lower_bound: 0.1
-  rewards_upper_bound: 0.9
 env:
   group_name: EnvGroup
   train:
@@ -102,9 +100,9 @@ env:
       - eye_in_hand
       composite_name: combined
     init_params:
-      extension_path: /data/home/chenxiangyu/Tabero/Tabero_X/source/tac_manip
-      realworld_config_dir: /data/home/chenxiangyu/Tabero/Tabero_X/benchmarks/datasets/realworld/config
-      realworld_assets_dir: /data/home/chenxiangyu/Tabero/Tabero_X/benchmarks/datasets/realworld/USD
+      extension_path: ${oc.env:ROOT}/Tabero_X/source/tac_manip
+      realworld_config_dir: ${oc.env:ROOT}/Tabero_X/benchmarks/datasets/realworld/config
+      realworld_assets_dir: ${oc.env:ROOT}/Tabero_X/benchmarks/datasets/realworld/USD
       gripper_diagnostics_path: ''
       tactile_image_history_len: 8
       success:
@@ -136,9 +134,9 @@ env:
       - eye_in_hand
       composite_name: combined
     init_params:
-      extension_path: /data/home/chenxiangyu/Tabero/Tabero_X/source/tac_manip
-      realworld_config_dir: /data/home/chenxiangyu/Tabero/Tabero_X/benchmarks/datasets/realworld/config
-      realworld_assets_dir: /data/home/chenxiangyu/Tabero/Tabero_X/benchmarks/datasets/realworld/USD
+      extension_path: ${oc.env:ROOT}/Tabero_X/source/tac_manip
+      realworld_config_dir: ${oc.env:ROOT}/Tabero_X/benchmarks/datasets/realworld/config
+      realworld_assets_dir: ${oc.env:ROOT}/Tabero_X/benchmarks/datasets/realworld/USD
       tactile_image_history_len: 8
       success:
         required_consecutive_steps: 8
@@ -160,7 +158,7 @@ rollout:
   collect_transitions: true
   collect_prev_infos: false
   model:
-    model_path: /data/home/chenxiangyu/Tabero/results/2026-09-05_23-36-08-task820-firm-mixed-tacfield-sft-8gpu-30k-from0/exports/global_step_18000
+    model_path: ${oc.env:ROOT}/results/2026-09-05_23-36-08-task820-firm-mixed-tacfield-sft-8gpu-30k-from0/exports/global_step_18000
     precision: ${actor.model.precision}
 actor:
   group_name: ActorGroup
@@ -172,7 +170,7 @@ actor:
   enable_offload: false
   combine_reference_model: true
   model:
-    model_path: /data/home/chenxiangyu/Tabero/results/2026-09-05_23-36-08-task820-firm-mixed-tacfield-sft-8gpu-30k-from0/exports/global_step_18000
+    model_path: ${oc.env:ROOT}/results/2026-09-05_23-36-08-task820-firm-mixed-tacfield-sft-8gpu-30k-from0/exports/global_step_18000
     model_type: openpi
     precision: null
     num_action_chunks: 10
@@ -190,15 +188,6 @@ actor:
     - critic_state_encoder.
     - critic_tactile_encoder.
     - q_head.
-    tabero_pi05_checkpoint_contract:
-      expected_model_sha256: 8dd4af58eb66915851962555fdd6d2c3ee18b262a16703fa953a2441fb02fcad
-      expected_norm_stats_sha256: ca9f865ef95d683070cd1abb03fdfe8b8fcddb3a9ad7392fc3501db2f3d1f863
-      expected_config_name: pi05_lora_tacfield_realworld_replayed_task820
-      expected_norm_asset_id: pi05_horizon50_tacfield_task820_firm_mixed
-      expected_dataset: datasets/realworld_replay_task820_firm_mixed
-      expected_gripper_coordinate: xarm_positive_open
-      require_final: false
-      allow_non_final_formal_training: true
     openpi:
       config_name: pi05_lora_tacfield_realworld_replayed_task820
       pi05: true

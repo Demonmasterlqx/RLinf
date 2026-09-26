@@ -16,10 +16,12 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.nn as nn
 from omegaconf import OmegaConf
 
+from rlinf.config import _validate_tabero_realworld_pi05_dsrl_contract
 from rlinf.data.dsrl_replay_buffer import CompactDSRLReplayBuffer
 from rlinf.data.embodied_io_struct import Trajectory
 from rlinf.models.embodiment.openpi.openpi_action_model import (
@@ -34,11 +36,13 @@ from rlinf.utils.dsrl_observation import (
     REALWORLD_TACIMG_DSRL_OBSERVATION_SEMANTICS,
 )
 from rlinf.utils.dsrl_replay import (
+    DSRL_REPLAY_BACKEND,
     REALWORLD_TACIMG_DSRL_REPLAY_SEMANTICS,
     compact_tabero_dsrl_observation,
     dsrl_replay_bytes_per_transition,
     validate_compact_dsrl_observation,
 )
+from rlinf.utils.dsrl_reward import DSRL_REWARD_SEMANTICS
 from rlinf.utils.dsrl_rollout_sync import (
     REALWORLD_TACIMG_DSRL_ROLLOUT_SYNC_PREFIXES,
     select_named_parameters_by_prefix,
@@ -46,6 +50,7 @@ from rlinf.utils.dsrl_rollout_sync import (
     validate_dsrl_rollout_sync_config,
 )
 from rlinf.utils.dsrl_transition import (
+    REALWORLD_TACIMG_DSRL_CHUNK_BOUNDARY_MODE,
     REALWORLD_TACIMG_DSRL_TRANSITION_BOUNDARY_SEMANTICS,
 )
 
@@ -211,3 +216,114 @@ def test_realworld_tacimg_dsrl_rollout_sync_requires_three_image_prefixes():
     assert validate_dsrl_rollout_sync_config(actor_cfg) == (
         REALWORLD_TACIMG_DSRL_ROLLOUT_SYNC_PREFIXES
     )
+
+
+def test_dsrl_preflight_accepts_tuning_without_checkpoint_audit():
+    model = {
+        "num_action_chunks": 10,
+        "action_dim": 13,
+        "is_lora": False,
+        "use_proprio": True,
+        "add_value_head": False,
+        "add_q_head": True,
+        "q_head_type": "default",
+        "num_q_heads": 4,
+        "num_steps": 5,
+        "model_path": "/synthetic/base",
+        "checkpoint_load_allowed_missing_prefixes": [
+            "dsrl_action_noise_net.",
+            "actor_image_encoder.",
+            "actor_state_encoder.",
+            "critic_image_encoder.",
+            "critic_state_encoder.",
+            "q_head.",
+        ],
+        "openpi_data": {"norm_stats_path": "/synthetic/stats"},
+        "openpi": {
+            "config_name": "pi05_lora_tacimg_realworld_replayed_task820_force",
+            "pi05": True,
+            "action_horizon": 50,
+            "discrete_state_input": False,
+            "num_images_in_input": 3,
+            "action_chunk": 10,
+            "train_expert_only": True,
+            "action_env_dim": 13,
+            "effective_action_dim": 13,
+            "add_value_head": False,
+            "joint_logprob": False,
+            "detach_critic_input": True,
+            "tactile_type": "expert_his_c_fut",
+            "tactile_dim": 6,
+            "tactile_dim_in": 0,
+            "use_dsrl": True,
+            "dsrl_use_tactile": False,
+            "dsrl_num_images": 3,
+            "dsrl_state_dim": 7,
+            "dsrl_action_noise_dim": 32,
+            "dsrl_num_q_heads": 4,
+            "dsrl_hidden_dims": [64, 64],
+            "num_steps": 5,
+        },
+    }
+    cfg = OmegaConf.create(
+        {
+            "runner": {"val_check_interval": -1},
+            "algorithm": {
+                "adv_type": "embodied_sac",
+                "loss_type": "embodied_sac",
+                "reward_type": "chunk_level",
+                "logprob_type": "chunk_level",
+                "dsrl_reward_semantics": DSRL_REWARD_SEMANTICS,
+                "dsrl_observation_semantics": REALWORLD_TACIMG_DSRL_OBSERVATION_SEMANTICS,
+                "dsrl_replay_semantics": REALWORLD_TACIMG_DSRL_REPLAY_SEMANTICS,
+                "dsrl_transition_boundary_semantics": REALWORLD_TACIMG_DSRL_TRANSITION_BOUNDARY_SEMANTICS,
+                "replay_buffer": {
+                    "backend": DSRL_REPLAY_BACKEND,
+                    "capacity_transitions": 128,
+                },
+            },
+            "actor": {
+                "model": model,
+                "global_batch_size": 4,
+                "fsdp_config": {
+                    "sharding_strategy": "no_shard",
+                    "gradient_checkpointing": True,
+                    "use_orig_params": True,
+                    "checkpoint_format": "local_shard",
+                    "save_full_model_weights": False,
+                    "save_trainable_model_weights": True,
+                },
+            },
+            "rollout": {
+                "collect_transitions": True,
+                "model": {"model_path": "/synthetic/base"},
+            },
+            "env": {
+                "train": {
+                    "auto_reset": False,
+                    "ignore_terminations": False,
+                    "total_num_envs": 2,
+                    "rollout_epoch": 1,
+                    "max_episode_steps": 200,
+                    "init_params": {
+                        "id": "Isaac-RealWorld-GentleGrasp-XarmUmi-Hybrid-Tactile-v0",
+                        "target_object": "target_object_3",
+                        "task_description": "pick up the cookie and put it into the basket",
+                        "reset_source": "task_config_default_reset",
+                        "task_suite": "gentle_grasp",
+                        "task_id": 6,
+                        "tactile_backend": "taxim_fots",
+                        "chunk_boundary_mode": REALWORLD_TACIMG_DSRL_CHUNK_BOUNDARY_MODE,
+                        "marker_history_len": 8,
+                        "combined_marker_count": 440,
+                        "tactile_image_history_len": 8,
+                        "success": {"force_bonus": {"enabled": False}},
+                    },
+                }
+            },
+        }
+    )
+    _validate_tabero_realworld_pi05_dsrl_contract(cfg, cfg.actor.model)
+    cfg.env.train.auto_reset = True
+    with pytest.raises(ValueError, match="auto_reset=false"):
+        _validate_tabero_realworld_pi05_dsrl_contract(cfg, cfg.actor.model)

@@ -380,11 +380,10 @@ def _required_directory(init_params: Any, name: str) -> Path:
 
 
 def _validate_extension_path(extension_path: Path) -> None:
-    expected_suffix = ("Tabero_X", "source", "tac_manip")
-    if tuple(extension_path.parts[-3:]) != expected_suffix:
+    if not (extension_path / "tac_manip" / "__init__.py").is_file():
         raise ValueError(
-            "RealWorld extension_path must end in "
-            f"{'/'.join(expected_suffix)}; got {extension_path}."
+            "RealWorld extension_path must contain the tac_manip package; "
+            f"got {extension_path}."
         )
 
 

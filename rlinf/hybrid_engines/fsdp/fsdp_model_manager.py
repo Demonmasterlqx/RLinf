@@ -592,6 +592,22 @@ class FSDPModelManager:
             configured_metadata = self._cfg.fsdp_config.get(
                 "trainable_checkpoint_metadata", None
             )
+            full_cfg = getattr(self, "cfg", None)
+            if full_cfg is not None:
+                from rlinf.utils.tabero_ppo_boundary import (
+                    TABERO_PPO_DEFAULT_RESET_TRANSITION_BOUNDARY_SEMANTICS,
+                    build_realworld_pirl_checkpoint_metadata,
+                )
+
+                if (
+                    OmegaConf.select(
+                        full_cfg, "algorithm.tabero_ppo_transition_boundary_semantics"
+                    )
+                    == TABERO_PPO_DEFAULT_RESET_TRANSITION_BOUNDARY_SEMANTICS
+                ):
+                    configured_metadata = build_realworld_pirl_checkpoint_metadata(
+                        full_cfg
+                    )
             if configured_metadata is not None:
                 if isinstance(configured_metadata, DictConfig):
                     configured_metadata = OmegaConf.to_container(
