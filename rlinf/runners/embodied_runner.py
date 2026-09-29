@@ -20,6 +20,7 @@ import time
 from collections import defaultdict
 from typing import TYPE_CHECKING, Union
 
+import torch
 from omegaconf.dictconfig import DictConfig
 
 from rlinf.scheduler import Channel
@@ -33,6 +34,14 @@ from rlinf.utils.metric_utils import (
     compute_evaluate_metrics,
     print_metrics_table,
 )
+from rlinf.utils.ppo_multi_task import (
+    COUNT_KEY,
+    SuccessWeightController,
+    manifest,
+    options,
+    task_list,
+)
+from rlinf.utils.ppo_multi_task import enabled as multi_task_enabled
 from rlinf.utils.runner_utils import check_progress
 from rlinf.utils.timers import Timer
 
@@ -70,6 +79,17 @@ class EmbodiedRunner:
         critic=None,
     ):
         self.cfg = cfg
+        self.multi_task_controller = None
+        if multi_task_enabled(cfg):
+            if type(self) is not EmbodiedRunner:
+                raise ValueError(
+                    "PPO multi_task only supports the synchronous EmbodiedRunner."
+                )
+            self.multi_task_controller = SuccessWeightController(
+                [task["name"] for task in task_list(cfg.env.train)],
+                options(cfg),
+                manifest(cfg),
+            )
         self.actor = actor
         self.rollout = rollout
         self.env = env
@@ -171,6 +191,20 @@ class EmbodiedRunner:
         )
 
     def init_workers(self):
+        resume_dir = self.cfg.runner.get("resume_dir")
+        if (
+            resume_dir
+            and self.multi_task_controller is None
+            and os.path.isfile(os.path.join(resume_dir, "multi_task_state.json"))
+        ):
+            raise ValueError(
+                "Multi-task continuation cannot disable algorithm.multi_task."
+            )
+        if self.multi_task_controller is not None and self.cfg.runner.get("resume_dir"):
+            resume = self.cfg.runner.resume_dir
+            self.multi_task_controller.restore(
+                resume, int(resume.split("global_step_")[-1])
+            )
         # create worker in order to decrease the maximum memory usage
         rollout_handle = self.rollout.init_worker()
         env_handle = self.env.init_worker()
@@ -215,9 +249,38 @@ class EmbodiedRunner:
         )
         env_results = env_handle.wait()
         rollout_handle.wait()
+        task_metrics = {}
+        if self.multi_task_controller is not None:
+            counts = self._take_task_counts(env_results)
+            for i, name in enumerate(self.multi_task_controller.names):
+                task_metrics[f"multi_task/{name}/successes"] = counts[0, i].item()
+                task_metrics[f"multi_task/{name}/episodes"] = counts[1, i].item()
+                if counts[1, i] > 0:
+                    task_metrics[f"multi_task/{name}/success_rate"] = (
+                        counts[0, i] / counts[1, i]
+                    ).item()
         eval_metrics_list = [results for results in env_results if results is not None]
         eval_metrics = compute_evaluate_metrics(eval_metrics_list)
+        eval_metrics.update(task_metrics)
         return eval_metrics
+
+    def _take_task_counts(self, env_results):
+        counts = torch.zeros(
+            (2, len(self.multi_task_controller.names)), dtype=torch.int64
+        )
+        for result in env_results:
+            if result is None or COUNT_KEY not in result:
+                raise ValueError(
+                    "Missing completed-episode counts from PPO environment worker."
+                )
+            worker_counts = result.pop(COUNT_KEY)
+            if (
+                worker_counts.shape != counts.shape
+                or worker_counts.dtype != torch.int64
+            ):
+                raise ValueError("Invalid PPO environment task counts.")
+            counts += worker_counts
+        return counts
 
     def _log_ranked_metrics(
         self,
@@ -610,6 +673,18 @@ class EmbodiedRunner:
                     if self.reward is not None:
                         reward_handle.wait()
 
+                env_results = None
+                if self.multi_task_controller is not None:
+                    env_results = env_handle.wait()
+                    task_metrics = self.multi_task_controller.update(
+                        self._take_task_counts(env_results), self.global_step + 1
+                    )
+                    self.actor.set_task_weights(
+                        self.multi_task_controller.weights.tolist(),
+                        self.global_step + 1,
+                    ).wait()
+                    self.metric_logger.log(task_metrics, _step)
+
                 # compute advantages and returns.
                 with self.timer("cal_adv_and_returns"):
                     actor_rollout_metrics = (
@@ -629,7 +704,8 @@ class EmbodiedRunner:
                     if env_bootstrap_handle is not None:
                         env_bootstrap_handle.wait()
 
-                env_results = env_handle.wait()
+                if env_results is None:
+                    env_results = env_handle.wait()
                 reward_audit_metrics = self._validate_tabero_dsrl_reward_step(
                     step=_step,
                     env_results=env_results,
@@ -755,6 +831,8 @@ class EmbodiedRunner:
         actor_save_path = os.path.join(base_output_dir, "actor")
         os.makedirs(actor_save_path, exist_ok=True)
         self.actor.save_checkpoint(actor_save_path, self.global_step).wait()
+        if self.multi_task_controller is not None:
+            self.multi_task_controller.save(base_output_dir, self.global_step)
 
     def set_max_steps(self):
         self.num_steps_per_epoch = 1

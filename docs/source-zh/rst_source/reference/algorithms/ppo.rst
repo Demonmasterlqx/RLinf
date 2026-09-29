@@ -161,3 +161,50 @@ LLM 推理任务的配置与具身任务的配置有相似之处。
 - 使用奖励归一化来稳定训练。  
 - 监控 KL 散度以检测策略是否更新过度。  
 - 对于大型 LLM，增加 batch size 可以减少方差。  
+
+可选的多任务成功率加权
+----------------------------
+
+``algorithm.multi_task.enabled`` 默认关闭。开启后，使用同步入口
+``train_embodied_agent.py``，在 ``env.train.multi_task.tasks`` 中用唯一
+``name`` 和 ``init_params`` 覆盖声明任务。每个逻辑环境实例（worker × rollout
+stage）固定分配一个任务，按任务列表循环分配，实例数必须覆盖全部任务。
+配置和代码均位于 RLinf，任务资产只读，不修改 Tabero_X 或 IsaacLab。
+评估使用相同顺序的任务名，可配置 ``env.eval.multi_task: ${env.train.multi_task}``。
+
+首版支持已有 Libero/Tabero 和 Task820 的 terminal-safe OpenPI 适配、FSDP、GAE
+和 chunk-level actor-critic PPO。同次训练要求模型、观测、动作、触觉、奖励及重置
+接口兼容，保留原有单任务契约；不会自动将 Libero pi0 配置变成 pi05 配置。
+开启功能时拒绝异步 PPO、training pipeline、外部 reward model 和 SFT co-training。
+
+统计口径与 terminal-safe 训练一致：每个 rollout epoch 中，每个环境的首个完整
+episode 只统计一次；终止后自动重置产生且已被训练 mask 排除的 episode 不计入。
+跨 worker 先汇总成功数及完成数（含超时），再计算成功率；统计不受 reward filter
+影响。采样窗口必须覆盖 episode horizon，缺少首个完整 episode 时在更新前报错。
+评估只报告计数，不更新训练 EMA。
+
+EMA 默认保留 0.9 的历史估计，首次直接采用观测成功率；没有新记录则保留旧值。
+全部任务首次被观测前权重为 1，之后使用：
+
+.. math::
+
+   w_k=0.5+1.5\sigma(10(\bar p-p_k)),\qquad \bar p=K^{-1}\sum_k p_k.
+
+参数分别为 ``weight_min``、``weight_max``、``sigmoid_scale``。每轮 rollout 更新
+一次权重表，本轮所有 PPO epoch 复用。权重在跨 rank、包含全部梯度累积的完整
+optimizer batch 内按有效 chunk 的平均值归一化，micro-batch 不单独归一化。
+策略 loss、价值 loss 和 entropy 共同加权；GAE、return、模型缓存输入、终止 mask
+及轨迹长度校正沿用现有实现。价值系数为 1；新示例的 ``entropy_bonus`` 为 0.005，
+旧配置参数不变。
+
+示例为 ``isaaclab_pi05_ppo_multitask_tacfield.yaml``，使用 pi05 TacField no-state。
+必须提供审核后的 SFT ``actor.model.model_path`` 和已有的
+``env.train.init_params.realworld_config_dir``；GPU 通过 RLinf placement 配置分配。
+TensorBoard 和 W&B 同时记录任务计数、成功率、EMA、原始及归一化权重。
+actor 的有效样本数为各 optimizer batch 的平均值，区别于 rollout 的 episode 计数。
+启动日志记录任务分片分配。
+
+checkpoint 在 ``actor/`` 旁保存原子写入的 ``multi_task_state.json``，包含任务契约、
+EMA、初始化标志、累计计数及版本。续训要求任务/优化契约及 actor 步数匹配，缺失状态
+或关闭控制器均报错。旧单任务续训路径不变；从基础权重开始新实验不视为完整续训。
+导出元数据列出全部任务，不将多任务模型描述为单个目标物体。

@@ -22,6 +22,7 @@ from rlinf.utils.metric_utils import (
     compute_critic_explained_variance_from_stats,
     compute_critic_explained_variance_stats,
 )
+from rlinf.utils.ppo_multi_task import weighted_reduce
 from rlinf.utils.utils import masked_mean, masked_mean_ratio
 
 
@@ -265,12 +266,29 @@ def compute_ppo_actor_loss(
     else:
         dual_clip_mask = torch.zeros_like(clip_mask)
 
-    metric_policy_loss_abs = loss_agg_func(
-        policy_loss.abs(), loss_mask, loss_mask_ratio
-    )
-    policy_loss = loss_agg_func(
-        policy_loss, loss_mask, loss_mask_ratio
-    )  # default max_episode_steps is None
+    if kwargs.get("sample_weights") is not None:
+        metric_policy_loss_abs = weighted_reduce(
+            policy_loss.abs(),
+            loss_mask,
+            loss_mask_ratio,
+            sample_weights=torch.ones_like(kwargs["sample_weights"]),
+        )
+    else:
+        metric_policy_loss_abs = loss_agg_func(
+            policy_loss.abs(), loss_mask, loss_mask_ratio
+        )
+    if kwargs.get("sample_weights") is not None:
+        policy_loss = weighted_reduce(
+            policy_loss,
+            loss_mask,
+            loss_mask_ratio,
+            sample_weights=kwargs["sample_weights"],
+            reduction_scale=kwargs.get("weighted_reduction_scale"),
+        )
+    else:
+        policy_loss = loss_agg_func(
+            policy_loss, loss_mask, loss_mask_ratio
+        )  # default max_episode_steps is None
 
     clip_mask = policy_loss1.detach() < policy_loss2.detach()
     dual_clip_mask = (dual_clip_mask * loss_mask).bool()
@@ -359,7 +377,16 @@ def compute_ppo_critic_loss(
         returns - value_pred_clipped, huber_delta
     )  # [bsz, ] | [bsz, chunk-step]
     value_loss = torch.max(value_loss_original, value_loss_clipped)
-    value_loss = loss_agg_func(value_loss, loss_mask, loss_mask_ratio)
+    if kwargs.get("sample_weights") is not None:
+        value_loss = weighted_reduce(
+            value_loss,
+            loss_mask,
+            loss_mask_ratio,
+            sample_weights=kwargs["sample_weights"],
+            reduction_scale=kwargs.get("weighted_reduction_scale"),
+        )
+    else:
+        value_loss = loss_agg_func(value_loss, loss_mask, loss_mask_ratio)
 
     value_clip_indicator = (value_pred_clipped - prev_values).abs() > value_clip
     value_clip_ratio = value_clip_indicator.float().mean()

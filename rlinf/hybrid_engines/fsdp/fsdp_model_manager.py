@@ -617,6 +617,13 @@ class FSDPModelManager:
                     raise ValueError(
                         "fsdp_config.trainable_checkpoint_metadata must be a mapping"
                     )
+                if full_cfg is not None:
+                    from rlinf.utils.ppo_multi_task import checkpoint_metadata, enabled
+
+                    if enabled(full_cfg):
+                        configured_metadata = checkpoint_metadata(
+                            configured_metadata, full_cfg
+                        )
                 target_global_step = configured_metadata.get("target_global_step")
                 if (
                     isinstance(target_global_step, bool)

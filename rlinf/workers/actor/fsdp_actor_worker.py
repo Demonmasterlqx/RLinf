@@ -77,6 +77,8 @@ from rlinf.utils.placement import (
     HybridComponentPlacement,
     ModelParallelComponentPlacement,
 )
+from rlinf.utils.ppo_multi_task import batch_weight_stats, task_list, weighted_reduce
+from rlinf.utils.ppo_multi_task import enabled as multi_task_enabled
 from rlinf.utils.tabero_ppo_boundary import (
     uses_tabero_primitive_prefix_boundary,
     validate_tabero_ppo_checkpoint_boundary_metadata,
@@ -1080,6 +1082,9 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         Worker.__init__(self)
         super().__init__(cfg.actor, self._world_size, self._rank)
         self.cfg = cfg
+        self.multi_task_enabled = multi_task_enabled(cfg)
+        self._task_weights = None
+        self._task_weight_version = None
         self._env_group_name = cfg.env.group_name
         self._rollout_group_name = cfg.rollout.group_name
         self._component_placement = HybridComponentPlacement(cfg, Cluster())
@@ -1317,6 +1322,81 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 rollout_batch["loss_mask"] = reward_filter_mask
 
         return rollout_batch
+
+    def set_task_weights(self, weights: list[float], version: int) -> None:
+        """Install the runner's frozen table for the current rollout update."""
+        if not self.multi_task_enabled or version != self.version + 1:
+            raise ValueError("PPO task weight version does not match this rollout.")
+        weights = torch.as_tensor(weights, dtype=torch.float32, device="cpu")
+        if (
+            weights.shape != (len(task_list(self.cfg.env.train)),)
+            or not torch.isfinite(weights).all()
+            or (weights <= 0).any()
+        ):
+            raise ValueError("Invalid PPO task weight table.")
+        self._task_weights = weights.detach().clone()
+        self._task_weight_version = version
+
+    def _prepare_task_weighted_batch(
+        self, batch: dict[str, torch.Tensor], metrics: dict[str, list[float]]
+    ) -> bool:
+        """Normalize across ranks before splitting gradient-accumulation batches."""
+        if self._task_weight_version != self.version + 1:
+            raise ValueError("Missing current-rollout PPO task weights.")
+        indices = batch["task_indices"]
+        if (
+            indices.dtype != torch.int64
+            or (indices < 0).any()
+            or (indices >= len(self._task_weights)).any()
+        ):
+            raise ValueError("Unknown PPO task index in actor batch.")
+        raw = self._task_weights[indices].reshape(-1)
+        mask = batch.get("loss_mask")
+        mask = (
+            torch.ones_like(raw, dtype=torch.bool)
+            if mask is None
+            else mask.reshape(-1).bool()
+        )
+        stats = batch_weight_stats(raw, mask).to(self.device)
+        torch.distributed.all_reduce(stats)
+        if stats[1].item() == 0:
+            append_to_dict(metrics, {"multi_task/skipped_empty_batches": 1.0})
+            return False
+        mean_weight = (stats[0] / stats[1]).cpu().float()
+        batch["sample_weights"] = raw / mean_weight
+        # PPO length-corrected loss uses the full padded batch denominator;
+        # entropy retains its effective-chunk denominator.
+        denominator = (
+            self.cfg.actor.global_batch_size
+            if batch.get("loss_mask_sum") is not None
+            else stats[1].item()
+        )
+        multiplier = self._world_size * self.gradient_accumulation
+        batch["weighted_reduction_scale"] = torch.full_like(
+            raw, multiplier / denominator
+        )
+        batch["weighted_entropy_scale"] = torch.full_like(
+            raw, multiplier / stats[1].item()
+        )
+        task_count = len(self._task_weights)
+        task_stats = torch.zeros(
+            (2, task_count), dtype=torch.float64, device=self.device
+        )
+        for i in range(task_count):
+            selected = mask & indices.reshape(-1).eq(i)
+            task_stats[0, i] = selected.sum()
+            task_stats[1, i] = batch["sample_weights"][selected].double().sum()
+        torch.distributed.all_reduce(task_stats)
+        data = {"multi_task/normalized_weight_mean": 1.0}
+        for i, task in enumerate(task_list(self.cfg.env.train)):
+            count = task_stats[0, i].item()
+            data[f"multi_task/{task['name']}/valid_samples"] = count
+            if count:
+                data[f"multi_task/{task['name']}/normalized_weight"] = (
+                    task_stats[1, i] / count
+                ).item()
+        append_to_dict(metrics, data)
+        return True
 
     @Worker.timer("actor/compute_adv")
     def compute_advantages_and_returns(self) -> dict[str, torch.Tensor]:
@@ -1577,6 +1657,11 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     f"{train_global_batch_size=}, {self.cfg.actor.micro_batch_size}"
                 )
 
+                if self.multi_task_enabled and not self._prepare_task_weighted_batch(
+                    train_global_batch, metrics
+                ):
+                    continue
+
                 train_micro_batch = split_dict_to_chunk(
                     train_global_batch,
                     train_global_batch_size // self.cfg.actor.micro_batch_size,
@@ -1726,11 +1811,23 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     self.cfg.algorithm.clip_log_ratio_max
                 )
 
+        if micro_batch.get("sample_weights") is not None:
+            loss_kwargs["sample_weights"] = micro_batch["sample_weights"]
+            loss_kwargs["weighted_reduction_scale"] = micro_batch[
+                "weighted_reduction_scale"
+            ][0]
         loss, metrics_data = policy_loss(**loss_kwargs)
         entropy_loss = torch.tensor(0.0, device=Worker.torch_platform.current_device())
         if self.cfg.algorithm.entropy_bonus > 0 and not loss_kwargs["critic_warmup"]:
             entropy = output_dict["entropy"]
-            if (
+            if micro_batch.get("sample_weights") is not None:
+                entropy_loss = weighted_reduce(
+                    entropy,
+                    loss_mask,
+                    sample_weights=micro_batch["sample_weights"],
+                    reduction_scale=micro_batch["weighted_entropy_scale"][0],
+                )
+            elif (
                 primitive_loss_mask is not None
                 and entropy.ndim == 2
                 and entropy.shape[-1] == 1

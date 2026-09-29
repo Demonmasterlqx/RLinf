@@ -369,8 +369,11 @@ class ChunkStepResult:
     rewards: torch.Tensor = None  # [B, 1]
     forward_inputs: dict[str, torch.Tensor] = field(default_factory=dict)
     versions: torch.Tensor = None  # [B, 1]
+    task_indices: torch.Tensor = None  # [B], action-aligned
 
     def __post_init__(self):
+        if self.task_indices is not None:
+            self.task_indices = self.task_indices.cpu().contiguous()
         if self.actions is not None:
             self.actions = self.actions.cpu().contiguous()
         if self.prev_logprobs is not None:
@@ -412,6 +415,7 @@ class Trajectory:
 
     curr_obs: dict[str, Any] = field(default_factory=dict)
     next_obs: dict[str, Any] = field(default_factory=dict)
+    task_indices: torch.Tensor = None  # [T, B], no bootstrap rows
 
     @staticmethod
     def _generate_field_mask(
@@ -514,6 +518,7 @@ class Trajectory:
                     terminations=terminations,
                     truncations=truncations,
                     dones=dones,
+                    task_indices=apply_mask(self.task_indices, i),
                     prev_logprobs=prev_logprobs,
                     prev_values=prev_values,
                     forward_inputs=forward_inputs,
@@ -560,7 +565,11 @@ class EmbodiedRolloutResult:
     curr_obs: list[dict[str, Any]] = field(default_factory=list)  # trajectory_length
     next_obs: list[dict[str, Any]] = field(default_factory=list)  # trajectory_length
 
+    task_indices: list[torch.Tensor] = field(default_factory=list)
+
     def append_step_result(self, result: ChunkStepResult):
+        if result.task_indices is not None:
+            self.task_indices.append(result.task_indices)
         if result.actions is not None:
             self.actions.append(result.actions)
             self.intervene_flags.append(
@@ -653,6 +662,7 @@ class EmbodiedRolloutResult:
         self.next_obs.append(next_obs)
 
     def clear(self):
+        self.task_indices.clear()
         self.actions.clear()
         self.intervene_flags.clear()
         self.rewards.clear()
@@ -671,6 +681,15 @@ class EmbodiedRolloutResult:
         trajectory = Trajectory(
             max_episode_length=self.max_episode_length,
         )
+        if self.task_indices:
+            trajectory.task_indices = torch.stack(self.task_indices).cpu().contiguous()
+            if (
+                trajectory.task_indices.shape[:2]
+                != torch.stack(self.prev_logprobs).shape[:2]
+            ):
+                raise ValueError(
+                    "PPO task indices must align with action log probabilities."
+                )
         if len(self.actions) > 0:
             trajectory.actions = torch.stack(self.actions, dim=0).cpu().contiguous()
         if len(self.intervene_flags) > 0:
@@ -1476,6 +1495,9 @@ def convert_trajectories_to_batch(
                 batch["forward_inputs"][key] = torch.cat(tensors, dim=1)
 
     # -------- tensor fields --------
+    task_presence = [traj.task_indices is not None for traj in trajectories]
+    if any(task_presence) and not all(task_presence):
+        raise ValueError("Cannot mix PPO trajectories with and without task indices.")
     reference_trajectory = trajectories[0]
     for field_name in reference_trajectory.__dataclass_fields__.keys():
         if not isinstance(getattr(reference_trajectory, field_name), torch.Tensor):

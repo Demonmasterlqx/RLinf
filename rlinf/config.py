@@ -1251,6 +1251,53 @@ def _validate_tabero_realworld_pi05_dsrl_contract(cfg, model_cfg) -> None:
 
 
 def validate_embodied_cfg(cfg):
+    from rlinf.utils.ppo_multi_task import (
+        enabled as multi_task_enabled,
+    )
+    from rlinf.utils.ppo_multi_task import (
+        task_env_cfg,
+        task_list,
+    )
+    from rlinf.utils.ppo_multi_task import (
+        validate_config as validate_multi_task_config,
+    )
+
+    if multi_task_enabled(cfg):
+        import copy
+
+        validate_multi_task_config(cfg)
+        # Validate every isolated task through the unchanged single-task gates.
+        validated = None
+        for task_index in range(len(task_list(cfg.env.train))):
+            candidate = copy.deepcopy(cfg)
+            with open_dict(candidate):
+                candidate.algorithm.multi_task.enabled = False
+                candidate.env.train = task_env_cfg(cfg.env.train, task_index)
+                if cfg.runner.get("val_check_interval", -1) > 0:
+                    candidate.env.eval = task_env_cfg(cfg.env.eval, task_index)
+            result = validate_embodied_cfg(candidate)
+            if validated is None:
+                validated = result
+        with open_dict(validated):
+            validated.algorithm.multi_task = copy.deepcopy(cfg.algorithm.multi_task)
+            for split in ("train", "eval"):
+                if split in cfg.env and "multi_task" in cfg.env[split]:
+                    validated.env[split].init_params = copy.deepcopy(
+                        cfg.env[split].init_params
+                    )
+                    validated.env[split].multi_task = copy.deepcopy(
+                        cfg.env[split].multi_task
+                    )
+        placement = HybridComponentPlacement(validated, Cluster())
+        shard_count = (
+            placement.get_world_size("env") * validated.rollout.pipeline_stage_num
+        )
+        if shard_count < len(task_list(validated.env.train)):
+            raise ValueError(
+                "PPO multi_task needs at least one logical env instance per task."
+            )
+        return validated
+
     only_eval = (
         cfg.runner.get("only_eval", False)
         or cfg.runner.get("task_type") == "embodied_eval"

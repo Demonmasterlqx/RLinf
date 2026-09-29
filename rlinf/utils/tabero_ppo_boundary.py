@@ -100,14 +100,14 @@ def build_realworld_pirl_checkpoint_metadata(cfg) -> dict[str, Any]:
     target_step = cfg.runner.max_epochs
     if cfg.runner.get("max_steps", -1) >= 0:
         target_step = min(target_step, cfg.runner.max_steps)
-    return {
+    metadata = {
         "checkpoint_format": TABERO_REALWORLD_CHECKPOINT_FORMAT,
         "method": "pirl",
         "task_domain": "realworld",
-        "task_suite": env.task_suite,
-        "task_id": env.task_id,
-        "target_object": env.target_object,
-        "task_description": env.task_description,
+        "task_suite": env.get("task_suite"),
+        "task_id": env.get("task_id"),
+        "target_object": env.get("target_object"),
+        "task_description": env.get("task_description"),
         "reset_source": env.reset_source,
         "deployment_config_name": model.deployment_config_name,
         "normalization_asset_id": model.export_norm_asset_id,
@@ -121,6 +121,12 @@ def build_realworld_pirl_checkpoint_metadata(cfg) -> dict[str, Any]:
         "target_global_step": target_step,
         "gradient_checkpointing": cfg.actor.fsdp_config.gradient_checkpointing,
     }
+
+    from rlinf.utils.ppo_multi_task import checkpoint_metadata, enabled
+
+    if enabled(cfg):
+        metadata = checkpoint_metadata(metadata, cfg)
+    return metadata
 
 
 def validate_realworld_pirl_checkpoint_format(metadata: Mapping) -> None:
