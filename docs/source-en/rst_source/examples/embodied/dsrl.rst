@@ -210,3 +210,50 @@ For metric definitions, see :doc:`Training metrics <../../reference/metrics>`. D
 
   - ``train/replay_buffer/size``: Current size of the replay buffer
   - ``train/replay_buffer/utilization``: Utilization of the replay buffer
+
+
+Synchronous multi-task DSRL
+--------------------------
+
+Enable ``algorithm.multi_task.enabled`` and define named tasks in
+``env.train.multi_task.tasks`` (and matching evaluation tasks when enabled).
+Each task has ``name`` and ``init_params`` overrides. The synchronous
+``train_embodied_agent.py`` entrypoint distributes tasks over logical environment
+shards. Tasks must share observation/action interfaces and collect complete
+terminal-safe episodes. Async training, demo mixing and replay prefetch are not
+supported in this first version; set ``algorithm.replay_buffer.enable_preload=false``.
+Disabling prefetch keeps the replay RNG at a well-defined checkpoint boundary.
+
+After each rollout, pooled completed-episode counts update success-rate EMA
+(``ema_decay=0.9``). Raw weights are
+``weight_min + (weight_max-weight_min) * sigmoid(sigmoid_scale * (mean_ema-ema))``,
+with defaults 0.5, 2.0 and 10.0. Until every task has been observed, weights are
+one. Tasks with no new completed episodes retain their EMA. Evaluation never
+updates the controller.
+
+Replay stores task indices, not historical weights. Each SAC optimizer batch
+looks up the current rollout's table and normalizes weights to mean one across
+all actor ranks and accumulation micro-batches. Weights multiply each critic TD
+squared error and the entire actor ``alpha * log_pi - Q`` objective. Q aggregation,
+TD targets, rewards, temperature loss and target updates are unchanged.
+
+Both trajectory and compact replay retain task indices in checkpoints. Compact
+multi-task replay uses format version 2; single-task replay remains version 1.
+Continuation requires controller, SAC update counter, RNG and labelled replay
+state. Task names identify tasks: reordering names remaps EMA and replay indices;
+adding/removing tasks is rejected. Configuration snapshots are provenance, not
+whole-configuration equality gates. TensorBoard and W&B report completed episodes,
+success rates, EMA, raw weights, sampled counts and normalized weights per task.
+
+The example ``isaaclab_pi05_dsrl_task820_multi_tasks_tacfield_8gpu_benchmark``
+uses the PiRL three-object SFT/environment baseline for Vitasoy, Coca-Cola and
+cookie. Both the frozen VLA (``discrete_state_input=false``) and DSRL actor
+(``dsrl_actor_use_state=false``) are no-state; the critic retains state. Its
+96 rollout rounds each request 8 SAC updates (768 updates without warmup skips).
+Checkpoint ``global_step`` counts rollout rounds, whereas ``update_step`` counts
+actual SAC updates. GPU placement is controlled by the RLinf configuration.
+
+For non-compact SAC/DSRL target checkpoints, actor rank 0 saves the full CPU
+state and broadcasts it to every actor rank on restore. The rank 0 file from
+legacy per-rank checkpoints is also supported. Compact target checkpoints
+continue to save and restore per rank.

@@ -418,9 +418,12 @@ class FSDPStrategyBase(ABC):
         model_state_dict,
         cpu_offload: bool,
         full_state_dict: bool,
+        broadcast_from_rank0: bool = False,
     ):
         opts = StateDictOptions(
-            cpu_offload=cpu_offload, full_state_dict=full_state_dict
+            cpu_offload=cpu_offload,
+            full_state_dict=full_state_dict,
+            broadcast_from_rank0=broadcast_from_rank0,
         )
         set_model_state_dict(
             model=model,

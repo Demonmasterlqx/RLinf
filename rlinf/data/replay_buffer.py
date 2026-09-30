@@ -27,6 +27,7 @@ import torch
 
 from rlinf.data.embodied_io_struct import Trajectory
 from rlinf.utils.logging import get_logger
+from rlinf.utils.multi_task import task_index_remap, validate_task_indices
 
 
 def clone_dict_of_tensors(obj):
@@ -240,6 +241,7 @@ class TrajectoryReplayBuffer:
         auto_save: bool = False,
         auto_save_path: str = "",
         trajectory_format: str = "pt",
+        task_names: list[str] | None = None,
     ):
         """
         Initialize trajectory-based replay buffer.
@@ -253,6 +255,9 @@ class TrajectoryReplayBuffer:
             sample_window_size: Number of trajectories to sample from for window cache
             auto_save: Whether to automatically save trajectories to disk
         """
+        self.task_names = list(task_names) if task_names is not None else None
+        if self.task_names is not None:
+            task_index_remap(self.task_names, self.task_names)
         self.trajectory_format = trajectory_format
         self.enable_cache = enable_cache
         self.sample_window_size = sample_window_size
@@ -303,6 +308,7 @@ class TrajectoryReplayBuffer:
 
         # Async save executor for add_trajectories
         self._save_executor = ThreadPoolExecutor(max_workers=20)
+        self._task_save_futures = []
         # Separate executor for checkpoint saves
         self._checkpoint_executor = ThreadPoolExecutor(max_workers=20)
         self._index_lock = threading.Lock()
@@ -435,6 +441,16 @@ class TrajectoryReplayBuffer:
         for field_name, value in trajectory_dict.items():
             setattr(trajectory, field_name, value)
 
+        if self.task_names is not None:
+            validate_task_indices(
+                trajectory.task_indices,
+                trajectory.rewards.shape[:2],
+                len(self.task_names),
+            )
+            saved_names = trajectory_info.get("task_names", self.task_names)
+            trajectory.task_indices = task_index_remap(saved_names, self.task_names)[
+                trajectory.task_indices
+            ]
         return trajectory
 
     def add_trajectories(self, trajectories: list[Trajectory]):
@@ -451,6 +467,12 @@ class TrajectoryReplayBuffer:
 
         save_futures = []
         for trajectory in trajectories:
+            if self.task_names is not None:
+                validate_task_indices(
+                    trajectory.task_indices,
+                    trajectory.rewards.shape[:2],
+                    len(self.task_names),
+                )
             model_weights_id = trajectory.model_weights_id
             trajectory_id = self._trajectory_counter
 
@@ -487,6 +509,11 @@ class TrajectoryReplayBuffer:
                     "max_episode_length": trajectory.max_episode_length,
                     "shape": tuple(trajectory_shape),
                     "model_weights_id": model_weights_id,
+                    **(
+                        {"task_names": self.task_names}
+                        if self.task_names is not None
+                        else {}
+                    ),
                 }
                 self._trajectory_index[trajectory_id] = trajectory_info
                 self._trajectory_id_list.append(trajectory_id)
@@ -502,6 +529,9 @@ class TrajectoryReplayBuffer:
                     trajectory_id,
                     self._flatten_trajectory(trajectory),
                 )
+
+        if self.task_names is not None:
+            self._task_save_futures.extend(save_futures)
 
         # Save metadata/index after all trajectory saves finish
         if self.auto_save:
@@ -710,6 +740,12 @@ class TrajectoryReplayBuffer:
         return batch if batch is not None else {}
 
     def _flatten_trajectory(self, trajectory: Trajectory) -> dict:
+        if self.task_names is not None:
+            validate_task_indices(
+                trajectory.task_indices,
+                trajectory.rewards.shape[:2],
+                len(self.task_names),
+            )
         flat: dict[str, object] = {}
         tensor_fields = trajectory.__dataclass_fields__.keys()
         traj_len = int(trajectory.rewards.shape[0])
@@ -923,10 +959,80 @@ class TrajectoryReplayBuffer:
         }
         return stats
 
+    @property
+    def available_samples(self) -> int:
+        """Count the window actually sampled, rather than historical insertions."""
+        with self._index_lock:
+            ids = self._trajectory_id_list
+            if self.sample_window_size > 0:
+                ids = ids[-self.sample_window_size :]
+            return sum(self._trajectory_index[i]["num_samples"] for i in ids)
+
+    def _save_multitask_checkpoint(self, save_path: str) -> None:
+        """Persist the full active sampling window, normalized to current task IDs."""
+        os.makedirs(save_path, exist_ok=True)
+        for future in self._task_save_futures:
+            future.result()
+        self._task_save_futures.clear()
+        ids = list(self._trajectory_id_list)
+        if self.sample_window_size > 0:
+            ids = ids[-self.sample_window_size :]
+        index = {}
+        for tid in ids:
+            info = dict(self._trajectory_index[tid])
+            flat = (
+                self._flat_trajectory_cache.get(tid)
+                if self._flat_trajectory_cache is not None
+                else None
+            )
+            if flat is None:
+                trajectory = self._load_trajectory(tid, info["model_weights_id"])
+            else:
+                trajectory = Trajectory(
+                    max_episode_length=info["max_episode_length"],
+                    model_weights_id=info["model_weights_id"],
+                )
+                for field_name in trajectory.__dataclass_fields__:
+                    if field_name in flat:
+                        setattr(
+                            trajectory,
+                            field_name,
+                            self._reshape_flat_for_save(
+                                flat[field_name], *info["shape"][:2]
+                            ),
+                        )
+            validate_task_indices(
+                trajectory.task_indices,
+                trajectory.rewards.shape[:2],
+                len(self.task_names),
+            )
+            self._save_trajectory(
+                trajectory, tid, info["model_weights_id"], save_dir=save_path
+            )
+            info["task_names"] = self.task_names
+            index[tid] = info
+        metadata = {
+            "multi_task_format": "sac_multitask_replay_v1",
+            "task_names": self.task_names,
+            "rng_state": self.random_generator.get_state().tolist(),
+            "trajectory_format": self.trajectory_format,
+            "size": self.size,
+            "total_samples": sum(info["num_samples"] for info in index.values()),
+            "trajectory_counter": self._trajectory_counter,
+            "seed": self.seed,
+        }
+        with open(self._get_metadata_path(save_path), "w") as stream:
+            json.dump(metadata, stream)
+        with open(self._get_trajectory_index_path(save_path), "w") as stream:
+            json.dump({"trajectory_index": index, "trajectory_id_list": ids}, stream)
+
     def save_checkpoint(self, save_path: str):
         """
         Save buffer state (metadata and indices) to save_path.
         """
+        if self.task_names is not None:
+            self._save_multitask_checkpoint(save_path)
+            return
         # Create save directory
         os.makedirs(save_path, exist_ok=True)
 
@@ -1017,6 +1123,15 @@ class TrajectoryReplayBuffer:
         with open(metadata_path, "r") as f:
             metadata = json.load(f)
 
+        if self.task_names is not None:
+            task_index_remap(metadata.get("task_names"), self.task_names)
+            if (
+                metadata.get("multi_task_format") != "sac_multitask_replay_v1"
+                or "rng_state" not in metadata
+            ):
+                raise ValueError("Missing multi-task replay checkpoint state.")
+        elif metadata.get("task_names") is not None:
+            raise ValueError("Cannot disable multi-task replay on continuation.")
         # Update instance attributes from metadata
         self.trajectory_format = metadata.get(
             "trajectory_format",
@@ -1041,6 +1156,14 @@ class TrajectoryReplayBuffer:
             int(k) for k in index_data.get("trajectory_id_list", [])
         ]
 
+        if self.task_names is not None:
+            for info in full_trajectory_index.values():
+                info["task_names"] = metadata["task_names"]
+            self.random_generator.set_state(
+                torch.tensor(metadata["rng_state"], dtype=torch.uint8)
+            )
+            self._index_version += 1
+            self._window_cache_version = None
         # Handle distributed loading
         if is_distributed:
             if local_rank < 0 or local_rank >= world_size:

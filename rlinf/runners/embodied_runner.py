@@ -34,14 +34,15 @@ from rlinf.utils.metric_utils import (
     compute_evaluate_metrics,
     print_metrics_table,
 )
-from rlinf.utils.ppo_multi_task import (
+from rlinf.utils.multi_task import (
     COUNT_KEY,
     SuccessWeightController,
     manifest,
     options,
+    state_format,
     task_list,
 )
-from rlinf.utils.ppo_multi_task import enabled as multi_task_enabled
+from rlinf.utils.multi_task import enabled as multi_task_enabled
 from rlinf.utils.runner_utils import check_progress
 from rlinf.utils.timers import Timer
 
@@ -83,12 +84,13 @@ class EmbodiedRunner:
         if multi_task_enabled(cfg):
             if type(self) is not EmbodiedRunner:
                 raise ValueError(
-                    "PPO multi_task only supports the synchronous EmbodiedRunner."
+                    "multi_task only supports the synchronous EmbodiedRunner."
                 )
             self.multi_task_controller = SuccessWeightController(
                 [task["name"] for task in task_list(cfg.env.train)],
                 options(cfg),
                 manifest(cfg),
+                state_format=state_format(cfg),
             )
         self.actor = actor
         self.rollout = rollout
@@ -226,6 +228,17 @@ class EmbodiedRunner:
             f"resume_dir {actor_checkpoint_path} does not exist."
         )
         checkpoint_receipts = self.actor.load_checkpoint(actor_checkpoint_path).wait()
+        if (
+            self.multi_task_controller is not None
+            and self.cfg.algorithm.loss_type == "embodied_sac"
+        ):
+            if not checkpoint_receipts or any(
+                receipt.get("multi_task_step") != self.multi_task_controller.version
+                for receipt in checkpoint_receipts
+            ):
+                raise ValueError(
+                    "SAC actor and multi-task controller checkpoint steps disagree."
+                )
         if checkpoint_receipts and any(
             receipt is not None for receipt in checkpoint_receipts
         ):

@@ -13,6 +13,9 @@
 # limitations under the License.
 
 import inspect
+import os
+from datetime import timedelta
+from pathlib import Path
 from types import MethodType, SimpleNamespace
 
 import pytest
@@ -23,6 +26,7 @@ from omegaconf import OmegaConf
 import rlinf.models as model_registry
 from rlinf.data.embodied_io_struct import Trajectory
 from rlinf.data.replay_buffer import TrajectoryReplayBuffer
+from rlinf.hybrid_engines.fsdp.strategy.base import FSDPStrategyBase
 from rlinf.models.embodiment.openpi.openpi_action_model import (
     OpenPi0Config,
     OpenPi0ForRLActionPrediction,
@@ -642,6 +646,13 @@ class _CheckpointStrategy:
         model.load_state_dict(state_dict)
 
 
+class _DistributedTargetStrategy(_CheckpointStrategy):
+    """Use real distributed target I/O without unrelated actor/replay I/O."""
+
+    get_model_state_dict = FSDPStrategyBase.get_model_state_dict
+    load_model_with_state_dict = FSDPStrategyBase.load_model_with_state_dict
+
+
 class _CheckpointModel(nn.Module):
     def __init__(self):
         super().__init__()
@@ -692,6 +703,89 @@ def _checkpoint_worker(tmp_path):
     )
     worker._init_target_shadow()
     return worker
+
+
+def _distributed_target_checkpoint_roundtrip(rank, directory, gpu_ids, shard, dsrl):
+    from torch.distributed.fsdp import FullyShardedDataParallel, ShardingStrategy
+
+    torch.set_num_threads(1)
+    torch.cuda.set_device(gpu_ids[rank])
+    torch.distributed.init_process_group(
+        "nccl",
+        init_method=f"file://{directory}/rendezvous",
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=90),
+    )
+    try:
+        worker = _checkpoint_worker(directory)
+        worker._rank = rank
+        worker._world_size = 2
+        worker.use_dsrl = dsrl
+        worker._strategy = _DistributedTargetStrategy()
+        worker._save_trainable_model_weights = lambda *_args: None
+        target = _CheckpointModel()
+        target.register_buffer("counter", torch.tensor(7, dtype=torch.int64))
+        with torch.no_grad():
+            for i, parameter in enumerate(target.parameters()):
+                parameter.fill_(i + 0.25)
+        expected = {key: value.clone() for key, value in target.state_dict().items()}
+        worker.target_model = FullyShardedDataParallel(
+            target,
+            device_id=gpu_ids[rank],
+            sharding_strategy=ShardingStrategy[shard],
+            use_orig_params=True,
+        )
+        worker.save_checkpoint(directory, step=1)
+        torch.distributed.barrier()
+        target_dir = Path(directory) / "sac_components" / "target_model"
+
+        # Restore after independently corrupting each rank, including a buffer.
+        # Also accept old per-rank layouts: only rank 0 is authoritative now.
+        for legacy_state in (None, {}, expected):
+            if legacy_state is not None and rank == 1:
+                torch.save(legacy_state, target_dir / "checkpoint_rank_1.pt")
+            torch.distributed.barrier()
+            with torch.no_grad():
+                for parameter in worker.target_model.parameters():
+                    parameter.fill_(-100 - rank)
+                worker.target_model.counter.fill_(-10 - rank)
+            worker.load_checkpoint(directory)
+            with FullyShardedDataParallel.summon_full_params(
+                worker.target_model, writeback=False
+            ):
+                actual = worker.target_model.module.state_dict()
+                assert actual.keys() == expected.keys()
+                for key, value in expected.items():
+                    torch.testing.assert_close(actual[key].cpu(), value)
+            if legacy_state is None:
+                assert not (target_dir / "checkpoint_rank_1.pt").exists()
+        saved = torch.load(
+            target_dir / "checkpoint_rank_0.pt", map_location="cpu", weights_only=True
+        )
+        for key, value in expected.items():
+            torch.testing.assert_close(saved[key], value)
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("RLINF_TEST_GPU_IDS"),
+    reason="Set RLINF_TEST_GPU_IDS to two available CUDA ordinals for FSDP I/O tests",
+)
+@pytest.mark.parametrize("shard", ["NO_SHARD", "FULL_SHARD"])
+@pytest.mark.parametrize("dsrl", [False, True], ids=["sac", "dsrl"])
+def test_two_rank_target_checkpoint_roundtrip(tmp_path, shard, dsrl):
+    """Exercise real FSDP CPU gathering and restore on both actor ranks."""
+    gpu_ids = [int(value) for value in os.environ["RLINF_TEST_GPU_IDS"].split(",")]
+    assert len(gpu_ids) == 2 and len(set(gpu_ids)) == 2
+    assert all(0 <= gpu < torch.cuda.device_count() for gpu in gpu_ids)
+    torch.multiprocessing.spawn(
+        _distributed_target_checkpoint_roundtrip,
+        args=(str(tmp_path), gpu_ids, shard, dsrl),
+        nprocs=2,
+        join=True,
+    )
 
 
 def test_dsrl_checkpoint_honors_fsdp_config_and_exports_trainable_weights(
@@ -848,6 +942,7 @@ def test_embodied_runner_logs_checkpoint_component_receipts(tmp_path):
     ]
     messages = []
     runner = EmbodiedRunner.__new__(EmbodiedRunner)
+    runner.multi_task_controller = None
     runner.cfg = OmegaConf.create({"runner": {"resume_dir": str(checkpoint)}})
     runner.actor = _ResumeActor(receipts)
     runner.rollout = _InitOnlyGroup()
@@ -869,6 +964,7 @@ def test_embodied_runner_preserves_none_checkpoint_receipt_compatibility(tmp_pat
     (checkpoint / "actor").mkdir(parents=True)
     messages = []
     runner = EmbodiedRunner.__new__(EmbodiedRunner)
+    runner.multi_task_controller = None
     runner.cfg = OmegaConf.create({"runner": {"resume_dir": str(checkpoint)}})
     runner.actor = _ResumeActor([None, None, None, None])
     runner.rollout = _InitOnlyGroup()

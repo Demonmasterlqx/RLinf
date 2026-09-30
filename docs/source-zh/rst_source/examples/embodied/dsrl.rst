@@ -314,3 +314,43 @@ DSRL actor 的 state 输入开关
 配置值写入checkpoint元数据和导出契约 ``actor_contract.use_state``，部署按同一开关
 构建网络。关闭时DSRL actor忽略缺失或变化的state，但完整VLA服务仍可能需要state。
 已有bundle需用当前导出器重新导出，不增加协议版本或兼容分支。
+
+
+同步多任务 DSRL
+----------------
+
+设置 ``algorithm.multi_task.enabled=true``，并在
+``env.train.multi_task.tasks`` 中配置任务的 ``name`` 和 ``init_params``；
+启用评估时提供同名、同顺序的 eval 任务。使用 ``train_embodied_agent.py``
+同步入口，按逻辑环境分片分配任务。任务须共享观测和动作接口，完整采集
+terminal-safe episode。首版不支持异步、demo 混训和 replay 预取；设置
+``algorithm.replay_buffer.enable_preload=false``，使采样 RNG 有明确的保存边界。
+
+每轮 rollout 汇总已完成 episode 的成功数和总数，然后以默认 0.9 衰减更新
+成功率 EMA。任务原始权重为
+``0.5 + 1.5 * sigmoid(10 * (mean_ema - task_ema))``。
+无新增完成 episode 的任务保持 EMA；所有任务初始化前使用全 1 权重。
+评估结果不参与权重更新。
+
+两种 replay 均保存任务 ID，不保存历史权重。每次 SAC 更新查询本轮权重，
+按跨所有 actor rank 和梯度累积 micro-batch 的完整优化 batch 归一化到均值 1。
+权重作用于 critic 的逐样本 TD 平方误差和 actor 的完整 ``alpha * log_pi - Q``
+目标。Q 聚合、reward、TD target、温度损失和 target 更新保持原逻辑。
+
+多任务 compact replay 使用格式版本 2，单任务保留版本 1。续训须提供控制器、
+SAC 更新计数、RNG 及带任务标签的 replay；任务顺序改变时按名称重映射 EMA
+和 replay ID，增删任务则拒绝恢复。配置快照用于追溯，不进行整份配置相等校验。
+TensorBoard 与 W&B 同时记录各任务完成数、成功率、EMA、原始权重、采样数和
+归一化权重。
+
+示例 ``isaaclab_pi05_dsrl_task820_multi_tasks_tacfield_8gpu_benchmark`` 使用
+PiRL 三对象的 SFT 与环境基线，任务为 Vitasoy、Coca-Cola、cookie。
+``discrete_state_input=false`` 和 ``dsrl_actor_use_state=false`` 分别控制
+VLA 与 DSRL actor 不使用 state；critic 保留 state。预算为 96 个 rollout
+轮次，每轮请求 8 次 SAC 更新，无 warmup 跳过时共 768 次。
+checkpoint 的 ``global_step`` 表示 rollout 轮次，``update_step`` 表示实际
+SAC 更新次数。GPU 通过 RLinf 配置分配。
+
+非 compact 的 SAC/DSRL target checkpoint 由 actor rank 0 保存完整 CPU 权重，
+恢复时广播到所有 actor rank。旧逐 rank 格式的 rank 0 文件也可用于恢复；
+compact target checkpoint 继续按 rank 保存和恢复。

@@ -71,10 +71,12 @@ from rlinf.utils.metric_utils import (
     append_to_dict,
     compute_split_num,
 )
+from rlinf.utils.multi_task import checkpoint_metadata, task_list, validate_task_indices
 from rlinf.utils.nested_dict_process import (
     put_tensor_device,
     split_dict_to_chunk,
 )
+from rlinf.utils.sac_multi_task import weighted_sac_mean
 from rlinf.utils.utils import clear_memory, collect_param_names_need_sync
 from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
 
@@ -368,6 +370,11 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         seed = self.cfg.actor.get("seed", 1234)
         replay_cfg = self.cfg.algorithm.replay_buffer
         replay_semantics = self._dsrl_replay_semantics()
+        task_kwargs = (
+            {"task_names": [task["name"] for task in task_list(self.cfg.env.train)]}
+            if getattr(self, "multi_task_enabled", False)
+            else {}
+        )
         use_compact_dsrl_replay = self.use_dsrl and is_compact_dsrl_replay_semantics(
             replay_semantics
         )
@@ -378,6 +385,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                     f"{DSRL_REPLAY_BACKEND!r}; got {replay_cfg.get('backend')!r}."
                 )
             self.replay_buffer = CompactDSRLReplayBuffer(
+                **task_kwargs,
                 seed=seed,
                 capacity_transitions=replay_cfg.capacity_transitions,
                 checkpoint_shard_transitions=replay_cfg.get(
@@ -400,6 +408,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             else:
                 auto_save_path = os.path.join(auto_save_path, f"rank_{self._rank}")
             self.replay_buffer = TrajectoryReplayBuffer(
+                **task_kwargs,
                 seed=seed,
                 enable_cache=replay_cfg.enable_cache,
                 cache_size=replay_cfg.cache_size,
@@ -587,6 +596,8 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                     metadata["global_step"] = step
                     metadata["is_final"] = step == target_global_step
 
+                if getattr(self, "multi_task_enabled", False):
+                    metadata = checkpoint_metadata(metadata, self.cfg)
                 sidecar_dir = os.path.join(save_path, "model_state_dict")
                 os.makedirs(sidecar_dir, exist_ok=True)
                 sidecar_path = os.path.join(sidecar_dir, "trainable_weights.pt")
@@ -707,6 +718,11 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         )
         CompactDSRLReplayBuffer.validate_checkpoint_metadata(
             replay_path,
+            expected_task_names=(
+                [task["name"] for task in task_list(self.cfg.env.train)]
+                if getattr(self, "multi_task_enabled", False)
+                else None
+            ),
             expected_capacity=self.cfg.algorithm.replay_buffer.capacity_transitions,
             expected_replay_semantics=expected_replay_semantics,
             expected_observation_semantics=expected_observation_semantics,
@@ -948,9 +964,17 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         # Align dtype: bool ops with Python floats promote to float32,
         # which can mismatch with bfloat16 model outputs.
         target_q_values = target_q_values.to(dtype=all_data_q_values.dtype)
-        critic_loss = F.mse_loss(
-            all_data_q_values, target_q_values.expand_as(all_data_q_values)
-        )
+        if "sample_weights" in batch:
+            errors = F.mse_loss(
+                all_data_q_values,
+                target_q_values.expand_as(all_data_q_values),
+                reduction="none",
+            )
+            critic_loss = weighted_sac_mean(errors, batch["sample_weights"])
+        else:
+            critic_loss = F.mse_loss(
+                all_data_q_values, target_q_values.expand_as(all_data_q_values)
+            )
         return critic_loss, {"q_data": all_data_q_values.mean().item()}
 
     @Worker.timer("forward_actor")
@@ -1007,7 +1031,12 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         elif agg_q == "mean":
             qf_pi = torch.mean(all_qf_pi, dim=1, keepdim=True)
         metrics["q_pi"] = qf_pi.mean().item()
-        actor_loss = ((self.entropy_temp.alpha * log_pi) - qf_pi).mean()
+        actor_objective = (self.entropy_temp.alpha * log_pi) - qf_pi
+        actor_loss = (
+            weighted_sac_mean(actor_objective, batch["sample_weights"])
+            if "sample_weights" in batch
+            else actor_objective.mean()
+        )
 
         entropy = -log_pi.mean()
         return actor_loss, entropy, metrics
@@ -1034,6 +1063,55 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         alpha_loss = -alpha * (log_pi.mean() + self.target_entropy)
         return alpha_loss
 
+    def _prepare_sac_task_batch(self, batch: dict) -> dict[str, float]:
+        """Normalize across the full optimizer batch before micro-batch splitting."""
+        if self._task_weight_version != self.version + 1:
+            raise ValueError("Missing current-rollout SAC task weights.")
+        names = [task["name"] for task in task_list(self.cfg.env.train)]
+        size = self.cfg.actor.global_batch_size // self._world_size
+        indices = batch.get("task_indices")
+        validate_task_indices(indices, (size,), len(names))
+        raw = self._task_weights[indices.cpu()].float()
+        stats = torch.zeros((2, len(names)), dtype=torch.float64, device=self.device)
+        for i in range(len(names)):
+            selected = indices.cpu().eq(i)
+            stats[0, i] = selected.sum()
+            stats[1, i] = raw[selected].double().sum()
+        torch.distributed.all_reduce(stats)
+        mean_weight = (stats[1].sum() / stats[0].sum()).cpu().float()
+        batch["sample_weights"] = raw / mean_weight
+        metrics = {
+            "multi_task/normalized_weight_mean": (
+                stats[1].sum() / mean_weight.to(stats) / stats[0].sum()
+            ).item()
+        }
+        for i, name in enumerate(names):
+            metrics[f"multi_task/{name}/sample_count"] = stats[0, i].item()
+            metrics[f"multi_task/{name}/normalized_weight"] = (
+                (stats[1, i] / stats[0, i] / mean_weight.to(stats)).item()
+                if stats[0, i]
+                else 0.0
+            )
+        return metrics
+
+    def _all_ranks_replay_ready(self, minimum: int) -> bool:
+        """Keep SAC collective calls aligned, including the warmup boundary."""
+        available = (
+            self.replay_buffer.total_samples
+            if isinstance(self.replay_buffer, CompactDSRLReplayBuffer)
+            else self.replay_buffer.available_samples
+        )
+        ready = torch.tensor(
+            int(
+                self.replay_buffer.is_ready(minimum)
+                and available >= self.cfg.actor.global_batch_size // self._world_size
+            ),
+            dtype=torch.int64,
+            device=self.device,
+        )
+        torch.distributed.all_reduce(ready, op=torch.distributed.ReduceOp.MIN)
+        return bool(ready.item())
+
     @Worker.timer("update_one_epoch")
     def update_one_epoch(self, train_actor: bool = True):
         global_batch_size_per_rank = (
@@ -1043,6 +1121,11 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         with self.worker_timer("sample"):
             global_batch = next(self.buffer_dataloader_iter)
 
+        task_metrics = (
+            self._prepare_sac_task_batch(global_batch)
+            if getattr(self, "multi_task_enabled", False)
+            else {}
+        )
         train_micro_batch_list = split_dict_to_chunk(
             global_batch,
             global_batch_size_per_rank // self.cfg.actor.micro_batch_size,
@@ -1079,6 +1162,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         self.qf_lr_scheduler.step()
 
         metrics_data = {
+            **task_metrics,
             "sac/critic_loss": np.mean(gbs_critic_loss),
             "critic/lr": self.qf_optimizer.param_groups[0]["lr"],
             "critic/grad_norm": qf_grad_norm,
@@ -1241,7 +1325,13 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
 
         # Check if replay buffer has enough samples
         min_buffer_size = self.cfg.algorithm.replay_buffer.get("min_buffer_size", 100)
-        if not self.replay_buffer.is_ready(min_buffer_size):
+        multi_task = getattr(self, "multi_task_enabled", False)
+        ready = (
+            self._all_ranks_replay_ready(min_buffer_size)
+            if multi_task
+            else self.replay_buffer.is_ready(min_buffer_size)
+        )
+        if not ready:
             self.log_on_first_rank(
                 f"Replay buffer size {len(self.replay_buffer)} < {min_buffer_size}, skipping training"
             )
@@ -1250,7 +1340,11 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         # Delay actor training until buffer has enough samples
         train_actor_steps = self.cfg.algorithm.get("train_actor_steps", 0)
         train_actor_steps = max(min_buffer_size, train_actor_steps)
-        train_actor = self.replay_buffer.is_ready(train_actor_steps)
+        train_actor = (
+            self._all_ranks_replay_ready(train_actor_steps)
+            if multi_task
+            else self.replay_buffer.is_ready(train_actor_steps)
+        )
 
         assert (
             self.cfg.actor.global_batch_size
@@ -1334,17 +1428,81 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             self._save_dsrl_target_checkpoint(target_checkpoint_path, step)
         else:
             target_model_state_dict = self._strategy.get_model_state_dict(
-                self.target_model, cpu_offload=False, full_state_dict=True
+                self.target_model, cpu_offload=True, full_state_dict=True
             )
-            torch.save(target_model_state_dict, target_checkpoint_path)
+            # CPU full-state gathering returns weights only on rank 0. All
+            # ranks participate in the collective, but only rank 0 writes.
+            if self._rank == 0:
+                torch.save(target_model_state_dict, target_checkpoint_path)
 
         # save replay buffer
         buffer_save_path = os.path.join(
             save_base_path, f"sac_components/replay_buffer/rank_{self._rank}"
         )
         self.replay_buffer.save_checkpoint(buffer_save_path)
+        if getattr(self, "multi_task_enabled", False):
+            self._save_multi_task_sac_state(save_base_path, step)
+
+    def _save_multi_task_sac_state(self, directory: str, step: int) -> None:
+        if self._task_weight_version != step:
+            raise ValueError("SAC task weights and checkpoint step disagree.")
+        state = {
+            "format": "sac_multitask_v1",
+            "step": step,
+            "update_step": self.update_step,
+            "rank": self._rank,
+            "world_size": self._world_size,
+            "critic_rng_state": self.critic_sample_generator.get_state(),
+            "target_shadow_f32": {
+                k: v.cpu() for k, v in self._target_shadow_f32.items()
+            },
+        }
+        path = os.path.join(
+            directory, "sac_components", f"multi_task_rank_{self._rank}.pt"
+        )
+        torch.save(state, path)
+
+    def _read_multi_task_sac_state(self, directory: str) -> dict:
+        path = os.path.join(
+            directory, "sac_components", f"multi_task_rank_{self._rank}.pt"
+        )
+        state = torch.load(path, map_location="cpu", weights_only=True)
+        if (
+            state.get("format") != "sac_multitask_v1"
+            or state.get("rank") != self._rank
+            or state.get("world_size") != self._world_size
+            or type(state.get("step")) is not int
+            or state["step"] < 0
+            or type(state.get("update_step")) is not int
+            or state["update_step"] < 0
+        ):
+            raise ValueError("Invalid SAC multi-task checkpoint state.")
+        return state
+
+    def _restore_multi_task_sac_state(self, state: dict) -> None:
+        """Restore SAC cadence and target precision independently of rollout count."""
+        self.update_step = state["update_step"]
+        self.version = state["step"]
+        self.critic_sample_generator.set_state(state["critic_rng_state"])
+        saved_shadow = state["target_shadow_f32"]
+        if saved_shadow.keys() != self._target_shadow_f32.keys():
+            raise ValueError("SAC target shadow keys mismatch.")
+        for name, current in self._target_shadow_f32.items():
+            saved = saved_shadow[name]
+            if (
+                saved.shape != current.shape
+                or saved.dtype != torch.float32
+                or not torch.isfinite(saved).all()
+            ):
+                raise ValueError("Invalid SAC target shadow tensor.")
+            current.copy_(saved.to(current.device))
 
     def load_checkpoint(self, load_base_path):
+        task_state = (
+            self._read_multi_task_sac_state(load_base_path)
+            if getattr(self, "multi_task_enabled", False)
+            else None
+        )
         self._validate_dsrl_resume_contract(load_base_path)
 
         # load model
@@ -1380,12 +1538,23 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                 target_checkpoint_path
             )
         else:
-            target_model_state_dict = torch.load(target_checkpoint_path)
+            # Rank 0 is also complete in the legacy per-rank layout. Ignore
+            # redundant (or empty) nonzero-rank files and broadcast on restore.
+            target_model_state_dict = (
+                torch.load(
+                    os.path.join(target_model_load_path, "checkpoint_rank_0.pt"),
+                    map_location="cpu",
+                    weights_only=True,
+                )
+                if self._rank == 0
+                else {}
+            )
             self._strategy.load_model_with_state_dict(
                 self.target_model,
                 target_model_state_dict,
                 cpu_offload=False,
                 full_state_dict=True,
+                broadcast_from_rank0=True,
             )
             target_restore_receipt = "loaded"
             if self.use_dsrl:
@@ -1396,8 +1565,15 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             load_base_path, f"sac_components/replay_buffer/rank_{self._rank}"
         )
         self.replay_buffer.load_checkpoint(buffer_load_path)
+        if task_state is not None:
+            self._restore_multi_task_sac_state(task_state)
 
         return {
+            **(
+                {"multi_task_step": task_state["step"]}
+                if task_state is not None
+                else {}
+            ),
             "rank": self._rank,
             "checkpoint_format": self.cfg.actor.fsdp_config.get(
                 "checkpoint_format", "dcp"

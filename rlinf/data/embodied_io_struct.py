@@ -683,13 +683,13 @@ class EmbodiedRolloutResult:
         )
         if self.task_indices:
             trajectory.task_indices = torch.stack(self.task_indices).cpu().contiguous()
+            action_rows = self.actions or self.prev_logprobs
             if (
-                trajectory.task_indices.shape[:2]
-                != torch.stack(self.prev_logprobs).shape[:2]
+                not action_rows
+                or trajectory.task_indices.shape[:2]
+                != torch.stack(action_rows).shape[:2]
             ):
-                raise ValueError(
-                    "PPO task indices must align with action log probabilities."
-                )
+                raise ValueError("Task indices must align with action rows.")
         if len(self.actions) > 0:
             trajectory.actions = torch.stack(self.actions, dim=0).cpu().contiguous()
         if len(self.intervene_flags) > 0:

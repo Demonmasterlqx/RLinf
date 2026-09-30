@@ -1251,10 +1251,10 @@ def _validate_tabero_realworld_pi05_dsrl_contract(cfg, model_cfg) -> None:
 
 
 def validate_embodied_cfg(cfg):
-    from rlinf.utils.ppo_multi_task import (
+    from rlinf.utils.multi_task import (
         enabled as multi_task_enabled,
     )
-    from rlinf.utils.ppo_multi_task import (
+    from rlinf.utils.multi_task import (
         task_env_cfg,
         task_list,
     )
@@ -1265,7 +1265,12 @@ def validate_embodied_cfg(cfg):
     if multi_task_enabled(cfg):
         import copy
 
-        validate_multi_task_config(cfg)
+        if cfg.algorithm.loss_type == "embodied_sac":
+            from rlinf.utils.sac_multi_task import validate_config as validate_sac_tasks
+
+            validate_sac_tasks(cfg)
+        else:
+            validate_multi_task_config(cfg)
         # Validate every isolated task through the unchanged single-task gates.
         validated = None
         for task_index in range(len(task_list(cfg.env.train))):

@@ -43,6 +43,7 @@ from rlinf.utils.dsrl_reward import (
     summarize_dsrl_chunk_rewards,
 )
 from rlinf.utils.dsrl_transition import DSRL_TRANSITION_BOUNDARY_SEMANTICS
+from rlinf.utils.multi_task import task_index_remap, validate_task_indices
 
 
 def _dtype_name(dtype: torch.dtype) -> str:
@@ -80,6 +81,7 @@ class CompactDSRLReplayBuffer:
     def __init__(
         self,
         *,
+        task_names: list[str] | None = None,
         seed: Optional[int] = 1234,
         capacity_transitions: int,
         checkpoint_shard_transitions: int = 4096,
@@ -115,7 +117,11 @@ class CompactDSRLReplayBuffer:
         self.replay_semantics = replay_semantics
         self.observation_semantics = observation_semantics
         self.transition_boundary_semantics = transition_boundary_semantics
-        self.field_specs = get_dsrl_replay_field_specs(replay_semantics)
+        self.task_names = list(task_names) if task_names is not None else None
+        self.field_specs = dict(get_dsrl_replay_field_specs(replay_semantics))
+        if self.task_names is not None:
+            task_index_remap(self.task_names, self.task_names)
+            self.field_specs["task_indices"] = ((), torch.int64)
         self.view_order = tuple(replay_contract["view_order"])
         self.num_images = int(replay_contract["num_images"])
         self.observation_keys = tuple(
@@ -128,6 +134,8 @@ class CompactDSRLReplayBuffer:
         self.checkpoint_shard_transitions = int(checkpoint_shard_transitions)
         self.max_resident_bytes = int(float(max_resident_gib) * (2**30))
         self.bytes_per_transition = dsrl_replay_bytes_per_transition(replay_semantics)
+        if self.task_names is not None:
+            self.bytes_per_transition += 8
         self.capacity_bytes = self.bytes_per_transition * self.capacity_transitions
         if self.capacity_bytes > self.max_resident_bytes:
             raise ValueError(
@@ -228,6 +236,15 @@ class CompactDSRLReplayBuffer:
                 )
             flat[name] = value.reshape(num_samples, *shape).cpu().contiguous()
 
+        if self.task_names is not None:
+            validate_task_indices(
+                trajectory.task_indices, (traj_len, batch_size), len(self.task_names)
+            )
+            flat["task_indices"] = (
+                trajectory.task_indices.reshape(-1).cpu().contiguous()
+            )
+        elif trajectory.task_indices is not None:
+            raise ValueError("Task-labelled trajectories require a multi-task replay.")
         if set(flat) != set(self.field_specs):
             raise AssertionError("Internal compact replay field projection mismatch.")
         return flat
@@ -282,6 +299,11 @@ class CompactDSRLReplayBuffer:
 
     def _nested_batch(self, flat: Mapping[str, torch.Tensor]) -> dict[str, object]:
         return {
+            **(
+                {"task_indices": flat["task_indices"]}
+                if self.task_names is not None
+                else {}
+            ),
             "curr_obs": {key: flat[f"curr_obs.{key}"] for key in self.observation_keys},
             "next_obs": {key: flat[f"next_obs.{key}"] for key in self.observation_keys},
             "actions": flat["actions"],
@@ -374,7 +396,10 @@ class CompactDSRLReplayBuffer:
     ) -> dict[str, object]:
         return {
             "format": DSRL_REPLAY_FORMAT,
-            "format_version": DSRL_REPLAY_FORMAT_VERSION,
+            "format_version": 2
+            if self.task_names is not None
+            else DSRL_REPLAY_FORMAT_VERSION,
+            **({"task_names": self.task_names} if self.task_names is not None else {}),
             "replay_semantics": self.replay_semantics,
             "reward_semantics": DSRL_REWARD_SEMANTICS,
             "observation_semantics": self.observation_semantics,
@@ -443,6 +468,7 @@ class CompactDSRLReplayBuffer:
         cls,
         load_path: str,
         *,
+        expected_task_names: list[str] | None = None,
         expected_capacity: int | None = None,
         expected_replay_semantics: str = DSRL_REPLAY_SEMANTICS,
         expected_observation_semantics: str | None = None,
@@ -464,10 +490,17 @@ class CompactDSRLReplayBuffer:
             expected_transition_boundary_semantics = replay_contract[
                 "transition_boundary_semantics"
             ]
-        field_specs = get_dsrl_replay_field_specs(expected_replay_semantics)
+        field_specs = dict(get_dsrl_replay_field_specs(expected_replay_semantics))
+        if expected_task_names is not None:
+            task_index_remap(metadata.get("task_names"), expected_task_names)
+            field_specs["task_indices"] = ((), torch.int64)
+        elif metadata.get("task_names") is not None:
+            raise ValueError("Cannot disable multi-task replay on continuation.")
         expected_values = {
             "format": DSRL_REPLAY_FORMAT,
-            "format_version": DSRL_REPLAY_FORMAT_VERSION,
+            "format_version": 2
+            if expected_task_names is not None
+            else DSRL_REPLAY_FORMAT_VERSION,
             "replay_semantics": expected_replay_semantics,
             "reward_semantics": DSRL_REWARD_SEMANTICS,
             "observation_semantics": expected_observation_semantics,
@@ -477,7 +510,8 @@ class CompactDSRLReplayBuffer:
             "image_size": DSRL_REPLAY_IMAGE_SIZE,
             "bytes_per_transition": dsrl_replay_bytes_per_transition(
                 expected_replay_semantics
-            ),
+            )
+            + (8 if expected_task_names is not None else 0),
             "field_manifest": _field_manifest(field_specs),
         }
         for key, expected in expected_values.items():
@@ -602,6 +636,7 @@ class CompactDSRLReplayBuffer:
         del local_rank, world_size
         metadata = self.validate_checkpoint_metadata(
             load_path,
+            expected_task_names=self.task_names,
             expected_capacity=self.capacity_transitions,
             expected_replay_semantics=self.replay_semantics,
             expected_observation_semantics=self.observation_semantics,
@@ -639,6 +674,12 @@ class CompactDSRLReplayBuffer:
                         f"expected {expected_shape}/{dtype}, got "
                         f"{tuple(tensor.shape)}/{tensor.dtype}."
                     )
+            if self.task_names is not None:
+                validate_task_indices(
+                    shard["task_indices"], (shard_count,), len(self.task_names)
+                )
+                remap = task_index_remap(metadata["task_names"], self.task_names)
+                shard["task_indices"] = remap[shard["task_indices"]]
             self._append_flat(shard)
             loaded_samples += shard_count
             del shard

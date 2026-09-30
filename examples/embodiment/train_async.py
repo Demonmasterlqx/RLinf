@@ -34,11 +34,11 @@ mp.set_start_method("spawn", force=True)
     version_base="1.1", config_path="config", config_name="maniskill_sac_mlp_async"
 )
 def main(cfg) -> None:
-    from rlinf.utils.ppo_multi_task import enabled as multi_task_enabled
+    from rlinf.utils.multi_task import enabled as multi_task_enabled
 
     if multi_task_enabled(cfg):
         raise ValueError(
-            "PPO multi_task requires train_embodied_agent.py (synchronous PPO)."
+            "multi_task requires train_embodied_agent.py (synchronous training)."
         )
     cfg = validate_cfg(cfg)
     print(json.dumps(OmegaConf.to_container(cfg, resolve=True), indent=2))

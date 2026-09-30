@@ -45,6 +45,8 @@ from rlinf.utils.dsrl_replay import (
 )
 from rlinf.utils.dsrl_reward import summarize_dsrl_chunk_rewards
 from rlinf.utils.metric_utils import compute_split_num
+from rlinf.utils.multi_task import COUNT_KEY, task_env_cfg, task_list
+from rlinf.utils.multi_task import enabled as multi_task_enabled
 from rlinf.utils.nested_dict_process import (
     clone_nested_to_cpu,
     copy_dict_tensor,
@@ -52,8 +54,6 @@ from rlinf.utils.nested_dict_process import (
     update_nested_cfg,
 )
 from rlinf.utils.placement import HybridComponentPlacement
-from rlinf.utils.ppo_multi_task import COUNT_KEY, task_env_cfg, task_list
-from rlinf.utils.ppo_multi_task import enabled as multi_task_enabled
 from rlinf.utils.utils import (
     flatten_embodied_batch,
     pack_batch,
@@ -245,6 +245,7 @@ def project_compact_dsrl_step_result(
     if result.rewards is not None:
         return result
     return ChunkStepResult(
+        task_indices=result.task_indices,
         actions=result.actions,
         prev_logprobs=result.prev_logprobs,
         prev_values=result.prev_values,
@@ -595,11 +596,11 @@ class EnvWorker(Worker):
                 shard = self._rank * self.stage_num + stage_id
                 if self._world_size * self.stage_num < len(tasks):
                     raise ValueError(
-                        "Not enough logical environment instances for PPO tasks."
+                        "Not enough logical environment instances for tasks."
                     )
                 effective_cfg = task_env_cfg(env_cfg, shard % len(tasks))
                 self.log_info(
-                    f"PPO task shard={shard}: {tasks[shard % len(tasks)]['name']}"
+                    f"Task shard={shard}: {tasks[shard % len(tasks)]['name']}"
                 )
             env = env_cls(
                 cfg=effective_cfg,
@@ -1270,9 +1271,7 @@ class EnvWorker(Worker):
     ) -> None:
         """Count each training episode once, before post-terminal resets."""
         if records is None:
-            raise ValueError(
-                "PPO multi_task requires explicit completed-episode records."
-            )
+            raise ValueError("multi_task requires explicit completed-episode records.")
         if not records:
             return
         seen = self._multi_task_eval_seen if evaluation else self._multi_task_seen
@@ -1439,7 +1438,7 @@ class EnvWorker(Worker):
                     chunk_step_result = ChunkStepResult(
                         task_indices=(
                             torch.full(
-                                (rollout_result.prev_logprobs.shape[0],),
+                                (rollout_result.actions.shape[0],),
                                 (self._rank * self.stage_num + stage_id)
                                 % len(task_list(self.cfg.env.train)),
                                 dtype=torch.int64,
@@ -1627,7 +1626,7 @@ class EnvWorker(Worker):
                 expected[index] += self.rollout_epoch * self.train_num_envs_per_stage
             if not torch.equal(self._multi_task_counts[1], expected):
                 raise ValueError(
-                    "PPO multi_task rollout reset would discard unfinished episodes."
+                    "multi_task rollout reset would discard unfinished episodes."
                 )
             env_metrics[COUNT_KEY] = self._multi_task_counts
         return env_metrics
