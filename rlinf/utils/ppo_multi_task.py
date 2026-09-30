@@ -204,7 +204,7 @@ def validate_config(cfg) -> None:
 
 
 def manifest(cfg) -> dict:
-    """Describe the task and optimization contract used for strict resume."""
+    """Record task and optimization settings for provenance, not resume gating."""
     splits = ["train"] + (
         ["eval"] if cfg.runner.get("val_check_interval", -1) > 0 else []
     )
@@ -336,13 +336,25 @@ class SuccessWeightController:
         if not path.is_file():
             raise ValueError(f"Multi-task continuation requires {path}.")
         payload = json.loads(path.read_text())
-        if (
-            payload.get("format") != "ppo_multitask_v1"
-            or payload.get("step") != step
-            or payload.get("names") != self.names
-            or payload.get("contract") != self.contract
+        if payload.get("format") != "ppo_multitask_v1" or payload.get("step") != step:
+            raise ValueError("PPO multi-task checkpoint format or step mismatch.")
+        saved_names = payload.get("names")
+        if not isinstance(saved_names, list) or not all(
+            isinstance(name, str) for name in saved_names
         ):
-            raise ValueError("PPO multi-task checkpoint contract or step mismatch.")
+            raise ValueError("Invalid PPO multi-task checkpoint task names.")
+        duplicates = sorted(
+            {name for name in saved_names if saved_names.count(name) > 1}
+        )
+        if duplicates:
+            raise ValueError(f"Duplicate PPO checkpoint task names: {duplicates}.")
+        if set(saved_names) != set(self.names):
+            missing = sorted(set(self.names) - set(saved_names))
+            unexpected = sorted(set(saved_names) - set(self.names))
+            raise ValueError(
+                "PPO multi-task checkpoint task names mismatch: "
+                f"missing={missing}, unexpected={unexpected}."
+            )
         ema = torch.tensor(payload["ema"], dtype=torch.float64)
         initialized = torch.tensor(payload["initialized"], dtype=torch.bool)
         totals = torch.tensor(payload["totals"])
@@ -351,6 +363,7 @@ class SuccessWeightController:
             or initialized.shape != self.initialized.shape
             or totals.shape != self.totals.shape
             or not torch.isfinite(ema).all()
+            or not torch.isfinite(totals).all()
             or ((ema < 0) | (ema > 1)).any()
             or (totals < 0).any()
             or (totals != totals.round()).any()
@@ -358,10 +371,12 @@ class SuccessWeightController:
             or not torch.equal(initialized, totals[1] > 0)
         ):
             raise ValueError("Invalid PPO multi-task checkpoint state.")
+        # Task identity is its name; old configuration records are informational.
+        order = [saved_names.index(name) for name in self.names]
         self.ema, self.initialized, self.totals = (
-            ema,
-            initialized,
-            totals.to(torch.int64),
+            ema[order],
+            initialized[order],
+            totals[:, order].to(torch.int64),
         )
         self.version = step
 

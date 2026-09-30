@@ -647,7 +647,11 @@ class EmbodiedRunner:
 
             with self.timer("step", trace_args={"step_idx": _step}):
                 with self.timer("sync_weights"):
-                    if _step % self.weight_sync_interval == 0:
+                    if _step % self.weight_sync_interval == 0 or (
+                        self.multi_task_controller is not None
+                        and self.cfg.runner.get("resume_dir")
+                        and _step == start_step
+                    ):
                         self.update_rollout_weights()
                 with self.timer("generate_rollouts"):
                     env_handle: Handle = self.env.interact(

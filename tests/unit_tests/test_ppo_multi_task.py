@@ -16,7 +16,9 @@
 
 import copy
 import json
+from contextlib import nullcontext
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -108,24 +110,159 @@ def test_round_is_updated_once():
         tracker.update(counts, 1)
 
 
-def test_resume_preserves_next_weights_and_rejects_contract_changes(tmp_path):
+@pytest.mark.parametrize("keep_contract", [True, False])
+def test_resume_preserves_next_weights_with_changed_contract(tmp_path, keep_contract):
     original = controller()
     original.update(torch.tensor([[2, 1], [3, 5]]), 1)
     original.save(str(tmp_path), 1)
+    if not keep_contract:
+        path = tmp_path / "multi_task_state.json"
+        payload = json.loads(path.read_text())
+        del payload["contract"]
+        path.write_text(json.dumps(payload))
     restored = controller()
+    restored.contract = {"contract": 2}
     restored.restore(str(tmp_path), 1)
     next_counts = torch.tensor([[1, 3], [4, 4]])
     original.update(next_counts, 2)
     restored.update(next_counts, 2)
     torch.testing.assert_close(original.weights, restored.weights, rtol=0, atol=0)
-    changed = controller()
-    changed.contract = {"contract": 2}
-    with pytest.raises(ValueError, match="contract"):
-        changed.restore(str(tmp_path), 1)
     with pytest.raises(ValueError, match="step"):
         controller().restore(str(tmp_path), 2)
     with pytest.raises(ValueError, match="requires"):
         controller().restore(str(tmp_path / "missing"), 1)
+
+
+def test_resume_reorders_tasks_and_uses_current_settings(tmp_path):
+    original = controller()
+    original.update(torch.tensor([[2, 1], [3, 5]]), 1)
+    original.save(str(tmp_path), 1)
+    settings = {**DEFAULTS, "ema_decay": 0.5, "weight_min": 0.2, "weight_max": 3.0}
+    restored = SuccessWeightController(["hard", "easy"], settings, {})
+    restored.restore(str(tmp_path), 1)
+    torch.testing.assert_close(restored.ema, original.ema.flip(0))
+    torch.testing.assert_close(restored.initialized, original.initialized.flip(0))
+    torch.testing.assert_close(restored.totals, original.totals.flip(1))
+    restored.update(torch.tensor([[3, 1], [4, 4]]), 2)
+    expected_ema = original.ema.flip(0) * 0.5 + torch.tensor([0.75, 0.25]) * 0.5
+    torch.testing.assert_close(restored.ema, expected_ema)
+    expected_weights = 0.2 + 2.8 * torch.sigmoid(
+        10 * (expected_ema.mean() - expected_ema)
+    )
+    torch.testing.assert_close(restored.weights, expected_weights.float())
+    assert restored.version == 2
+    # A subsequent checkpoint follows the current order and remains resumable.
+    restored.save(str(tmp_path), 2)
+    original.restore(str(tmp_path), 2)
+    torch.testing.assert_close(original.ema, restored.ema.flip(0))
+    torch.testing.assert_close(original.totals, restored.totals.flip(1))
+
+
+@pytest.mark.parametrize(
+    "names, message",
+    [
+        (["easy"], "missing=.*hard"),
+        (["easy", "hard", "new"], "unexpected=.*new"),
+        (["easy", "renamed"], "missing=.*hard.*unexpected=.*renamed"),
+        (["easy", "easy"], "Duplicate.*easy"),
+    ],
+)
+def test_resume_rejects_changed_or_duplicate_task_names(tmp_path, names, message):
+    tracker = controller()
+    tracker.save(str(tmp_path), 0)
+    path = tmp_path / "multi_task_state.json"
+    payload = json.loads(path.read_text())
+    payload["names"] = names
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match=message):
+        controller().restore(str(tmp_path), 0)
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("format", "unknown"),
+        ("ema", [2, 0]),
+        ("ema", [float("nan"), 0]),
+        ("ema", [0]),
+        ("totals", [[0, 0], [float("inf"), 1]]),
+        ("totals", [[2, 0], [1, 1]]),
+        ("initialized", [False, True]),
+    ],
+)
+def test_resume_rejects_invalid_state(tmp_path, field, value):
+    tracker = controller()
+    tracker.update(torch.tensor([[1, 0], [1, 1]]), 1)
+    tracker.save(str(tmp_path), 1)
+    path = tmp_path / "multi_task_state.json"
+    payload = json.loads(path.read_text())
+    payload[field] = value
+    path.write_text(json.dumps(payload))
+    with pytest.raises(ValueError):
+        controller().restore(str(tmp_path), 1)
+
+
+@pytest.mark.parametrize(
+    "multi_task, resume, start, expected_syncs",
+    [
+        (True, True, 3, [3, 4]),
+        (True, True, 4, [4, 6]),
+        (False, True, 3, [4]),
+        (True, False, 0, [0, 2]),
+    ],
+)
+def test_runner_syncs_restored_multitask_weights_before_first_rollout(
+    multi_task, resume, start, expected_syncs
+):
+    from rlinf.runners.embodied_runner import EmbodiedRunner
+
+    runner = object.__new__(EmbodiedRunner)
+    runner.cfg = OmegaConf.create(
+        {"runner": {"resume_dir": f"global_step_{start}" if resume else None}}
+    )
+    runner.global_step = start
+    runner.max_steps = start + 3
+    runner.weight_sync_interval = 2
+    runner.multi_task_controller = controller() if multi_task else None
+    if multi_task:
+        runner.multi_task_controller.version = start
+    runner.actor, runner.env, runner.rollout = MagicMock(), MagicMock(), MagicMock()
+    runner.reward = None
+    runner.overlap_env_bootstrap = False
+    runner.env_channel = runner.rollout_channel = object()
+    runner.reward_channel = runner.actor_channel = object()
+    runner.timer = lambda *args, **kwargs: nullcontext()
+    runner.metric_logger = MagicMock()
+    runner._should_profile_step = MagicMock(return_value=False)
+    runner._take_task_counts = MagicMock(return_value=torch.tensor([[1, 0], [1, 1]]))
+    runner._validate_tabero_dsrl_reward_step = MagicMock(return_value={})
+    runner._maybe_eval_and_checkpoint = MagicMock(return_value={})
+    runner._log_step_metrics = MagicMock()
+    runner._finish_run = MagicMock()
+    events = []
+    runner.update_rollout_weights = lambda: events.append(("sync", runner.global_step))
+
+    def interact(**kwargs):
+        events.append(("rollout", runner.global_step))
+        return MagicMock()
+
+    runner.env.interact.side_effect = interact
+    runner.run()
+    assert [step for event, step in events if event == "sync"] == expected_syncs
+    for step in expected_syncs:
+        assert events.index(("sync", step)) < events.index(("rollout", step))
+    assert runner.global_step == start + 3
+
+
+def test_runner_rejects_disabling_multitask_on_resume(tmp_path):
+    from rlinf.runners.embodied_runner import EmbodiedRunner
+
+    controller().save(str(tmp_path), 0)
+    runner = object.__new__(EmbodiedRunner)
+    runner.cfg = OmegaConf.create({"runner": {"resume_dir": str(tmp_path)}})
+    runner.multi_task_controller = None
+    with pytest.raises(ValueError, match="cannot disable"):
+        runner.init_workers()
 
 
 def test_corrupt_resume_is_rejected(tmp_path):

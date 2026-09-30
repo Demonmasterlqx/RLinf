@@ -218,10 +218,24 @@ and normalized weights. These batch counts are averaged over PPO updates, not
 unique rollout episode counts. Environment startup logs the shard assignment.
 
 Every multi-task checkpoint includes an atomic ``multi_task_state.json`` beside
-``actor/``. It records the task contract, success EMA, initialization flags,
+``actor/``. It records configuration provenance, success EMA, initialization flags,
 cumulative counts and rollout version. Resume requires this state, the matching
-actor step and an unchanged task/optimization contract. Old single-task resumes
-are unaffected. A multi-task continuation cannot disable the controller or load
-an old checkpoint without its state. Loading base model weights to start a new
+actor step and the same set of task names. Task order may change: history is
+restored by name. Added, removed, renamed or duplicate tasks, corrupt state, and
+disabling the controller are rejected. A name identifies the same historical task;
+changing its environment or reward does not clear its history.
+
+The ``contract`` field is informational and need not exist or match on restore;
+existing ``ppo_multitask_v1`` files need no conversion. GPU placement, environment
+count, stages, batches, rewards, evaluation and training limits may change without
+being rejected by the multi-task restore layer. Current configuration validation
+and model/DCP compatibility requirements still apply. Historical EMA and counts
+are retained, while current EMA decay and weight settings govern subsequent
+updates. Model, optimizer, scheduler and RNG loading remain unchanged; this does
+not override learning rates restored from the checkpoint.
+
+The first rollout after a multi-task resume always synchronizes the restored actor
+weights; later rounds follow the configured synchronization interval. Old
+single-task resumes are unaffected. Loading base model weights to start a new
 experiment remains separate from continuation. Export metadata lists all tasks
 instead of describing the policy as one target object.
