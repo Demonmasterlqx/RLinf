@@ -228,16 +228,17 @@ class EmbodiedRunner:
             f"resume_dir {actor_checkpoint_path} does not exist."
         )
         checkpoint_receipts = self.actor.load_checkpoint(actor_checkpoint_path).wait()
-        if (
-            self.multi_task_controller is not None
-            and self.cfg.algorithm.loss_type == "embodied_sac"
+        if self.multi_task_controller is not None and self.cfg.algorithm.loss_type in (
+            "embodied_sac",
+            "rlt_ac",
         ):
             if not checkpoint_receipts or any(
-                receipt.get("multi_task_step") != self.multi_task_controller.version
+                not isinstance(receipt, dict)
+                or receipt.get("multi_task_step") != self.multi_task_controller.version
                 for receipt in checkpoint_receipts
             ):
                 raise ValueError(
-                    "SAC actor and multi-task controller checkpoint steps disagree."
+                    "Off-policy actor and multi-task controller checkpoint steps disagree."
                 )
         if checkpoint_receipts and any(
             receipt is not None for receipt in checkpoint_receipts

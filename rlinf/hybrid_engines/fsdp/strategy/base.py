@@ -27,6 +27,7 @@ from torch.distributed.checkpoint.state_dict import (
     set_model_state_dict,
 )
 from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.fsdp import ShardingStrategy
 from torch.distributed.tensor import DTensor
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
@@ -312,7 +313,15 @@ class FSDPStrategyBase(ABC):
             load_path (str): The path to load the checkpoint from.
             checkpoint_format (str): "dcp" or "local_shard".
         """
-        opts = StateDictOptions(full_state_dict=False, cpu_offload=True)
+        # NO_SHARD uses full tensors on every rank. Explicitly request a full,
+        # non-offloaded load template so nonzero ranks also have optimizer
+        # parameter groups, rather than an empty rank-0-only placeholder.
+        fsdp_modules = FSDP.fsdp_modules(model)
+        no_shard = bool(fsdp_modules) and all(
+            module.sharding_strategy == ShardingStrategy.NO_SHARD
+            for module in fsdp_modules
+        )
+        opts = StateDictOptions(full_state_dict=no_shard, cpu_offload=not no_shard)
         training_state = Checkpoint(
             model=model,
             optimizers=optimizers,

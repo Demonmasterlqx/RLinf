@@ -733,5 +733,41 @@ action chunk。同步和异步入口都遵守这一规则。
 - ``rollout.rlt_feature_model.model_path`` 应指向 Stage 1 FSDP 检查点下的 ``actor`` 目录，例如 ``.../checkpoints/global_step_<step>/actor``。
 - 添加仿真示例时，可以新建仿真环境配置，保留 ``loss_type: rlt_ac`` 和 ``rollout.rlt_feature_model``，再把真机阶段切换逻辑替换成适合仿真的逻辑。
 
+同步多任务 Stage 2
+------------------
+
+IsaacLab Stage 2 可通过 ``algorithm.multi_task.enabled: true`` 启用与
+PPO/SAC 相同的成功率任务加权。使用 ``train_embodied_agent.py``，设置
+``rlt_schedule.enable: true``、``transition_replay: true`` 和
+``rlt_route.actor_scope: full_task``，并在 ``env.train.multi_task.tasks`` 中
+提供唯一的 ``name`` 与任务 ``init_params``。任务共享冻结的 Stage 1
+特征模型、状态/动作接口及 Actor/Critic；如开启周期评估，评估任务名称与顺序
+应与训练一致。逻辑环境实例数必须覆盖全部任务。
+
+每轮完整 rollout 结束后，按任务汇总成功 episode 数和总 episode 数，更新一次
+成功率 EMA（默认 0.9），再计算：
+
+.. math::
+
+   w_k = 0.5 + 1.5\,\sigma(10(\bar p-\hat p_k)),\qquad
+   \widetilde w_i = w_{k_i}/\operatorname{mean}_{j\in B}(w_{k_j}).
+
+任务均值是各任务 EMA 的等权平均。Replay 保存任务身份；旧样本使用本轮的
+任务权重，按包含所有 rank 和梯度累积的完整优化 batch 归一化。归一化后同一个
+系数乘 Critic 的 twin-Q TD MSE，以及 Actor 完整的 ``-q_weight * Q1 + bc_weight * BC``。
+奖励、TD target、采样概率、预热和 Q/BC 系数调度保持原有语义，固定 alpha=0。
+预热期间仍统计实际执行的 reference 策略成功率，Actor 接管后不重置 EMA。
+
+首版只支持同步、非自动 reset、完整 episode 的 transition replay；不支持
+训练 pipeline、demo/expert 混合或 replay preload。各 rank 不足一个完整局部
+batch 时统一等待，并保留待执行更新预算。
+
+恢复需要 ``multi_task_state.json``（``rlt_multitask_v1``）、带任务标签的 replay
+和 RLT schedule sidecar。Rollout 权重版本与 learner ``update_step`` 分别恢复；
+同一任务名集合可以重排，EMA 和 replay 标签按名称映射，不以完整配置相等作为
+新增恢复条件。日志包括每任务成功率/EMA/权重，以及
+``train/actor/task/<name>/bc_mse``、``q1`` 和
+``train/critic/task/<name>/td_mse``；这些诊断量按样本数汇总。
+
 Stage 2 MLP 的 FSDP 配置使用 ``use_orig_params: false``。SAC/RLT worker 在
 FSDP 包装前记录可训练参数名，保证展平参数后仍可导出 ``trainable_weights.pt``。

@@ -743,7 +743,10 @@ class TrajectoryReplayBuffer:
         if self.task_names is not None:
             validate_task_indices(
                 trajectory.task_indices,
-                trajectory.rewards.shape[:2],
+                # RLT flattens raw rollouts before splitting transitions. Their
+                # rewards include one bootstrap slot per epoch; task identities
+                # always describe the executed actions, not those extra slots.
+                trajectory.actions.shape[:2],
                 len(self.task_names),
             )
         flat: dict[str, object] = {}

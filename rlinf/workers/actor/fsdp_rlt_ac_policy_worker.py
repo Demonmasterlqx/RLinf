@@ -17,6 +17,8 @@ import queue
 
 import torch
 import torch.nn.functional as F
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import ShardingStrategy
 
 from rlinf.algorithms.rlt.transition import use_simulator_transition_replay
 from rlinf.data.embodied_io_struct import Trajectory
@@ -29,6 +31,8 @@ from rlinf.utils.metric_utils import (
     compute_split_num,
     trajectory_has_bool_tensor,
 )
+from rlinf.utils.multi_task import task_list, validate_task_indices
+from rlinf.utils.sac_multi_task import weighted_sac_mean
 from rlinf.utils.utils import clear_memory
 from rlinf.workers.actor.async_fsdp_sac_policy_worker import (
     AsyncEmbodiedSACFSDPPolicy,
@@ -100,6 +104,8 @@ class RLTACLossMixin:
         actions: torch.Tensor,
         ref_chunk: torch.Tensor,
         intervene_flags: torch.Tensor | None,
+        *,
+        per_sample: bool = False,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         chunk_len, action_dim = self._chunk_shape()
         pi_chunk = self._flatten_chunk(pi).reshape(-1, chunk_len, action_dim)
@@ -143,7 +149,41 @@ class RLTACLossMixin:
             "human_mask_ratio": human_ratio,
             "policy_mask_ratio": 1.0 - human_ratio,
         }
-        return bc_loss, metrics
+        return (bc_error.mean(dim=-1) if per_sample else bc_loss), metrics
+
+    def _task_loss_metrics(self, batch, **values) -> dict[str, float]:
+        """Keep additive diagnostics until reduction across batches and ranks."""
+        if not getattr(self, "multi_task_enabled", False):
+            return {}
+        indices = batch["task_indices"]
+        metrics = {}
+        for index, task in enumerate(task_list(self.cfg.env.train)):
+            mask = indices == index
+            prefix = f"task/{task['name']}"
+            metrics[f"{prefix}/count"] = mask.sum().item()
+            for key, value in values.items():
+                per_sample = (
+                    value.detach().float().reshape(indices.shape[0], -1).mean(1)
+                )
+                metrics[f"{prefix}/{key}_sum"] = per_sample[mask].sum().item()
+        return metrics
+
+    def process_train_metrics(self, metrics):
+        reduced = super().process_train_metrics(metrics)
+        # The base worker averages additive statistics over equal-sized micro
+        # batches, learner updates and ranks. Numerator/count has the same scale.
+        for key in list(reduced):
+            if "/task/" not in key or not key.endswith("_sum"):
+                continue
+            prefix = key.rsplit("/", 1)[0]
+            count = reduced[f"{prefix}/count"]
+            value = reduced.pop(key)
+            if count > 0:
+                reduced[key.removesuffix("_sum")] = value / count
+        for key in list(reduced):
+            if "/task/" in key and key.endswith("/count"):
+                del reduced[key]
+        return reduced
 
     def _actor_objective_weights(self) -> tuple[float, float, dict[str, float]]:
         """Resolve RLT actor-objective BC/Q weights."""
@@ -290,10 +330,20 @@ class RLTACLossMixin:
             )
 
         target_q_values = target_q_values.to(dtype=all_data_q_values.dtype)
+        td_errors = F.mse_loss(
+            all_data_q_values,
+            target_q_values.expand_as(all_data_q_values),
+            reduction="none",
+        )
         critic_loss = F.mse_loss(
             all_data_q_values, target_q_values.expand_as(all_data_q_values)
         )
-        return critic_loss, {"q_data": all_data_q_values.mean().item()}
+        if "sample_weights" in batch:
+            critic_loss = weighted_sac_mean(td_errors, batch["sample_weights"])
+        return critic_loss, {
+            "q_data": all_data_q_values.mean().item(),
+            **self._task_loss_metrics(batch, td_mse=td_errors),
+        }
 
     @Worker.timer("forward_actor")
     def forward_actor(self, batch):
@@ -344,12 +394,20 @@ class RLTACLossMixin:
             actions=batch["actions"],
             ref_chunk=ref_chunk,
             intervene_flags=batch.get("intervene_flags", None),
+            per_sample=True,
         )
         metrics.update(rlt_metrics)
 
         entropy = -log_pi.mean()
         bc_weight, q_weight, weight_metrics = self._actor_objective_weights()
-        actor_loss = -q_weight * qf_pi.mean() + bc_weight * bc_loss
+        if "sample_weights" in batch:
+            q_mean = weighted_sac_mean(qf_pi, batch["sample_weights"])
+            bc_mean = weighted_sac_mean(bc_loss, batch["sample_weights"])
+        else:
+            q_mean = qf_pi.mean()
+            bc_mean = bc_loss.mean()
+        actor_loss = -q_weight * q_mean + bc_weight * bc_mean
+        metrics.update(self._task_loss_metrics(batch, bc_mse=bc_loss, q1=qf_pi))
         metrics.update(weight_metrics)
         metrics["action_ref_abs_mean"] = (
             (self._flatten_chunk(pi) - self._flatten_chunk(ref_chunk))
@@ -358,8 +416,8 @@ class RLTACLossMixin:
             .detach()
             .item()
         )
-        metrics["weighted_q"] = (q_weight * qf_pi.mean()).detach().item()
-        metrics["weighted_bc"] = (bc_weight * bc_loss).detach().item()
+        metrics["weighted_q"] = (q_weight * q_mean).detach().item()
+        metrics["weighted_bc"] = (bc_weight * bc_mean).detach().item()
         metrics["reference_dropout_prob"] = reference_dropout_prob
 
         return actor_loss, entropy, metrics
@@ -477,6 +535,7 @@ class RLTACReplayMixin:
 
         tensor_fields = (
             "actions",
+            "task_indices",
             "intervene_flags",
             "rewards",
             "terminations",
@@ -491,6 +550,12 @@ class RLTACReplayMixin:
         completed_episodes = 0
         traj_len = int(trajectory.actions.shape[0])
         bsz = int(trajectory.actions.shape[1])
+        if getattr(self, "multi_task_enabled", False):
+            validate_task_indices(
+                trajectory.task_indices,
+                (traj_len, bsz),
+                len(task_list(self.cfg.env.train)),
+            )
         num_rows = int(actions.shape[0])
         auto_reset = bool(self.cfg.env.train.get("auto_reset", False))
         bootstrap_fields = (
@@ -638,9 +703,7 @@ class RLTACReplayMixin:
             action_bound = float(
                 self.cfg.actor.model.get("normalized_action_bound", 1.0)
             )
-            max_stats["normalized_action_abs_max"] = float(
-                actions.abs().max().item()
-            )
+            max_stats["normalized_action_abs_max"] = float(actions.abs().max().item())
             sum_stats["action_count"] = float(actions.numel())
             sum_stats["action_saturation_count"] = float(
                 (actions.abs() >= 0.99 * action_bound).sum().item()
@@ -652,8 +715,8 @@ class RLTACReplayMixin:
             environment_action = traj.forward_inputs.get("environment_action")
             if not isinstance(environment_action, torch.Tensor):
                 continue
-            physical_actions = environment_action.detach().float().reshape(
-                -1, action_dim
+            physical_actions = (
+                environment_action.detach().float().reshape(-1, action_dim)
             )
             if action_dim > 7:
                 physical_force_tensors.append(physical_actions[:, 7:])
@@ -690,17 +753,11 @@ class RLTACReplayMixin:
             and torch.distributed.is_available()
             and torch.distributed.is_initialized()
         ):
-            sum_stats = all_reduce_dict(
-                sum_stats, op=torch.distributed.ReduceOp.SUM
-            )
-            max_stats = all_reduce_dict(
-                max_stats, op=torch.distributed.ReduceOp.MAX
-            )
+            sum_stats = all_reduce_dict(sum_stats, op=torch.distributed.ReduceOp.SUM)
+            max_stats = all_reduce_dict(max_stats, op=torch.distributed.ReduceOp.MAX)
         metrics = {
             "replay/transition_count": sum_stats["transition_count"],
-            "replay/normalized_action_abs_max": max_stats[
-                "normalized_action_abs_max"
-            ],
+            "replay/normalized_action_abs_max": max_stats["normalized_action_abs_max"],
             "replay/physical_force_abs_max": max_stats["physical_force_abs_max"],
         }
         if sum_stats["action_count"] > 0:
@@ -825,20 +882,21 @@ class RLTACScheduleCheckpointMixin:
             f"checkpoint_rank_{self._rank}.pt",
         )
 
+    def _multi_task_checkpoint_format(self) -> str:
+        return "rlt_multitask_v1"
+
     def save_checkpoint(self, save_base_path, step):
         super().save_checkpoint(save_base_path, step)
         state_path = self._rlt_checkpoint_path(save_base_path)
         os.makedirs(os.path.dirname(state_path), exist_ok=True)
-        state = {
-            field: getattr(self, field) for field in self._RLT_CHECKPOINT_FIELDS
-        }
+        state = {field: getattr(self, field) for field in self._RLT_CHECKPOINT_FIELDS}
         state["global_step"] = int(step)
         torch.save(state, state_path)
 
     def load_checkpoint(self, load_base_path):
-        super().load_checkpoint(load_base_path)
+        receipt = super().load_checkpoint(load_base_path)
         if not self.use_rlt_schedule:
-            return
+            return receipt
         state_path = self._rlt_checkpoint_path(load_base_path)
         state = None
         local_error: Exception | None = None
@@ -855,13 +913,18 @@ class RLTACScheduleCheckpointMixin:
                 raise ValueError(
                     f"RLT checkpoint {state_path} is missing fields: {missing}."
                 )
+            if getattr(self, "multi_task_enabled", False) and (
+                receipt["multi_task_step"] != state["global_step"]
+                or receipt["multi_task_update_step"] != state["update_step"]
+            ):
+                raise ValueError(
+                    "RLT schedule and multi-task checkpoint steps disagree."
+                )
             checkpoint_dir = os.path.basename(
                 os.path.dirname(os.path.normpath(load_base_path))
             )
             if checkpoint_dir.startswith("global_step_"):
-                expected_global_step = int(
-                    checkpoint_dir.removeprefix("global_step_")
-                )
+                expected_global_step = int(checkpoint_dir.removeprefix("global_step_"))
                 if int(state["global_step"]) != expected_global_step:
                     raise ValueError(
                         "RLT checkpoint global step mismatch: sidecar contains "
@@ -928,6 +991,7 @@ class RLTACScheduleCheckpointMixin:
                 )
         for field in self._RLT_CHECKPOINT_FIELDS:
             setattr(self, field, state[field])
+        return receipt
 
 
 class RLTACFSDPPolicy(
@@ -937,6 +1001,22 @@ class RLTACFSDPPolicy(
     EmbodiedSACFSDPPolicy,
 ):
     """Synchronous RLT AC worker with transition replay and warmup scheduling."""
+
+    def soft_update_target_model(self, tau=None):
+        # A frozen FSDP target has no backward pass to invalidate its cached
+        # full parameters. Updating shards directly can leave forward/state_dict
+        # reading stale values. Public full-param contexts commit the EMA to
+        # both the unsharded views and each rank's shards.
+        if isinstance(self.target_model, FSDP) and any(
+            module.sharding_strategy != ShardingStrategy.NO_SHARD
+            for module in FSDP.fsdp_modules(self.target_model)
+        ):
+            with (
+                FSDP.summon_full_params(self.model, writeback=False),
+                FSDP.summon_full_params(self.target_model, writeback=True),
+            ):
+                return super().soft_update_target_model(tau)
+        return super().soft_update_target_model(tau)
 
     def __init__(self, cfg):
         super().__init__(cfg)
@@ -974,13 +1054,18 @@ class RLTACFSDPPolicy(
             },
             op=torch.distributed.ReduceOp.SUM,
         )
+        local_minimums = {
+            "min_replay_size": float(self.replay_buffer.total_samples),
+            "min_demo_size": float(
+                0 if self.demo_buffer is None else self.demo_buffer.total_samples
+            ),
+        }
+        if getattr(self, "multi_task_enabled", False):
+            local_minimums["min_available_samples"] = float(
+                self.replay_buffer.available_samples
+            )
         minimums = all_reduce_dict(
-            {
-                "min_replay_size": float(self.replay_buffer.total_samples),
-                "min_demo_size": float(
-                    0 if self.demo_buffer is None else self.demo_buffer.total_samples
-                ),
-            },
+            local_minimums,
             op=torch.distributed.ReduceOp.MIN,
         )
         summed.update(minimums)
@@ -994,6 +1079,10 @@ class RLTACFSDPPolicy(
         )
         counters = self._global_rlt_counters()
         buffer_ready = counters["min_replay_size"] >= min_buffer_size
+        batch_ready = not getattr(self, "multi_task_enabled", False) or (
+            counters["min_available_samples"]
+            >= self.cfg.actor.global_batch_size // self._world_size
+        )
         warmup_required_updates = int(
             schedule_cfg.get("warmup_post_collect_updates", 0)
         )
@@ -1052,6 +1141,10 @@ class RLTACFSDPPolicy(
                 updates_to_run = min(updates_to_run, max_updates)
             if updates_to_run <= 0:
                 skip_reason = 2
+            elif not batch_ready:
+                # Preserve pending budget while all ranks wait for a full batch.
+                updates_to_run = 0
+                skip_reason = 4
         self.pending_update_budget = int(pending_updates)
 
         metrics = {

@@ -1443,18 +1443,22 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         if getattr(self, "multi_task_enabled", False):
             self._save_multi_task_sac_state(save_base_path, step)
 
+    def _multi_task_checkpoint_format(self) -> str:
+        """Allow off-policy subclasses to retain distinct continuation state."""
+        return "sac_multitask_v1"
+
     def _save_multi_task_sac_state(self, directory: str, step: int) -> None:
         if self._task_weight_version != step:
             raise ValueError("SAC task weights and checkpoint step disagree.")
         state = {
-            "format": "sac_multitask_v1",
+            "format": self._multi_task_checkpoint_format(),
             "step": step,
             "update_step": self.update_step,
             "rank": self._rank,
             "world_size": self._world_size,
             "critic_rng_state": self.critic_sample_generator.get_state(),
             "target_shadow_f32": {
-                k: v.cpu() for k, v in self._target_shadow_f32.items()
+                k: v.cpu() for k, v in getattr(self, "_target_shadow_f32", {}).items()
             },
         }
         path = os.path.join(
@@ -1468,7 +1472,7 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         )
         state = torch.load(path, map_location="cpu", weights_only=True)
         if (
-            state.get("format") != "sac_multitask_v1"
+            state.get("format") != self._multi_task_checkpoint_format()
             or state.get("rank") != self._rank
             or state.get("world_size") != self._world_size
             or type(state.get("step")) is not int
@@ -1485,9 +1489,10 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         self.version = state["step"]
         self.critic_sample_generator.set_state(state["critic_rng_state"])
         saved_shadow = state["target_shadow_f32"]
-        if saved_shadow.keys() != self._target_shadow_f32.keys():
+        current_shadow = getattr(self, "_target_shadow_f32", {})
+        if saved_shadow.keys() != current_shadow.keys():
             raise ValueError("SAC target shadow keys mismatch.")
-        for name, current in self._target_shadow_f32.items():
+        for name, current in current_shadow.items():
             saved = saved_shadow[name]
             if (
                 saved.shape != current.shape
@@ -1570,7 +1575,10 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
 
         return {
             **(
-                {"multi_task_step": task_state["step"]}
+                {
+                    "multi_task_step": task_state["step"],
+                    "multi_task_update_step": task_state["update_step"],
+                }
                 if task_state is not None
                 else {}
             ),

@@ -369,12 +369,11 @@ def batch_weight_stats(weights: torch.Tensor, mask: torch.Tensor) -> torch.Tenso
 
 
 def state_format(cfg) -> str:
-    """Keep historical PPO state compatible while distinguishing SAC state."""
-    return (
-        "sac_multitask_v1"
-        if OmegaConf.select(cfg, "algorithm.loss_type") == "embodied_sac"
-        else "ppo_multitask_v1"
-    )
+    """Keep controller state distinct across PPO, SAC and RLT objectives."""
+    return {
+        "embodied_sac": "sac_multitask_v1",
+        "rlt_ac": "rlt_multitask_v1",
+    }.get(OmegaConf.select(cfg, "algorithm.loss_type"), "ppo_multitask_v1")
 
 
 def validate_task_indices(indices, shape: tuple, task_count: int) -> None:

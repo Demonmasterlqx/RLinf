@@ -787,3 +787,40 @@ Practical Notes
 - To add a simulator example, create a simulator environment config, keep
   ``loss_type: rlt_ac`` and ``rollout.rlt_feature_model``, and replace the
   real-robot phase-switching logic with simulator-appropriate behavior.
+
+
+Synchronous multi-task Stage 2
+------------------------------
+
+IsaacLab Stage 2 supports the shared PPO/SAC success-rate controller through
+``algorithm.multi_task.enabled: true``. Use ``train_embodied_agent.py`` with
+``rlt_schedule.enable: true``, ``transition_replay: true`` and
+``rlt_route.actor_scope: full_task``. Declare unique task names and environment
+parameters in ``env.train.multi_task.tasks``. Tasks share the frozen Stage 1
+feature model and Stage 2 Actor/Critic interfaces. Logical environment instances
+must cover all tasks; periodic evaluation uses the same task names and order.
+
+After each complete rollout, the controller updates each task's success EMA
+(default decay 0.9). The default raw weight is
+``0.5 + 1.5 * sigmoid(10 * (mean_task_ema - task_ema))``.
+Replay retains task identities and applies the current weights to historical
+samples. Weights are normalized to mean one over the entire optimizer batch,
+including all ranks and gradient accumulation. They multiply both twin-Q TD MSE
+and the full Actor objective ``-q_weight * Q1 + bc_weight * BC``.
+The Actor predicts complete actions. Rewards, replay sampling probabilities,
+warmup, update cadence and the BC/Q coefficient schedule retain their existing
+semantics.
+
+Version 1 requires synchronous, terminal-safe complete episodes, transition
+replay, the standard twin-Q head and fixed zero entropy temperature. Pipeline
+training, replay preload and demo/expert mixing are unsupported. Optimization
+waits until every rank can supply its complete local batch, retaining pending
+update budget.
+
+Resume requires ``multi_task_state.json`` (``rlt_multitask_v1``), RLT schedule
+state, replay and normal model/optimizer/Target checkpoint files. Rollout and
+learner update counters remain distinct and are checked for consistency across
+sidecars. Task reordering is supported by name; missing or renamed tasks fail
+explicitly. TensorBoard and W&B report per-task successes/episodes, EMA, raw and
+normalized weights, sample counts and unweighted TD/BC/Q diagnostics alongside
+weighted losses and the RLT schedule counters.

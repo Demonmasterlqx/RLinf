@@ -1269,6 +1269,10 @@ def validate_embodied_cfg(cfg):
             from rlinf.utils.sac_multi_task import validate_config as validate_sac_tasks
 
             validate_sac_tasks(cfg)
+        elif cfg.algorithm.loss_type == "rlt_ac":
+            from rlinf.utils.rlt_multi_task import validate_config as validate_rlt_tasks
+
+            validate_rlt_tasks(cfg)
         else:
             validate_multi_task_config(cfg)
         # Validate every isolated task through the unchanged single-task gates.
@@ -1299,7 +1303,7 @@ def validate_embodied_cfg(cfg):
         )
         if shard_count < len(task_list(validated.env.train)):
             raise ValueError(
-                "PPO multi_task needs at least one logical env instance per task."
+                "multi_task needs at least one logical env instance per task."
             )
         return validated
 
