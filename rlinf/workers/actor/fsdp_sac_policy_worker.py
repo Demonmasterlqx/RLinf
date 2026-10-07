@@ -1593,5 +1593,8 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             "replay_buffer": {
                 "size": int(self.replay_buffer.size),
                 "total_samples": int(self.replay_buffer.total_samples),
+                "task_migration": getattr(
+                    self.replay_buffer, "last_restore_migration", None
+                ),
             },
         }

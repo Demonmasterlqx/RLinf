@@ -43,7 +43,12 @@ from rlinf.utils.dsrl_reward import (
     summarize_dsrl_chunk_rewards,
 )
 from rlinf.utils.dsrl_transition import DSRL_TRANSITION_BOUNDARY_SEMANTICS
-from rlinf.utils.multi_task import task_index_remap, validate_task_indices
+from rlinf.utils.multi_task import (
+    task_index_remap,
+    task_migration_remap,
+    task_migration_summary,
+    validate_task_indices,
+)
 
 
 def _dtype_name(dtype: torch.dtype) -> str:
@@ -492,7 +497,7 @@ class CompactDSRLReplayBuffer:
             ]
         field_specs = dict(get_dsrl_replay_field_specs(expected_replay_semantics))
         if expected_task_names is not None:
-            task_index_remap(metadata.get("task_names"), expected_task_names)
+            task_migration_remap(metadata.get("task_names"), expected_task_names)
             field_specs["task_indices"] = ((), torch.int64)
         elif metadata.get("task_names") is not None:
             raise ValueError("Cannot disable multi-task replay on continuation.")
@@ -676,9 +681,9 @@ class CompactDSRLReplayBuffer:
                     )
             if self.task_names is not None:
                 validate_task_indices(
-                    shard["task_indices"], (shard_count,), len(self.task_names)
+                    shard["task_indices"], (shard_count,), len(metadata["task_names"])
                 )
-                remap = task_index_remap(metadata["task_names"], self.task_names)
+                remap = task_migration_remap(metadata["task_names"], self.task_names)
                 shard["task_indices"] = remap[shard["task_indices"]]
             self._append_flat(shard)
             loaded_samples += shard_count
@@ -701,5 +706,23 @@ class CompactDSRLReplayBuffer:
                 f"Tabero DSRL compact replay write_pos is invalid: {write_pos!r}."
             )
         self._write_pos = write_pos
+        if self.task_names is not None:
+            # Shards are physical ring slots. Only compact when samples were
+            # removed; otherwise preserve layout and sampling determinism.
+            if self._valid_samples:
+                order = self._chronological_indices()
+                keep = self._storage["task_indices"][order] >= 0
+                if not keep.all():
+                    retained = order[keep]
+                    count = len(retained)
+                    for tensor in self._storage.values():
+                        tensor[:count].copy_(tensor[retained])
+                    self._valid_samples = count
+                    self._write_pos = count % self.capacity_transitions
+            self.last_restore_migration = {
+                **task_migration_summary(metadata["task_names"], self.task_names),
+                "retained_samples": self._valid_samples,
+                "dropped_samples": valid_samples - self._valid_samples,
+            }
         rng_state = torch.tensor(metadata["rng_state"], dtype=torch.uint8)
         self.random_generator.set_state(rng_state)

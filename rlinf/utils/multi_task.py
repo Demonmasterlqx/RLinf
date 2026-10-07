@@ -343,20 +343,13 @@ class SuccessWeightController:
             raise ValueError(
                 f"Duplicate multi-task checkpoint task names: {duplicates}."
             )
-        if set(saved_names) != set(self.names):
-            missing = sorted(set(self.names) - set(saved_names))
-            unexpected = sorted(set(saved_names) - set(self.names))
-            raise ValueError(
-                "Multi-task checkpoint task names mismatch: "
-                f"missing={missing}, unexpected={unexpected}."
-            )
         ema = torch.tensor(payload["ema"], dtype=torch.float64)
         initialized = torch.tensor(payload["initialized"], dtype=torch.bool)
         totals = torch.tensor(payload["totals"])
         if (
-            ema.shape != self.ema.shape
-            or initialized.shape != self.initialized.shape
-            or totals.shape != self.totals.shape
+            ema.shape != (len(saved_names),)
+            or initialized.shape != (len(saved_names),)
+            or totals.shape != (2, len(saved_names))
             or not torch.isfinite(ema).all()
             or not torch.isfinite(totals).all()
             or ((ema < 0) | (ema > 1)).any()
@@ -367,13 +360,17 @@ class SuccessWeightController:
         ):
             raise ValueError("Invalid Multi-task checkpoint state.")
         # Task identity is its name; old configuration records are informational.
-        order = [saved_names.index(name) for name in self.names]
-        self.ema, self.initialized, self.totals = (
-            ema[order],
-            initialized[order],
-            totals[:, order].to(torch.int64),
-        )
+        remap = task_migration_remap(saved_names, self.names)
+        keep = remap >= 0
+        new_ema = torch.zeros_like(self.ema)
+        new_initialized = torch.zeros_like(self.initialized)
+        new_totals = torch.zeros_like(self.totals)
+        new_ema[remap[keep]] = ema[keep]
+        new_initialized[remap[keep]] = initialized[keep]
+        new_totals[:, remap[keep]] = totals[:, keep].to(torch.int64)
+        self.ema, self.initialized, self.totals = new_ema, new_initialized, new_totals
         self.version = step
+        self.last_restore_migration = task_migration_summary(saved_names, self.names)
 
 
 def batch_weight_stats(weights: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -418,3 +415,28 @@ def task_index_remap(saved_names, names) -> torch.Tensor:
     ):
         raise ValueError("Multi-task replay task names mismatch.")
     return torch.tensor([names.index(name) for name in saved_names], dtype=torch.int64)
+
+
+def task_migration_remap(saved_names, names) -> torch.Tensor:
+    """Map checkpoint IDs by name; deleted tasks map to -1 only during restore."""
+    for values in (saved_names, names):
+        if (
+            not isinstance(values, list)
+            or not values
+            or not all(isinstance(name, str) and name for name in values)
+            or len(set(values)) != len(values)
+        ):
+            raise ValueError("Invalid multi-task checkpoint task names.")
+    current = {name: index for index, name in enumerate(names)}
+    return torch.tensor(
+        [current.get(name, -1) for name in saved_names], dtype=torch.int64
+    )
+
+
+def task_migration_summary(saved_names, names) -> dict:
+    """Describe task identity changes for checkpoint restore receipts."""
+    return {
+        "inherited": [name for name in names if name in saved_names],
+        "new": [name for name in names if name not in saved_names],
+        "deleted": [name for name in saved_names if name not in names],
+    }

@@ -240,9 +240,20 @@ TD targets, rewards, temperature loss and target updates are unchanged.
 Both trajectory and compact replay retain task indices in checkpoints. Compact
 multi-task replay uses format version 2; single-task replay remains version 1.
 Continuation requires controller, SAC update counter, RNG and labelled replay
-state. Task names identify tasks: reordering names remaps EMA and replay indices;
-adding/removing tasks is rejected. Configuration snapshots are provenance, not
-whole-configuration equality gates. TensorBoard and W&B report completed episodes,
+state. Current task names and order govern continuation: matching names inherit
+EMA/counters and replay samples; new names start with zero history and no samples;
+removed names lose their history and samples. Renaming is removal plus addition.
+Both replay formats filter transitions and remap IDs by name, retaining stored
+rewards without recomputation. Compact replay preserves ring chronology; trajectory
+replay preserves trajectory IDs and model versions, using owned temporary storage
+for filtered trajectories without modifying the source checkpoint. If no samples
+are deleted, the original sample order and RNG sequence are preserved. Empty replay
+is valid; all ranks collect more data until every rank can supply a full batch.
+Shared model, optimizers, targets, RNG and rollout/update counters remain restored.
+Model/schema/capacity/rank/world-size compatibility checks remain in force.
+Restore receipts report inherited/new/deleted tasks and retained/dropped samples.
+Save again to persist the current names and filtered data. Configuration snapshots
+are provenance, not whole-configuration equality gates. TensorBoard and W&B report completed episodes,
 success rates, EMA, raw weights, sampled counts and normalized weights per task.
 
 The example ``isaaclab_pi05_dsrl_task820_multi_tasks_tacfield_8gpu_benchmark``

@@ -207,6 +207,9 @@ class EmbodiedRunner:
             self.multi_task_controller.restore(
                 resume, int(resume.split("global_step_")[-1])
             )
+            self.logger.info(
+                f"Multi-task restore: {self.multi_task_controller.last_restore_migration}"
+            )
         # create worker in order to decrease the maximum memory usage
         rollout_handle = self.rollout.init_worker()
         env_handle = self.env.init_worker()

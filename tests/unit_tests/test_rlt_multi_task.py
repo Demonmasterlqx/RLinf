@@ -602,3 +602,102 @@ def test_two_gpu_rlt_update_checkpoint_and_exact_next_update(tmp_path, shard):
     assert len(gpu_ids) == 2 and len(set(gpu_ids)) == 2
     assert all(0 <= gpu < torch.cuda.device_count() for gpu in gpu_ids)
     mp.spawn(_gpu_roundtrip, args=(str(tmp_path), gpu_ids, shard), nprocs=2, join=True)
+
+
+@pytest.mark.parametrize("names", [["hard"], ["new", "easy"], ["new"]])
+def test_rlt_transition_replay_migrates_without_crossing_boundaries(tmp_path, names):
+    actor = worker()
+    original = TrajectoryReplayBuffer(
+        task_names=["easy", "hard"], sample_window_size=100
+    )
+    restored = TrajectoryReplayBuffer(task_names=names, sample_window_size=100)
+    actor.replay_buffer = original
+    try:
+        transitions, _ = actor._transition_replay_trajectories(labelled_trajectory())
+        original.add_trajectories(transitions)
+        original.save_checkpoint(str(tmp_path))
+        restored.load_checkpoint(str(tmp_path))
+        expected_ids = [
+            i
+            for i, item in enumerate(transitions)
+            if ["easy", "hard"][item.task_indices.item()] in names
+        ]
+        assert restored._trajectory_id_list == expected_ids
+        assert restored.total_samples == len(expected_ids)
+        if expected_ids:
+            restored._flat_trajectory_cache.clear()
+            samples = restored.sample(20)
+            torch.testing.assert_close(samples["rewards"], samples["actions"])
+            torch.testing.assert_close(
+                samples["curr_obs"]["z_rl"], samples["actions"][:, :1]
+            )
+            originals = {int(item.actions[0, 0, 0]): item for item in transitions}
+            for field in ("next_obs", "curr_obs"):
+                for key, values in samples[field].items():
+                    expected = torch.stack(
+                        [
+                            getattr(originals[int(action)], field)[key][0, 0]
+                            for action in samples["actions"][:, 0]
+                        ]
+                    )
+                    torch.testing.assert_close(values, expected)
+            for action, task in zip(
+                samples["actions"][:, 0].long(), samples["task_indices"]
+            ):
+                assert names[task] == ["easy", "hard"][action % 10]
+                assert action // 10 not in (2, 5)
+    finally:
+        original.close()
+        restored.close()
+
+
+def _distributed_rlt_migration(rank, directory):
+    from pathlib import Path
+
+    import rlinf.workers.actor.fsdp_rlt_ac_policy_worker as rlt
+
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{directory}/gloo",
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=60),
+    )
+    rlt.all_reduce_dict = cpu_reduce
+    actor = worker(batch_size=4, world_size=2)
+    original = TrajectoryReplayBuffer(
+        task_names=["easy", "hard"], sample_window_size=100
+    )
+    restored = TrajectoryReplayBuffer(task_names=["hard"], sample_window_size=100)
+    try:
+        actor.replay_buffer = original
+        traj = labelled_trajectory()
+        traj.task_indices.fill_(rank)
+        transitions, _ = actor._transition_replay_trajectories(traj)
+        original.add_trajectories(transitions)
+        path = Path(directory) / str(rank)
+        original.save_checkpoint(str(path))
+        restored.load_checkpoint(str(path))
+        actor.replay_buffer = restored
+        actor.demo_buffer = None
+        actor.update_step = 2
+        actor.total_transitions_added = 10
+        actor._warmup_ready_total_transitions = 0
+        actor._warmup_ready_total_episodes = 0
+        updates, _ = actor._rlt_updates_to_run()
+        assert updates == 0 and actor.update_step == 2
+        if rank == 0:
+            for item in transitions:
+                item.task_indices.zero_()
+            restored.add_trajectories(transitions)
+        updates, _ = actor._rlt_updates_to_run()
+        assert updates > 0 and actor.update_step == 2
+        assert actor.total_transitions_added == 10
+    finally:
+        original.close()
+        restored.close()
+        dist.destroy_process_group()
+
+
+def test_two_rank_rlt_empty_migration_collects_before_updating(tmp_path):
+    mp.spawn(_distributed_rlt_migration, args=(str(tmp_path),), nprocs=2, join=True)

@@ -161,13 +161,12 @@ def test_resume_reorders_tasks_and_uses_current_settings(tmp_path):
 @pytest.mark.parametrize(
     "names, message",
     [
-        (["easy"], "missing=.*hard"),
-        (["easy", "hard", "new"], "unexpected=.*new"),
-        (["easy", "renamed"], "missing=.*hard.*unexpected=.*renamed"),
+        (["easy"], "Invalid.*state"),
+        (["easy", "hard", "new"], "Invalid.*state"),
         (["easy", "easy"], "Duplicate.*easy"),
     ],
 )
-def test_resume_rejects_changed_or_duplicate_task_names(tmp_path, names, message):
+def test_resume_rejects_malformed_or_duplicate_task_names(tmp_path, names, message):
     tracker = controller()
     tracker.save(str(tmp_path), 0)
     path = tmp_path / "multi_task_state.json"
@@ -719,3 +718,58 @@ def test_checkpoint_metadata_has_all_tasks_and_no_single_object():
     assert "target_object" not in result and "task_description" not in result
     assert [task["target_object"] for task in result["tasks"]] == ["a", "b"]
     assert old["target_object"] == "a"
+
+
+@pytest.mark.parametrize(
+    "state_format", ["ppo_multitask_v1", "sac_multitask_v1", "rlt_multitask_v1"]
+)
+@pytest.mark.parametrize(
+    "names", [["hard"], ["new", "hard", "easy"], ["new", "hard"], ["new"]]
+)
+def test_resume_migrates_task_history(tmp_path, state_format, names):
+    old = SuccessWeightController(
+        ["easy", "hard"], DEFAULTS, {}, state_format=state_format
+    )
+    old.update(torch.tensor([[2, 1], [3, 5]]), 1)
+    old.save(str(tmp_path), 1)
+    restored = SuccessWeightController(names, DEFAULTS, {}, state_format=state_format)
+    restored.restore(str(tmp_path), 1)
+    for index, name in enumerate(names):
+        if name in old.names:
+            before = old.names.index(name)
+            assert restored.ema[index] == old.ema[before]
+            assert restored.initialized[index]
+            torch.testing.assert_close(restored.totals[:, index], old.totals[:, before])
+        else:
+            assert restored.ema[index] == 0
+            assert not restored.initialized[index]
+            assert not restored.totals[:, index].any()
+    if "new" in names:
+        torch.testing.assert_close(restored.weights, torch.ones(len(names)))
+    assert restored.version == 1
+    restored.update(torch.tensor([[1] * len(names), [2] * len(names)]), 2)
+    (tmp_path / "next").mkdir()
+    restored.save(str(tmp_path / "next"), 2)
+    again = SuccessWeightController(names, DEFAULTS, {}, state_format=state_format)
+    again.restore(str(tmp_path / "next"), 2)
+    torch.testing.assert_close(again.ema, restored.ema)
+    torch.testing.assert_close(again.totals, restored.totals)
+
+
+def test_controller_failed_migration_is_atomic(tmp_path):
+    old = controller()
+    old.save(str(tmp_path), 0)
+    path = tmp_path / "multi_task_state.json"
+    payload = json.loads(path.read_text())
+    payload["totals"] = [[0], [0]]
+    path.write_text(json.dumps(payload))
+    target = SuccessWeightController(["new", "hard"], DEFAULTS, {})
+    target.update(torch.tensor([[1, 0], [2, 1]]), 1)
+    before = (target.ema.clone(), target.initialized.clone(), target.totals.clone())
+    with pytest.raises(ValueError, match="Invalid.*state"):
+        target.restore(str(tmp_path), 0)
+    assert target.version == 1
+    for actual, expected in zip(
+        (target.ema, target.initialized, target.totals), before
+    ):
+        torch.testing.assert_close(actual, expected)

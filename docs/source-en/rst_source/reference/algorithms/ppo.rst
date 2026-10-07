@@ -220,10 +220,13 @@ unique rollout episode counts. Environment startup logs the shard assignment.
 Every multi-task checkpoint includes an atomic ``multi_task_state.json`` beside
 ``actor/``. It records configuration provenance, success EMA, initialization flags,
 cumulative counts and rollout version. Resume requires this state, the matching
-actor step and the same set of task names. Task order may change: history is
-restored by name. Added, removed, renamed or duplicate tasks, corrupt state, and
-disabling the controller are rejected. A name identifies the same historical task;
-changing its environment or reward does not clear its history.
+actor step and ``algorithm.multi_task.enabled: true``. The current configuration
+sets task names and order. Matching names inherit EMA, initialization flags and
+cumulative counts; new names start with zero history, and removed names are
+discarded. Renaming is removal plus addition; completely replacing the task set
+is allowed. Duplicate names, corrupt state and disabling the controller remain
+errors. While any task is uninitialized, all task weights are one. Current
+environment/reward settings apply to matching names without clearing their history.
 
 The ``contract`` field is informational and need not exist or match on restore;
 existing ``ppo_multitask_v1`` files need no conversion. GPU placement, environment

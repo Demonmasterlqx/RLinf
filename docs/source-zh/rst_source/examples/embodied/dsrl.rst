@@ -338,8 +338,16 @@ terminal-safe episode。首版不支持异步、demo 混训和 replay 预取；�
 目标。Q 聚合、reward、TD target、温度损失和 target 更新保持原逻辑。
 
 多任务 compact replay 使用格式版本 2，单任务保留版本 1。续训须提供控制器、
-SAC 更新计数、RNG 及带任务标签的 replay；任务顺序改变时按名称重映射 EMA
-和 replay ID，增删任务则拒绝恢复。配置快照用于追溯，不进行整份配置相等校验。
+SAC 更新计数、RNG 及带任务标签的 replay。任务列表及顺序使用当前配置：同名任务继承
+EMA、计数及 replay 样本，新增任务统计为零且无历史样本，删除任务丢弃历史和样本；
+改名视为删除后新增。两种 replay 均按 transition 过滤并重映射 ID，历史奖励不重算。
+compact replay 保留剩余样本的时间顺序；trajectory replay 保留轨迹 ID 和模型版本，
+逐条处理并将过滤后的轨迹存入自身临时目录，不修改源 checkpoint。没有删除样本时保留
+原采样顺序和 RNG 序列。允许迁移后为空；任一 rank 不足完整 batch 时所有 rank 共同
+跳过更新，继续采集。共享模型、优化器、target、RNG 和 rollout/update 计数仍全局恢复，
+模型、schema、容量、rank/world-size 兼容性检查继续生效。恢复日志报告继承、新增、删除
+的任务及各 rank 保留/丢弃的样本数。再次保存会持久化当前名称及过滤后的数据。
+配置快照用于追溯，不进行整份配置相等校验。
 TensorBoard 与 W&B 同时记录各任务完成数、成功率、EMA、原始权重、采样数和
 归一化权重。
 

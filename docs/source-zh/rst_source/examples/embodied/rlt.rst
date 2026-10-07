@@ -764,8 +764,11 @@ batch 时统一等待，并保留待执行更新预算。
 
 恢复需要 ``multi_task_state.json``（``rlt_multitask_v1``）、带任务标签的 replay
 和 RLT schedule sidecar。Rollout 权重版本与 learner ``update_step`` 分别恢复；
-同一任务名集合可以重排，EMA 和 replay 标签按名称映射，不以完整配置相等作为
-新增恢复条件。日志包括每任务成功率/EMA/权重，以及
+当前任务集合可以重排、增删或完全替换：同名任务继承历史及 replay，新任务统计从零
+开始且无 replay，删除任务丢弃；改名视为删除后新增。Transition replay 按名称过滤并
+映射标签，保留存储的奖励且不修改源 checkpoint，迁移语义见 :doc:`dsrl`。
+共享模型、优化器、target 和 rollout/learner 计数继续全局恢复；后续 rollout 使用当前
+设置。各 rank 都有足够样本后才更新，不新增 YAML 开关或整份配置相等校验。日志包括每任务成功率/EMA/权重，以及
 ``train/actor/task/<name>/bc_mse``、``q1`` 和
 ``train/critic/task/<name>/td_mse``；这些诊断量按样本数汇总。
 

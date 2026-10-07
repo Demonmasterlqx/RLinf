@@ -820,7 +820,12 @@ update budget.
 Resume requires ``multi_task_state.json`` (``rlt_multitask_v1``), RLT schedule
 state, replay and normal model/optimizer/Target checkpoint files. Rollout and
 learner update counters remain distinct and are checked for consistency across
-sidecars. Task reordering is supported by name; missing or renamed tasks fail
-explicitly. TensorBoard and W&B report per-task successes/episodes, EMA, raw and
+sidecars. Tasks may be reordered, added or removed: matching names inherit history
+and replay, new names start with zero history and no replay, and removed names
+are discarded. Renaming is removal plus addition. Transition replay filters samples
+and remaps IDs while preserving stored rewards and source checkpoints, as described
+in :doc:`dsrl`. Shared model/optimizer/target state and rollout/learner counters
+continue globally; current settings apply to subsequent rollouts. Every rank waits
+for sufficient migrated replay before updating. No extra YAML switch is required. TensorBoard and W&B report per-task successes/episodes, EMA, raw and
 normalized weights, sample counts and unweighted TD/BC/Q diagnostics alongside
 weighted losses and the RLT schedule counters.

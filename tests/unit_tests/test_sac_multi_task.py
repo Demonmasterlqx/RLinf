@@ -4,7 +4,11 @@
 
 """Synthetic DSRL tests: actual loss methods, replay and distributed reduction."""
 
+import hashlib
 import inspect
+import json
+from datetime import timedelta
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -85,9 +89,10 @@ def replay(kind, names):
 
 
 @pytest.mark.parametrize("kind", ["compact", "trajectory"])
-def test_replay_wrap_resume_reorder_and_resave(kind, tmp_path):
+@pytest.mark.parametrize("restored_names", [["hard", "easy"], ["hard", "easy", "new"]])
+def test_replay_wrap_resume_reorder_and_resave(kind, restored_names, tmp_path):
     original = replay(kind, ["easy", "hard"])
-    restored = replay(kind, ["hard", "easy"])
+    restored = replay(kind, restored_names)
     again = replay(kind, ["easy", "hard"])
     try:
         for offset in (0, 2, 4):
@@ -129,13 +134,100 @@ def test_replay_rejects_missing_or_invalid_labels(kind, bad):
 
 
 @pytest.mark.parametrize("kind", ["compact", "trajectory"])
-def test_replay_rejects_changed_task_set(kind, tmp_path):
+@pytest.mark.parametrize(
+    "names", [["hard"], ["new", "hard"], ["new"], ["new", "hard", "easy"]]
+)
+def test_replay_migrates_task_set(kind, names, tmp_path):
     original = replay(kind, ["easy", "hard"])
-    changed = replay(kind, ["easy", "new"])
+    changed = replay(kind, names)
+    again = replay(kind, names)
+    source = tmp_path / "source"
+    try:
+        for offset in (0, 2, 4):
+            traj = trajectory(offset)
+            # Verify every retained transition keeps its observation/reward data.
+            traj.rewards[..., 0] = traj.actions[..., 0] + 10
+            for group in (traj.curr_obs, traj.next_obs, traj.forward_inputs):
+                for value in group.values():
+                    value.reshape(2, 2, -1)[..., 0] = traj.actions[..., 0]
+            original.add_trajectories([traj])
+        original.save_checkpoint(str(source))
+        hashes = {
+            p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in source.iterdir()
+        }
+        changed.load_checkpoint(str(source))
+        assert hashes == {
+            p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in source.iterdir()
+        }
+        expected = (
+            (2 if kind == "compact" else 4)
+            if "easy" not in names
+            else (5 if kind == "compact" else 8)
+        )
+        if "hard" not in names:
+            expected = 0
+        assert changed.total_samples == expected
+        assert changed.last_restore_migration["retained_samples"] == expected
+        if kind == "trajectory":
+            # Force lazy reload of the migrated files, bypassing the cache.
+            changed._flat_trajectory_cache.clear()
+        changed.save_checkpoint(str(tmp_path / "next"))
+        again.load_checkpoint(str(tmp_path / "next"))
+        assert again.total_samples == expected
+        if expected:
+            actual = changed.sample(20)
+            repeated = again.sample(20)
+            for key in ("actions", "task_indices", "rewards"):
+                torch.testing.assert_close(actual[key], repeated[key])
+            torch.testing.assert_close(
+                actual["rewards"][:, 0], actual["actions"][:, 0].float() + 10
+            )
+            for group in ("curr_obs", "next_obs", "forward_inputs"):
+                for value in actual.get(group, {}).values():
+                    torch.testing.assert_close(
+                        value.reshape(len(actual["actions"]), -1)[:, 0].float(),
+                        actual["actions"][:, 0].float(),
+                    )
+            for action, task in zip(
+                actual["actions"][:, 0].long(), actual["task_indices"]
+            ):
+                assert names[task] == ["easy", "hard"][action % 2]
+        else:
+            with pytest.raises(RuntimeError, match="empty"):
+                changed.sample(1)
+        if kind == "compact" and names == ["hard"]:
+            order = changed._chronological_indices()
+            assert changed._storage["actions"][order, 0].tolist() == [5, 5]
+            assert changed._write_pos == 2
+            assert changed.size == original.size
+            assert changed._total_inserted_samples == original._total_inserted_samples
+    finally:
+        original.close()
+        changed.close()
+        again.close()
+
+
+@pytest.mark.parametrize("kind", ["compact", "trajectory"])
+def test_migration_rejects_invalid_old_task_ids(kind, tmp_path):
+    original = replay(kind, ["easy", "hard"])
+    changed = replay(kind, ["new"])
     try:
         original.add_trajectories([trajectory()])
         original.save_checkpoint(str(tmp_path))
-        with pytest.raises(ValueError, match="task names mismatch"):
+        path = next(
+            tmp_path.glob("shard_*.pt" if kind == "compact" else "trajectory_*.pt")
+        )
+        data = torch.load(path, weights_only=True)
+        data["task_indices"].view(-1)[0] = 2
+        torch.save(data, path)
+        if kind == "compact":
+            metadata_path = tmp_path / "metadata.json"
+            metadata = json.loads(metadata_path.read_text())
+            for shard in metadata["shards"]:
+                if shard["name"] == path.name:
+                    shard["size_bytes"] = path.stat().st_size
+            metadata_path.write_text(json.dumps(metadata))
+        with pytest.raises(ValueError, match="indices"):
             changed.load_checkpoint(str(tmp_path))
     finally:
         original.close()
@@ -428,3 +520,130 @@ def test_disk_backed_replay_remaps_cache_misses_and_new_samples(tmp_path):
         original.close()
         restored.close()
         again.close()
+
+
+def _distributed_migration_readiness(rank, directory, kind):
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{directory}/gloo",
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=60),
+    )
+    original = replay(kind, ["easy", "hard"])
+    restored = replay(kind, ["hard"])
+    try:
+        traj = trajectory()
+        traj.task_indices.fill_(rank)
+        original.add_trajectories([traj])
+        path = Path(directory) / str(rank)
+        original.save_checkpoint(str(path))
+        restored.load_checkpoint(str(path))
+        actor = worker(batch_size=8, world_size=2)
+        actor.replay_buffer = restored
+        assert restored.total_samples == (0 if rank == 0 else 4)
+        assert not actor._all_ranks_replay_ready(1)
+        # One rank collecting more must not permit any rank to update early.
+        traj.task_indices.zero_()
+        if rank == 1:
+            restored.add_trajectories([traj])
+        assert not actor._all_ranks_replay_ready(1)
+        if rank == 0:
+            restored.add_trajectories([traj])
+        assert actor._all_ranks_replay_ready(1)
+    finally:
+        original.close()
+        restored.close()
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("kind", ["compact", "trajectory"])
+def test_two_rank_migrated_replay_waits_for_collection(tmp_path, kind):
+    mp.spawn(
+        _distributed_migration_readiness,
+        args=(str(tmp_path), kind),
+        nprocs=2,
+        join=True,
+    )
+
+
+def test_compact_deletion_preserves_ring_chronology_and_next_write(tmp_path):
+    original = replay("compact", ["easy", "hard"])
+    restored = replay("compact", ["hard"])
+    try:
+        for offset in (0, 4):
+            traj = trajectory()
+            traj.actions[..., 0] = torch.arange(offset, offset + 4).reshape(2, 2)
+            original.add_trajectories([traj])
+        original.save_checkpoint(str(tmp_path))
+        restored.load_checkpoint(str(tmp_path))
+        assert restored._storage["actions"][
+            restored._chronological_indices(), 0
+        ].tolist() == [5, 6]
+        fresh = trajectory()
+        fresh.task_indices.zero_()
+        fresh.actions[..., 0] = torch.arange(8, 12).reshape(2, 2)
+        restored.add_trajectories([fresh])
+        assert restored._storage["actions"][
+            restored._chronological_indices(), 0
+        ].tolist() == [6, 8, 9, 10, 11]
+    finally:
+        original.close()
+        restored.close()
+
+
+def test_trajectory_migration_survives_eviction_and_new_collection(tmp_path):
+    original = TrajectoryReplayBuffer(task_names=["easy", "hard"], sample_window_size=3)
+    restored = TrajectoryReplayBuffer(
+        task_names=["hard", "new"],
+        sample_window_size=3,
+        cache_size=1,
+        auto_save=True,
+        auto_save_path=str(tmp_path / "live"),
+    )
+    try:
+        for offset, labels in (
+            (0, [[1, 1], [1, 1]]),
+            (4, [[0, 1], [1, 0]]),
+            (8, [[0, 0], [1, 0]]),
+        ):
+            traj = trajectory(offset)
+            traj.task_indices = torch.tensor(labels)
+            traj.forward_inputs["alignment"] = traj.actions[..., :1].clone()
+            original.add_trajectories([traj])
+        original.save_checkpoint(str(tmp_path / "source"))
+        restored.load_checkpoint(str(tmp_path / "source"))
+        assert restored.total_samples == 7
+        assert [
+            restored._trajectory_index[i]["num_samples"]
+            for i in restored._trajectory_id_list
+        ] == [4, 2, 1]
+        scratch = restored._migration_directory.name
+        for tid in (0, 1, 2, 0, 2, 1):
+            loaded = restored._load_trajectory(tid, "test")
+            flat = restored._flatten_trajectory(loaded)
+            restored._flat_trajectory_cache.put(tid, flat)
+            assert not flat["task_indices"].any()
+            torch.testing.assert_close(
+                flat["forward_inputs"]["alignment"], flat["actions"][:, :1]
+            )
+        new = trajectory(12)
+        new.task_indices.fill_(1)
+        new.forward_inputs["alignment"] = new.actions[..., :1].clone()
+        restored.add_trajectories([new])
+        assert restored._trajectory_id_list == [0, 1, 2, 3]
+        assert restored.available_samples == 7  # Recent IDs 1, 2, 3 only.
+        restored.save_checkpoint(str(tmp_path / "next"))
+        restored.load_checkpoint(str(tmp_path / "next"))
+        assert not Path(scratch).exists()
+        assert restored._trajectory_id_list == [1, 2, 3]
+        samples = restored.sample(20)
+        torch.testing.assert_close(
+            samples["forward_inputs"]["alignment"], samples["actions"][:, :1]
+        )
+        assert (
+            samples["task_indices"] == (samples["actions"][:, 0] >= 12).long()
+        ).all()
+    finally:
+        original.close()
+        restored.close()

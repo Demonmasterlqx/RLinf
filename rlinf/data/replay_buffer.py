@@ -18,6 +18,7 @@ import json
 import os
 import pickle as pkl
 import shutil
+import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
@@ -27,7 +28,12 @@ import torch
 
 from rlinf.data.embodied_io_struct import Trajectory
 from rlinf.utils.logging import get_logger
-from rlinf.utils.multi_task import task_index_remap, validate_task_indices
+from rlinf.utils.multi_task import (
+    task_index_remap,
+    task_migration_remap,
+    task_migration_summary,
+    validate_task_indices,
+)
 
 
 def clone_dict_of_tensors(obj):
@@ -298,6 +304,7 @@ class TrajectoryReplayBuffer:
         # this enables each trajectory to be saved to or loaded from a separate file
         self._trajectory_file_path: dict[int, str] = {}
 
+        self._migration_directory = None
         self._trajectory_counter = 0  # Next trajectory ID to use
         self._index_version = 0
 
@@ -409,7 +416,9 @@ class TrajectoryReplayBuffer:
             with open(trajectory_path, "wb") as f:
                 pkl.dump(trajectory_dict, f)
 
-    def _load_trajectory(self, trajectory_id: int, model_weights_id: str) -> Trajectory:
+    def _load_trajectory(
+        self, trajectory_id: int, model_weights_id: str, *, remap_tasks: bool = True
+    ) -> Trajectory:
         """Load a trajectory from disk and reconstruct Trajectory object."""
 
         # Get trajectory info from index
@@ -442,15 +451,19 @@ class TrajectoryReplayBuffer:
             setattr(trajectory, field_name, value)
 
         if self.task_names is not None:
+            saved_names = trajectory_info.get("task_names", self.task_names)
+            remap = task_migration_remap(saved_names, self.task_names)
             validate_task_indices(
                 trajectory.task_indices,
                 trajectory.rewards.shape[:2],
-                len(self.task_names),
+                len(saved_names),
             )
-            saved_names = trajectory_info.get("task_names", self.task_names)
-            trajectory.task_indices = task_index_remap(saved_names, self.task_names)[
-                trajectory.task_indices
-            ]
+            if remap_tasks:
+                trajectory.task_indices = remap[trajectory.task_indices]
+                if (trajectory.task_indices < 0).any():
+                    raise ValueError(
+                        "Deleted task samples must be migrated before loading."
+                    )
         return trajectory
 
     def add_trajectories(self, trajectories: list[Trajectory]):
@@ -739,7 +752,9 @@ class TrajectoryReplayBuffer:
 
         return batch if batch is not None else {}
 
-    def _flatten_trajectory(self, trajectory: Trajectory) -> dict:
+    def _flatten_trajectory(
+        self, trajectory: Trajectory, *, task_count: Optional[int] = None
+    ) -> dict:
         if self.task_names is not None:
             validate_task_indices(
                 trajectory.task_indices,
@@ -747,7 +762,7 @@ class TrajectoryReplayBuffer:
                 # rewards include one bootstrap slot per epoch; task identities
                 # always describe the executed actions, not those extra slots.
                 trajectory.actions.shape[:2],
-                len(self.task_names),
+                len(self.task_names) if task_count is None else task_count,
             )
         flat: dict[str, object] = {}
         tensor_fields = trajectory.__dataclass_fields__.keys()
@@ -937,6 +952,11 @@ class TrajectoryReplayBuffer:
         return self.size >= min_size
 
     def clear(self):
+        if self._migration_directory is not None:
+            self._migration_directory.cleanup()
+            self._migration_directory = None
+        self._index_version += 1
+        self._window_cache_version = None
         # Clear index
         self._trajectory_index.clear()
         self._trajectory_id_list.clear()
@@ -1127,7 +1147,7 @@ class TrajectoryReplayBuffer:
             metadata = json.load(f)
 
         if self.task_names is not None:
-            task_index_remap(metadata.get("task_names"), self.task_names)
+            task_migration_remap(metadata.get("task_names"), self.task_names)
             if (
                 metadata.get("multi_task_format") != "sac_multitask_replay_v1"
                 or "rng_state" not in metadata
@@ -1135,6 +1155,10 @@ class TrajectoryReplayBuffer:
                 raise ValueError("Missing multi-task replay checkpoint state.")
         elif metadata.get("task_names") is not None:
             raise ValueError("Cannot disable multi-task replay on continuation.")
+        for future in self._task_save_futures:
+            future.result()
+        self._task_save_futures.clear()
+        self.clear()
         # Update instance attributes from metadata
         self.trajectory_format = metadata.get(
             "trajectory_format",
@@ -1228,6 +1252,9 @@ class TrajectoryReplayBuffer:
             self._total_samples = metadata.get("total_samples", 0)
             self._trajectory_counter = metadata.get("trajectory_counter", 0)
 
+        if self.task_names is not None:
+            self._migrate_checkpoint_tasks(metadata["task_names"])
+
         if self._flat_trajectory_cache is not None:
             self._flat_trajectory_cache.clear()
             if self._trajectory_id_list:
@@ -1243,6 +1270,75 @@ class TrajectoryReplayBuffer:
                         trajectory_id,
                         flat_trajectory,
                     )
+
+    def _migrate_checkpoint_tasks(self, saved_names: list[str]) -> None:
+        """Validate and migrate one trajectory at a time into owned scratch storage."""
+        remap = task_migration_remap(saved_names, self.task_names)
+        retained = dropped = 0
+        kept_ids = []
+        for tid in self._trajectory_id_list:
+            info = self._trajectory_index[tid]
+            trajectory = self._load_trajectory(
+                tid, info["model_weights_id"], remap_tasks=False
+            )
+            flat = self._flatten_trajectory(trajectory, task_count=len(saved_names))
+            indices = remap[flat["task_indices"]]
+            keep = indices >= 0
+            count = int(keep.sum())
+            if indices.numel() != info["num_samples"]:
+                raise ValueError("Multi-task replay trajectory sample count mismatch.")
+            retained += count
+            dropped += indices.numel() - count
+            if not count:
+                del self._trajectory_index[tid]
+                del self._trajectory_file_path[tid]
+                continue
+            kept_ids.append(tid)
+            if keep.all():
+                # Lazy name remapping preserves the original data and sample order.
+                continue
+            flat["task_indices"] = indices
+
+            def select(value):
+                if isinstance(value, dict):
+                    return {key: select(item) for key, item in value.items()}
+                if torch.is_tensor(value):
+                    if value.shape[0] != keep.numel():
+                        raise ValueError(
+                            "Misaligned multi-task replay transition field."
+                        )
+                    return value[keep]
+                return value
+
+            migrated = Trajectory(
+                max_episode_length=info["max_episode_length"],
+                model_weights_id=info["model_weights_id"],
+            )
+            for field, value in select(flat).items():
+                setattr(migrated, field, self._reshape_flat_for_save(value, count, 1))
+            if self._migration_directory is None:
+                self._migration_directory = tempfile.TemporaryDirectory(
+                    prefix="rlinf-replay-migration-"
+                )
+            directory = self._migration_directory.name
+            self._save_trajectory(
+                migrated, tid, info["model_weights_id"], save_dir=directory
+            )
+            self._trajectory_file_path[tid] = directory
+            info.update(
+                num_samples=count, shape=(count, 1), task_names=list(self.task_names)
+            )
+        self._trajectory_id_list = kept_ids
+        self._total_samples = retained
+        if dropped:
+            self.size = len(kept_ids)
+        self._index_version += 1
+        self._window_cache_version = None
+        self.last_restore_migration = {
+            **task_migration_summary(saved_names, self.task_names),
+            "retained_samples": retained,
+            "dropped_samples": dropped,
+        }
 
     def clear_cache(self):
         """Clear trajectory cache."""
