@@ -538,7 +538,7 @@ def test_terminal_safe_step_maps_gripper_once_and_keeps_hold_state_in_model_unit
     env._wrap_obs = lambda raw_obs, marker_update_mask=None: {
         "states": _build_state(raw_obs["policy"])
     }
-    env._record_metrics = lambda reward, terminations, infos: {"episode": {}}
+    env._init_metrics()
     seen_actions = []
 
     class FakeEnv:
@@ -555,7 +555,7 @@ def test_terminal_safe_step_maps_gripper_once_and_keeps_hold_state_in_model_unit
                 torch.zeros(1),
                 torch.zeros(1, dtype=torch.bool),
                 torch.zeros(1, dtype=torch.bool),
-                {},
+                {"_tabero_terminal_valid_success": torch.zeros(1, dtype=torch.bool)},
             )
 
     env.env = FakeEnv()

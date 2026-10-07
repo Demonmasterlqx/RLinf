@@ -1,8 +1,52 @@
+# Copyright 2026 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import torch
+
+TERMINAL_SUCCESS_KEY = "_tabero_terminal_valid_success"
+
+
+def valid_success_mask(env: Any) -> torch.Tensor:
+    """Read actual terminal success before IsaacLab resets its managers."""
+    manager = env.termination_manager
+    success = manager.get_term("success").to(dtype=torch.bool).clone()
+    invalid = manager.time_outs.to(dtype=torch.bool).clone()
+    for name in manager.active_terms:
+        if name != "success":
+            invalid |= manager.get_term(name).to(dtype=torch.bool)
+    return success & ~invalid
+
+
+def record_success_metrics(env: Any, step_reward: torch.Tensor, infos: dict) -> dict:
+    """Keep Tabero success independent of signed rewards and return scaling."""
+    success = infos.pop(TERMINAL_SUCCESS_KEY)
+    if success.shape != step_reward.shape or success.dtype != torch.bool:
+        raise ValueError("Tabero terminal success must be a reward-shaped bool tensor.")
+    env.returns += step_reward
+    env.success_once |= success
+    infos["episode"] = {
+        "success_once": env.success_once.clone(),
+        "return": env.returns.clone(),
+        "episode_len": env.elapsed_steps.clone(),
+        "reward": env.returns / env.elapsed_steps.clamp(min=1),
+    }
+    return infos
 
 
 def _cfg_get(cfg: Any, name: str, default: Any = None) -> Any:
@@ -22,12 +66,8 @@ def validate_force_bonus_cfg(
         "coefficient": float(_cfg_get(force_bonus_cfg, "coefficient", 0.0)),
         "epsilon": float(_cfg_get(force_bonus_cfg, "epsilon", 0.1)),
         "max_bonus": float(_cfg_get(force_bonus_cfg, "max_bonus", 0.0)),
-        "min_valid_samples": int(
-            _cfg_get(force_bonus_cfg, "min_valid_samples", 1)
-        ),
-        "contact_epsilon": float(
-            _cfg_get(force_bonus_cfg, "contact_epsilon", 1.0e-4)
-        ),
+        "min_valid_samples": int(_cfg_get(force_bonus_cfg, "min_valid_samples", 1)),
+        "contact_epsilon": float(_cfg_get(force_bonus_cfg, "contact_epsilon", 1.0e-4)),
     }
     if not enabled:
         return normalized
@@ -70,6 +110,69 @@ def validate_force_bonus_cfg(
     return normalized
 
 
+def validate_force_reward_cfg(
+    success_cfg: Any, terminal_reward: float
+) -> dict[str, Any]:
+    """Resolve one task's optional force reward, preserving legacy defaults."""
+    old_cfg = _cfg_get(success_cfg, "force_bonus")
+    new_cfg = _cfg_get(success_cfg, "normalize_effort_reward")
+    old_enabled = _cfg_get(old_cfg, "enabled", False)
+    new_enabled = _cfg_get(new_cfg, "enabled", False)
+    if not isinstance(old_enabled, bool) or not isinstance(new_enabled, bool):
+        raise ValueError("Tabero force reward enabled flags must be boolean.")
+    if old_enabled and new_enabled:
+        raise ValueError(
+            "Tabero force_bonus and normalize_effort_reward are mutually exclusive."
+        )
+    if not new_enabled:
+        if not old_enabled:
+            return {"enabled": False}
+        return validate_force_bonus_cfg(old_cfg, terminal_reward)
+
+    def finite_number(name: str, default: Any = None) -> float:
+        value = _cfg_get(new_cfg, name, default)
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (float, int))
+            or not math.isfinite(value)
+        ):
+            raise ValueError(
+                f"Tabero normalize_effort_reward.{name} must be a finite number."
+            )
+        return float(value)
+
+    minimum = finite_number("min_effort")
+    midpoint = finite_number("mid_effort")
+    maximum = midpoint + (midpoint - minimum)
+    if minimum < 0 or midpoint <= minimum or not math.isfinite(maximum):
+        raise ValueError(
+            "Tabero normalize_effort_reward requires 0 <= min_effort < mid_effort "
+            "and finite max_effort."
+        )
+    if not math.isfinite(terminal_reward) or terminal_reward <= 0:
+        raise ValueError("Tabero terminal_reward must be finite and positive.")
+    samples = _cfg_get(new_cfg, "min_valid_samples", 1)
+    if type(samples) is not int or samples < 1:
+        raise ValueError(
+            "Tabero normalize_effort_reward.min_valid_samples must be a positive integer."
+        )
+    contact_epsilon = finite_number("contact_epsilon", 1.0e-4)
+    if contact_epsilon < 0:
+        raise ValueError(
+            "Tabero normalize_effort_reward.contact_epsilon must be non-negative."
+        )
+    if _cfg_get(new_cfg, "max_effort") is not None:
+        raise ValueError(
+            "Tabero normalize_effort_reward.max_effort is derived, not configurable."
+        )
+    return {
+        "enabled": True,
+        "normalize_effort_reward": {"min_effort": minimum, "mid_effort": midpoint},
+        "min_valid_samples": samples,
+        "contact_epsilon": contact_epsilon,
+    }
+
+
 def make_trajectory_force_success_reward_term(manager_term_base_cls: type) -> type:
     class TrajectoryForceSuccessRewardTerm(manager_term_base_cls):
         def __init__(self, cfg: Any, env: Any) -> None:
@@ -87,13 +190,14 @@ def make_trajectory_force_success_reward_term(manager_term_base_cls: type) -> ty
                     "or at least one grasp-gated force source."
                 )
             self._terminal_reward = float(params["terminal_reward"])
-            self._coefficient = float(params["coefficient"])
-            self._epsilon = float(params["epsilon"])
-            self._max_bonus = float(params["max_bonus"])
+            self._normalize_effort_reward = params.get("normalize_effort_reward")
+            self._coefficient = float(params.get("coefficient", 0.0))
+            self._epsilon = float(params.get("epsilon", 0.1))
+            self._max_bonus = float(params.get("max_bonus", 0.0))
             self._min_valid_samples = int(params["min_valid_samples"])
             self._contact_epsilon = float(params["contact_epsilon"])
-            source_count = 1 if self._direct_force_reader is not None else len(
-                self._force_sources
+            source_count = (
+                1 if self._direct_force_reader is not None else len(self._force_sources)
             )
             self._grasp_started = torch.zeros(
                 (env.num_envs, source_count), dtype=torch.bool, device=env.device
@@ -115,10 +219,25 @@ def make_trajectory_force_success_reward_term(manager_term_base_cls: type) -> ty
 
         @property
         def current_force_bonus(self) -> torch.Tensor:
-            bonus = self._coefficient / self.trajectory_mean_force.clamp(
-                min=self._epsilon
-            )
-            bonus = bonus.clamp(min=0.0, max=self._max_bonus)
+            """Selected force component; the legacy name also permits signed values."""
+            if self._normalize_effort_reward is not None:
+                minimum = self._normalize_effort_reward["min_effort"]
+                midpoint = self._normalize_effort_reward["mid_effort"]
+                # Equivalent to 2 * (mid - effort) / (max - min).
+                # Float64 avoids overflow/underflow of otherwise valid bounds.
+                bonus = (
+                    (
+                        (midpoint - self.trajectory_mean_force.double())
+                        / (midpoint - minimum)
+                    )
+                    .clamp(-1.0, 1.0)
+                    .to(self._force_sum.dtype)
+                )
+            else:
+                bonus = self._coefficient / self.trajectory_mean_force.clamp(
+                    min=self._epsilon
+                )
+                bonus = bonus.clamp(min=0.0, max=self._max_bonus)
             return torch.where(
                 self._force_count >= self._min_valid_samples,
                 bonus,
@@ -227,16 +346,17 @@ def make_trajectory_force_success_reward_term(manager_term_base_cls: type) -> ty
             success_term_name: str,
             failure_term_names: tuple[str, ...],
             terminal_reward: float,
-            coefficient: float,
-            epsilon: float,
-            max_bonus: float,
-            min_valid_samples: int,
-            contact_epsilon: float,
+            coefficient: float = 0.0,
+            epsilon: float = 0.1,
+            max_bonus: float = 0.0,
+            min_valid_samples: int = 1,
+            contact_epsilon: float = 1.0e-4,
             force_sources: tuple[tuple[str, Any], ...] = (),
             force_reader: Any = None,
             direct_force_reader: Any = None,
             direct_force_params: dict[str, Any] | None = None,
             env_reward_multipliers: tuple[float, ...] | None = None,
+            normalize_effort_reward: dict[str, float] | None = None,
         ) -> torch.Tensor:
             del (
                 force_sources,
@@ -249,6 +369,7 @@ def make_trajectory_force_success_reward_term(manager_term_base_cls: type) -> ty
                 max_bonus,
                 min_valid_samples,
                 contact_epsilon,
+                normalize_effort_reward,
             )
             if self._direct_force_reader is not None:
                 self._update_direct_force_history(env)

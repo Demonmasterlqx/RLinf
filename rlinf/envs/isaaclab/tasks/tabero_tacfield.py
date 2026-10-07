@@ -32,6 +32,12 @@ from rlinf.envs.isaaclab.utils import quat2axisangle_torch
 
 from ..isaaclab_env import IsaaclabBaseEnv
 from .tabero_force_reward import (
+    TERMINAL_SUCCESS_KEY,
+    record_success_metrics,
+    valid_success_mask,
+    validate_force_reward_cfg,
+)
+from .tabero_force_reward import (
     make_trajectory_force_success_reward_term as _shared_make_trajectory_force_success_reward_term,
 )
 from .tabero_force_reward import (
@@ -392,6 +398,7 @@ class TaberoHdf5ResetWrapper:
         self._step_terminal_mask = torch.zeros(
             int(self._env.num_envs), dtype=torch.bool, device=self._env.device
         )
+        self._step_terminal_success = torch.zeros_like(self._step_terminal_mask)
         self._step_terminal_force_mean = torch.full(
             (int(self._env.num_envs),),
             float("nan"),
@@ -471,6 +478,9 @@ class TaberoHdf5ResetWrapper:
                         terminal_obs,
                         capture_mask,
                     )
+                self._step_terminal_success[env_ids_tensor] = valid_success_mask(
+                    self._env
+                )[env_ids_tensor]
                 self._step_terminal_mask[env_ids_tensor] = True
                 if self._trajectory_force_reward_term is not None:
                     mean_force, valid_sample_count = (
@@ -542,6 +552,7 @@ class TaberoHdf5ResetWrapper:
 
         self._step_terminal_observation = None
         self._step_terminal_mask.zero_()
+        self._step_terminal_success.zero_()
         self._step_terminal_force_mean.fill_(float("nan"))
         self._step_terminal_force_count.zero_()
         self._capture_terminal_on_reset = True
@@ -573,6 +584,8 @@ class TaberoHdf5ResetWrapper:
                 trajectory_force_count.clone()
             )
 
+        extras = dict(extras or {})
+        extras[TERMINAL_SUCCESS_KEY] = self._step_terminal_success.clone()
         dones = torch.logical_or(terminations, truncations).to(dtype=torch.bool)
         if dones.any():
             if self._step_terminal_observation is None or not torch.all(
@@ -1035,6 +1048,7 @@ def _install_success_reward(
     terminal_reward: float = 1.0,
     force_bonus_cfg: Any = None,
     force_reader: Any = None,
+    normalize_effort_reward_cfg: Any = None,
 ) -> None:
     terminations_cfg = getattr(isaac_env_cfg, "terminations", None)
     success_term = getattr(terminations_cfg, "success", None)
@@ -1042,8 +1056,12 @@ def _install_success_reward(
     if success_func is None:
         return
 
-    normalized_force_bonus = _validate_force_bonus_cfg(
-        force_bonus_cfg, terminal_reward=float(terminal_reward)
+    normalized_force_bonus = validate_force_reward_cfg(
+        {
+            "force_bonus": force_bonus_cfg,
+            "normalize_effort_reward": normalize_effort_reward_cfg,
+        },
+        terminal_reward=float(terminal_reward),
     )
     force_sources: tuple[tuple[str, str], ...] = ()
     if normalized_force_bonus["enabled"]:
@@ -1083,11 +1101,11 @@ def _install_success_reward(
                 "force_sources": force_sources,
                 "force_reader": force_reader,
                 "terminal_reward": float(terminal_reward),
-                "coefficient": normalized_force_bonus["coefficient"],
-                "epsilon": normalized_force_bonus["epsilon"],
-                "max_bonus": normalized_force_bonus["max_bonus"],
-                "min_valid_samples": normalized_force_bonus["min_valid_samples"],
-                "contact_epsilon": normalized_force_bonus["contact_epsilon"],
+                **{
+                    key: value
+                    for key, value in normalized_force_bonus.items()
+                    if key != "enabled"
+                },
             }
         )
         reward_func = _make_trajectory_force_success_reward_term(manager_term_base_cls)
@@ -1447,6 +1465,10 @@ class IsaaclabTaberoTacFieldEnv(IsaaclabBaseEnv):
         )
         self._force_key = _cfg_get(init_params, "force_key", "gripper_net_force")
         self._success_cfg = _cfg_get(init_params, "success", None)
+        self._force_reward_cfg = validate_force_reward_cfg(
+            self._success_cfg,
+            float(_cfg_get(self._success_cfg, "terminal_reward", 1.0)),
+        )
         self._prompt_cfg = _cfg_get(init_params, "prompt_conditions", None)
         self._hdf5_initial_states_path = _cfg_get(
             init_params, "hdf5_initial_states_path", None
@@ -1590,7 +1612,7 @@ class IsaaclabTaberoTacFieldEnv(IsaaclabBaseEnv):
             )
             force_bonus_cfg = _cfg_get(self._success_cfg, "force_bonus", None)
             force_reader = None
-            if bool(_cfg_get(force_bonus_cfg, "enabled", False)):
+            if self._force_reward_cfg["enabled"]:
                 force_reader = _read_current_gripper_force_local
             _install_success_reward(
                 isaac_env_cfg,
@@ -1608,6 +1630,9 @@ class IsaaclabTaberoTacFieldEnv(IsaaclabBaseEnv):
                     _cfg_get(self._success_cfg, "terminal_reward", 1.0)
                 ),
                 force_bonus_cfg=force_bonus_cfg,
+                normalize_effort_reward_cfg=_cfg_get(
+                    self._success_cfg, "normalize_effort_reward"
+                ),
                 force_reader=force_reader,
             )
 
@@ -1777,7 +1802,12 @@ class IsaaclabTaberoTacFieldEnv(IsaaclabBaseEnv):
         obs = self._wrap_obs(wrapped_source, marker_update_mask=active_mask)
 
         step_reward = torch.where(active_mask, step_reward, 0.0)
-        infos = self._record_metrics(step_reward, terminations, {})
+        valid_success = raw_infos.pop(TERMINAL_SUCCESS_KEY) & active_mask
+        infos = self._record_metrics(
+            step_reward,
+            terminations,
+            {TERMINAL_SUCCESS_KEY: valid_success},
+        )
         if trajectory_force_mean is not None:
             trajectory_force_mean = torch.as_tensor(
                 trajectory_force_mean,
@@ -1813,7 +1843,7 @@ class IsaaclabTaberoTacFieldEnv(IsaaclabBaseEnv):
         final_info = {"episode": _clone_nested_tensors(infos["episode"])}
         returned_terminations = terminations.clone()
         if self.ignore_terminations:
-            infos["episode"]["success_at_end"] = terminations.clone()
+            infos["episode"]["success_at_end"] = valid_success.clone()
             returned_terminations.zero_()
 
         if newly_done.any():
@@ -2008,7 +2038,7 @@ class IsaaclabTaberoTacFieldEnv(IsaaclabBaseEnv):
         )
 
     def _record_metrics(self, step_reward, terminations, infos):
-        infos = super()._record_metrics(step_reward, terminations, infos)
+        infos = record_success_metrics(self, step_reward, infos)
         episode_info = infos["episode"]
         episode_info["task_id"] = torch.full(
             (self.num_envs,),

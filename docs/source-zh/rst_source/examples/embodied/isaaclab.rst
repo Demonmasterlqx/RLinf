@@ -300,3 +300,95 @@ RealWorld 的 ``auto_reset=false`` rollout 每个环境只使用第一次终止�
 每个文件按 seed 和进程 ID 区分，记录包含 ``rollout_index``、``env_index``、
 成功、奖励、长度、终止原因及可用的力指标。无有效力样本的非有限值写为 JSON ``null``。
 视频可通过相同 seed 与 ``env_index`` 对应网格位置；首次轨迹结束后的画面属于替代轨迹。
+
+
+Tabero 按任务选择力奖励
+----------------------
+
+普通 Tabero 与 RealWorld Tabero 均支持 ``success.force_bonus``（原倒数形式）和
+``success.normalize_effort_reward``。每个任务最多启用一种，也可全部关闭；
+同一次多任务训练可以混用两种形式。配置按公共 ``init_params`` 与任务覆盖深度合并，
+因此切换奖励时必须显式关闭继承而来的另一种形式。其他成功判据和观测、动作、重置接口仍须一致。
+
+新形式要求显式配置有限的 ``0 <= min_effort < mid_effort``，自动计算
+``max_effort = mid_effort + (mid_effort - min_effort)``，不接受手动配置 ``max_effort``。
+
+.. math::
+
+   r_{\mathrm{effort}} = \operatorname{clip}\left(
+   \frac{2(\mathrm{mid\_effort}-\mathrm{effort})}
+   {\mathrm{max\_effort}-\mathrm{min\_effort}}, -1, 1\right)
+
+min/mid/max 分别对应 +1/0/-1，超出区间时裁剪。effort 复用原奖励的有效双指接触
+挤压力轨迹均值，包括原有抓取门控、多来源聚合、释放过滤和局部重置行为。
+``min_valid_samples`` 默认 1，``contact_epsilon`` 默认 0.0001；不足有效样本时力分量为零。
+只有有效成功时才发放 ``terminal_reward + 力分量``，失败和超时为零。
+``[-1, 1]`` 限制的是力分量，后续仍应用环境 ``reward_coef`` 和已有条件倍率；
+奖励项的 ``/ step_dt`` 与 IsaacLab RewardManager 的 ``* dt`` 抵消。
+
+成功率使用重置前的成功终止标志，不从奖励正负推断。
+例如 ``terminal_reward: 1.0`` 且 effort 达到 max 时，总奖励为零，但仍计为成功。
+现有 ``force_bonus`` 诊断字段保留兼容，在新模式下表示选中的有符号力分量；
+它是在成功门控及奖励缩放前的诊断值，不等于失败 episode 获得了力奖励。
+总回报和成功指标继续通过现有 TensorBoard、W&B 通道记录。
+
+以下为 Task820 多任务训练配置片段。数值仅为结构示例，不是物体力阈值的标定结果；
+保留原训练配置的其他设置及任务描述。Vitasoy、Coca-Cola 使用不同范围，cookie 使用旧奖励。
+现有 YAML 不会自动切换奖励形式。
+
+.. code-block:: yaml
+
+   runner:
+     logger:
+       logger_backends: [tensorboard, wandb]
+   env:
+     train:
+       init_params:
+         success:
+           required_consecutive_steps: 8
+           terminal_reward: 1.0
+           force_bonus:
+             enabled: false
+           normalize_effort_reward:
+             enabled: false
+             min_valid_samples: 4
+             contact_epsilon: 1.0
+       multi_task:
+         tasks:
+           - name: vitasoy
+             init_params:
+               target_object: target_object_1
+               task_description: pick up the Vitasoy and put it into the basket
+               success:
+                 normalize_effort_reward:
+                   enabled: true
+                   min_effort: 10.0
+                   mid_effort: 20.0  # max_effort = 30
+           - name: coca_cola
+             init_params:
+               target_object: target_object_2
+               task_description: Pick up the Coca-Cola and put it into the basket
+               success:
+                 normalize_effort_reward:
+                   enabled: true
+                   min_effort: 15.0
+                   mid_effort: 30.0  # max_effort = 45
+           - name: cookie
+             init_params:
+               target_object: target_object_3
+               task_description: pick up the cookie and put it into the basket
+               success:
+                 force_bonus:
+                   enabled: true
+                   coefficient: 10.0
+                   epsilon: 1.0
+                   max_bonus: 1.0
+                   min_valid_samples: 4
+                   contact_epsilon: 1.0
+     eval:
+       multi_task: ${env.train.multi_task}
+       init_params:
+         success: ${env.train.init_params.success}
+
+单任务训练直接在 ``env.train.init_params.success`` 中设置同样的奖励块，无需任务列表。
+改变力奖励属于训练目标调整，配置示例不修改模型、GPU、批量、训练步数或 ``resume_dir``。

@@ -862,6 +862,28 @@ def _tabero_active_env_splits(cfg) -> tuple[str, ...]:
     return ("train",)
 
 
+def _validate_tabero_force_reward_contract(cfg) -> None:
+    """Check single-task force shaping before simulator/model initialization."""
+    from rlinf.envs.isaaclab.tasks.tabero_force_reward import validate_force_reward_cfg
+
+    tabero_ids = {
+        "Isaac-Libero-Franka-Hybrid-Tactile-v0",
+        "Isaac-RealWorld-GentleGrasp-XarmUmi-Hybrid-Tactile-v0",
+    }
+    for split in _tabero_active_env_splits(cfg):
+        env = cfg.env.get(split, {})
+        params = env.get("init_params", {})
+        if env.get("env_type") != "isaaclab" or params.get("id") not in tabero_ids:
+            continue
+        success = params.get("success") or {}
+        try:
+            validate_force_reward_cfg(
+                success, float(success.get("terminal_reward", 1.0))
+            )
+        except ValueError as exc:
+            raise ValueError(f"env.{split}.init_params.success: {exc}") from exc
+
+
 def _validate_tabero_realworld_action_filter_contract(cfg) -> str:
     """Check filter enablement across active splits; tuning is runtime validated."""
     enabled_by_split = {}
@@ -1306,6 +1328,8 @@ def validate_embodied_cfg(cfg):
                 "multi_task needs at least one logical env instance per task."
             )
         return validated
+
+    _validate_tabero_force_reward_contract(cfg)
 
     only_eval = (
         cfg.runner.get("only_eval", False)

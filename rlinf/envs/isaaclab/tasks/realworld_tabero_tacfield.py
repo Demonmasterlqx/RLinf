@@ -40,8 +40,11 @@ from rlinf.utils.tabero_ppo_boundary import (
 
 from ..isaaclab_env import IsaaclabBaseEnv
 from .tabero_force_reward import (
+    TERMINAL_SUCCESS_KEY,
     make_trajectory_force_success_reward_term,
-    validate_force_bonus_cfg,
+    record_success_metrics,
+    valid_success_mask,
+    validate_force_reward_cfg,
 )
 
 REALWORLD_ENV_ID = "Isaac-RealWorld-GentleGrasp-XarmUmi-Hybrid-Tactile-v0"
@@ -262,6 +265,7 @@ class _TerminalObservationCapture:
         self._captured_mask = torch.zeros(
             env.num_envs, device=env.device, dtype=torch.bool
         )
+        self._captured_success = torch.zeros_like(self._captured_mask)
         self._captured_force_mean = torch.full(
             (env.num_envs,), float("nan"), device=env.device, dtype=torch.float32
         )
@@ -307,6 +311,7 @@ class _TerminalObservationCapture:
                         terminal_observation,
                         capture_mask,
                     )
+                self._captured_success[indices] = valid_success_mask(env)[indices]
                 self._captured_mask |= capture_mask
                 if self._force_reward_term is not None:
                     self._captured_force_mean[indices] = (
@@ -329,6 +334,7 @@ class _TerminalObservationCapture:
     def reset(self, seed=None, env_ids=None):
         self._captured_observation = None
         self._captured_mask.zero_()
+        self._captured_success.zero_()
         self._captured_force_mean.fill_(float("nan"))
         self._captured_force_count.zero_()
         self._captured_force_bonus.zero_()
@@ -337,6 +343,7 @@ class _TerminalObservationCapture:
     def step(self, action: torch.Tensor):
         self._captured_observation = None
         self._captured_mask.zero_()
+        self._captured_success.zero_()
         self._captured_force_mean.fill_(float("nan"))
         self._captured_force_count.zero_()
         self._captured_force_bonus.zero_()
@@ -346,6 +353,7 @@ class _TerminalObservationCapture:
         finally:
             self._capture_enabled = False
         infos = dict(infos or {})
+        infos[TERMINAL_SUCCESS_KEY] = self._captured_success.clone()
         infos[_TERMINAL_RAW_OBSERVATION_KEY] = self._captured_observation
         infos[_TERMINAL_OBSERVATION_MASK_KEY] = self._captured_mask.clone()
         try:
@@ -1260,9 +1268,7 @@ class IsaaclabRealWorldTaberoTacFieldEnv(IsaaclabBaseEnv):
             raise ValueError("RealWorld required_consecutive_steps must be positive.")
         if not torch.isfinite(torch.tensor(terminal_reward)) or terminal_reward <= 0:
             raise ValueError("RealWorld terminal_reward must be finite and positive.")
-        force_bonus = validate_force_bonus_cfg(
-            _cfg_get(success_cfg, "force_bonus", None), terminal_reward
-        )
+        force_bonus = validate_force_reward_cfg(success_cfg, terminal_reward)
 
         target_object = str(_cfg_get(init_params, "target_object", "")).strip()
         configured_task_description = str(
@@ -1459,11 +1465,11 @@ class IsaaclabRealWorldTaberoTacFieldEnv(IsaaclabBaseEnv):
                                 getattr(force_term_cfg, "params", {}) or {}
                             ),
                             "terminal_reward": self._terminal_reward,
-                            "coefficient": self._force_bonus["coefficient"],
-                            "epsilon": self._force_bonus["epsilon"],
-                            "max_bonus": self._force_bonus["max_bonus"],
-                            "min_valid_samples": self._force_bonus["min_valid_samples"],
-                            "contact_epsilon": self._force_bonus["contact_epsilon"],
+                            **{
+                                key: value
+                                for key, value in self._force_bonus.items()
+                                if key != "enabled"
+                            },
                         }
                     )
                     reward_func = make_trajectory_force_success_reward_term(
@@ -1804,7 +1810,11 @@ class IsaaclabRealWorldTaberoTacFieldEnv(IsaaclabBaseEnv):
         truncations = raw_truncations & active_mask
         newly_done = terminations | truncations
         reward = torch.where(active_mask, reward, 0.0)
-        infos = self._record_metrics(reward, terminations, {})
+        infos = record_success_metrics(
+            self,
+            reward,
+            {TERMINAL_SUCCESS_KEY: raw_infos.pop(TERMINAL_SUCCESS_KEY) & active_mask},
+        )
         if terminal_force_mean is not None:
             terminal_force_mean = torch.as_tensor(
                 terminal_force_mean, device=self.device, dtype=torch.float32

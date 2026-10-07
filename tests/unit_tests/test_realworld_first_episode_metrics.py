@@ -37,7 +37,7 @@ from rlinf.workers.env.env_worker import (
 )
 
 
-def make_env(tmp_path):
+def make_env(tmp_path, success_reward=1.0):
     env = object.__new__(IsaaclabRealWorldTaberoTacFieldEnv)
     env.num_envs = 4
     env.device = torch.device("cpu")
@@ -84,10 +84,11 @@ def make_env(tmp_path):
             timeout = env._elapsed_steps + 1 >= 300
             return (
                 raw,
-                success.float(),
+                success.float() * success_reward,
                 success,
                 timeout,
                 {
+                    "_tabero_terminal_valid_success": success & ~timeout,
                     "_realworld_terminal_raw_observation": raw,
                     "_realworld_terminal_observation_mask": success | timeout,
                     "_realworld_terminal_force_mean": torch.full((4,), 5.0),
@@ -246,3 +247,14 @@ def test_missing_terminal_is_detected(tmp_path):
     env._elapsed_steps[:] = 0
     with pytest.raises(RuntimeError, match="missing first-episode"):
         env.step(torch.zeros(4, 13))
+
+
+@pytest.mark.parametrize("success_reward", [0.0, -0.5])
+def test_nonpositive_success_reward_preserves_episode_counts(
+    tmp_path, monkeypatch, success_reward
+):
+    env = make_env(tmp_path, success_reward=success_reward)
+    metrics, _ = run_rollout(env, monkeypatch)
+    assert metrics["num_trajectories"] == 4
+    assert metrics["success_once"] == pytest.approx(0.75)
+    assert metrics["return"] == pytest.approx(0.75 * success_reward)

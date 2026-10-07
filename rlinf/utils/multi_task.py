@@ -161,6 +161,26 @@ def validate_environments(cfg) -> None:
                 "tabero_task_subset_path",
                 "prompt_conditions",
             }
+            # Only Tabero's force shaping is task-specific. Other success,
+            # observation/action and reset settings must still agree.
+            from rlinf.envs.isaaclab.tasks.tabero_force_reward import (
+                validate_force_reward_cfg,
+            )
+
+            success = params.get("success") or {}
+            try:
+                validate_force_reward_cfg(
+                    success, float(success.get("terminal_reward", 1.0))
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    f"env.{split} task {train_tasks[i]['name']}: {exc}"
+                ) from exc
+            params["success"] = {
+                k: v
+                for k, v in success.items()
+                if k not in {"force_bonus", "normalize_effort_reward"}
+            }
             interfaces.append({k: v for k, v in params.items() if k not in varying})
         if any(value != interfaces[0] for value in interfaces[1:]):
             raise ValueError(

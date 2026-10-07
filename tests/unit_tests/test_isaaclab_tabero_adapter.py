@@ -101,7 +101,7 @@ class _TerminalSafeFakeEnv:
         dones = terminations | truncations
         post_step_x = [10.0 + step_index + env_id for env_id in range(self.num_envs)]
         raw_obs = _raw_tabero_obs(post_step_x, marker_offset=10.0 + step_index)
-        extras = {}
+        extras = {tabero_tacfield.TERMINAL_SUCCESS_KEY: terminations.clone()}
         if dones.any():
             terminal_x = [
                 100.0 + step_index + env_id if dones[env_id] else post_step_x[env_id]
@@ -277,6 +277,11 @@ def test_hdf5_wrapper_captures_terminal_observation_before_internal_reset():
 
         def __init__(self):
             self.observation_manager = FakeObservationManager()
+            self.termination_manager = SimpleNamespace(
+                active_terms=["success"],
+                time_outs=torch.zeros(2, dtype=torch.bool),
+                get_term=lambda _: torch.ones(2, dtype=torch.bool),
+            )
             self.reset_ids = []
 
         def _reset_idx(self, env_ids):
@@ -337,6 +342,11 @@ def test_hdf5_wrapper_captures_trajectory_force_metrics_before_internal_reset():
 
         def __init__(self):
             self.observation_manager = FakeObservationManager()
+            self.termination_manager = SimpleNamespace(
+                active_terms=["success"],
+                time_outs=torch.zeros(2, dtype=torch.bool),
+                get_term=lambda _: torch.ones(2, dtype=torch.bool),
+            )
             self.force_reward_term = FakeForceRewardTerm()
             self.reward_manager = FakeRewardManager(self.force_reward_term)
 
@@ -400,6 +410,11 @@ def test_hdf5_wrapper_accumulates_terminal_rows_across_multiple_internal_resets(
 
         def __init__(self):
             self.observation_manager = FakeObservationManager()
+            self.termination_manager = SimpleNamespace(
+                active_terms=["success"],
+                time_outs=torch.zeros(2, dtype=torch.bool),
+                get_term=lambda _: torch.ones(2, dtype=torch.bool),
+            )
 
         def _reset_idx(self, env_ids):
             del env_ids
@@ -1125,7 +1140,7 @@ def test_tabero_record_metrics_adds_tensor_task_metadata():
     infos = env._record_metrics(
         torch.tensor([0.0, 1.0]),
         torch.tensor([False, True]),
-        {},
+        {tabero_tacfield.TERMINAL_SUCCESS_KEY: torch.tensor([False, True])},
     )
 
     torch.testing.assert_close(infos["episode"]["task_id"], torch.tensor([5.0, 5.0]))
@@ -1449,9 +1464,7 @@ def test_force_bonus_config_allows_positive_cap_above_terminal_reward():
         }
     )
 
-    normalized = tabero_tacfield._validate_force_bonus_cfg(
-        config, terminal_reward=1.0
-    )
+    normalized = tabero_tacfield._validate_force_bonus_cfg(config, terminal_reward=1.0)
 
     assert normalized["max_bonus"] == 10.0
 
@@ -1568,7 +1581,8 @@ def test_install_success_reward_forwards_condition_multipliers():
     )
 
 
-def test_install_success_reward_installs_force_tracking_term_and_params():
+@pytest.mark.parametrize("normalize", [False, True])
+def test_install_success_reward_installs_force_tracking_term_and_params(normalize):
     install_fn = getattr(tabero_tacfield, "_install_success_reward")
 
     class FakeManagerTermBase:
@@ -1614,6 +1628,13 @@ def test_install_success_reward_installs_force_tracking_term_and_params():
         }
     )
 
+    normalized_cfg = {
+        "enabled": True,
+        "min_effort": 10.0,
+        "mid_effort": 20.0,
+        "min_valid_samples": 3,
+        "contact_epsilon": 0.01,
+    }
     install_fn(
         env_cfg,
         FakeRewardTerm,
@@ -1621,7 +1642,8 @@ def test_install_success_reward_installs_force_tracking_term_and_params():
         manager_term_base_cls=FakeManagerTermBase,
         required_steps=8,
         terminal_reward=1.5,
-        force_bonus_cfg=force_bonus_cfg,
+        force_bonus_cfg=None if normalize else force_bonus_cfg,
+        normalize_effort_reward_cfg=normalized_cfg if normalize else None,
         force_reader=force_reader,
     )
 
@@ -1629,7 +1651,7 @@ def test_install_success_reward_installs_force_tracking_term_and_params():
     assert issubclass(reward_cfg.func, FakeManagerTermBase)
     assert reward_cfg.func.__name__ == "TrajectoryForceSuccessRewardTerm"
     assert reward_cfg.weight == 2.0
-    assert reward_cfg.params == {
+    expected = {
         "success_term_name": "success",
         "failure_term_names": (),
         "force_sources": (("grasp_1", "contact_gripper"),),
@@ -1641,6 +1663,12 @@ def test_install_success_reward_installs_force_tracking_term_and_params():
         "min_valid_samples": 3,
         "contact_epsilon": 0.01,
     }
+
+    if normalize:
+        for key in ("coefficient", "epsilon", "max_bonus"):
+            expected.pop(key)
+        expected["normalize_effort_reward"] = {"min_effort": 10.0, "mid_effort": 20.0}
+    assert reward_cfg.params == expected
 
 
 @pytest.mark.parametrize("missing", ["force_reader", "grasp_source"])
@@ -1903,7 +1931,7 @@ def test_tabero_condition_metrics_report_each_condition_without_half_scaling():
     infos = env._record_metrics(
         torch.tensor([1.0, 0.0]),
         torch.tensor([True, False]),
-        {},
+        {tabero_tacfield.TERMINAL_SUCCESS_KEY: torch.tensor([True, False])},
     )
 
     episode = infos["episode"]
@@ -1917,3 +1945,36 @@ def test_tabero_condition_metrics_report_each_condition_without_half_scaling():
     torch.testing.assert_close(
         episode["gentle_squeeze_pred_mean"], torch.full((2,), 2.0)
     )
+
+
+@pytest.mark.parametrize("success_reward", [0.0, -0.5])
+def test_terminal_safe_chunk_counts_nonpositive_success_once(success_reward):
+    env = _terminal_safe_adapter([{0: "termination"}, {}, {}, {}], num_envs=1)
+    original_step = env.env.step
+
+    def signed_step(actions):
+        obs, reward, terminated, truncated, infos = original_step(actions)
+        return (
+            obs,
+            torch.full_like(reward, success_reward),
+            terminated,
+            truncated,
+            infos,
+        )
+
+    env.env.step = signed_step
+    _, rewards, _, _, infos_list = env.chunk_step(torch.zeros(1, 4, 13))
+    records = infos_list[-1][tabero_tacfield._CHUNK_EPISODE_RECORDS_KEY]
+    assert records["success_once"].tolist() == [1.0]
+    assert records["return"].tolist() == [success_reward]
+    assert rewards[0, 1:].eq(0).all()
+
+
+def test_success_at_end_describes_current_step_not_accumulated_success():
+    env = _terminal_safe_adapter([{0: "termination"}, {}])
+    env.ignore_terminations = True
+    first = env.step(torch.zeros(1, 13))[-1]["episode"]
+    second = env.step(torch.zeros(1, 13))[-1]["episode"]
+    assert first["success_at_end"].tolist() == [True]
+    assert second["success_at_end"].tolist() == [False]
+    assert second["success_once"].tolist() == [True]
