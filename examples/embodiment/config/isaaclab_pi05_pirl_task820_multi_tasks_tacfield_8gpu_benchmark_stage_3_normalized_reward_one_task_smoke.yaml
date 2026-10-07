@@ -80,7 +80,7 @@ env:
               min_effort: 2.0
               mid_effort: 25.0
     rollout_epoch: 1
-    total_num_envs: 192
+    total_num_envs: 128
     max_steps_per_rollout_epoch: 300
     max_episode_steps: 300
     video_cfg:
@@ -147,17 +147,17 @@ rollout:
   group_name: RolloutGroup
   backend: huggingface
   enable_offload: true
-  # Each of eight GPUs hosts three stages, one per task.
-  # With 192 training envs this gives 8 envs per stage and 64 per task.
-  pipeline_stage_num: 3
+  # Each of eight GPUs hosts one stage for the Vitasoy task.
+  # With 128 training envs this gives 16 envs per rank.
+  pipeline_stage_num: 1
   model:
     model_path: ${actor.model.model_path}
     precision: ${actor.model.precision}
 actor:
   group_name: ActorGroup
   training_backend: fsdp
-  micro_batch_size: 48
-  global_batch_size: 384
+  micro_batch_size: 32
+  global_batch_size: 256
   seed: 42
   enable_offload: true
   combine_reference_model: true
