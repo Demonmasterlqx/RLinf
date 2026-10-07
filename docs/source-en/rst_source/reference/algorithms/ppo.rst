@@ -239,3 +239,24 @@ weights; later rounds follow the configured synchronization interval. Old
 single-task resumes are unaffected. Loading base model weights to start a new
 experiment remains separate from continuation. Export metadata lists all tasks
 instead of describing the policy as one target object.
+
+Tabero task-separated metrics are enabled only by ``algorithm.multi_task.enabled``
+and retain the existing global curves. With multi-task enabled,
+``env/multi_task/<name>/`` and ``eval/multi_task/<name>/`` report episode reward,
+return, length, force diagnostics and available reward audits. ``return`` is the
+undiscounted episode sum; ``reward`` averages the per-episode return/length.
+Episode rows are pooled across workers before reduction. Force means/medians use
+the existing valid-contact episode definitions; ``force_bonus`` remains the
+candidate bonus, including failed episodes, rather than the gated reward paid.
+Per-task ``chunk_boundary/*`` event counts are summed across chunks and workers.
+
+PPO also logs ``rollout/multi_task/<name>/rewards``,
+``advantages_mean/min/max``, ``returns_mean/min/max`` and ``values_mean/min/max``.
+These use the existing loss masks and action-aligned task labels; value statistics
+exclude bootstrap rows. Each signal has a ``rewards_count``, ``advantages_count``,
+``returns_count`` or ``values_count`` denominator, globally and per task. Reward
+counts use primitive entries under the existing chunk mask; return, advantage and
+value counts use chunk entries. Advantages are not renormalized per task.
+Counts are zero when a task has no valid samples; its corresponding task mean and
+extrema are omitted. TensorBoard and W&B receive identical names and steps.
+Single-task logging, task weights, reward computation and checkpoints are unchanged.

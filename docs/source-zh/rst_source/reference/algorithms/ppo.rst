@@ -218,3 +218,21 @@ EMA、初始化标志、累计计数及版本。续训要求状态文件存在�
 多任务续训第一轮 rollout 前总会同步恢复后的 actor 权重，随后遵循配置的同步间隔。
 旧单任务续训路径不变；从基础权重开始新实验不视为完整续训。
 导出元数据列出全部任务，不将多任务模型描述为单个目标物体。
+
+Tabero 分任务日志仅在 ``algorithm.multi_task.enabled`` 开启时生效，
+保留全局曲线，并在 ``env/multi_task/<name>/`` 和
+``eval/multi_task/<name>/`` 下记录各任务的 episode reward、return、长度、
+力统计及已有 reward audit。``return`` 是 episode 未折扣累计奖励；``reward``
+是各 episode 的 return/length 再取平均。跨 worker 先合并样本再计算统计量。
+力均值和中位数沿用有效接触轨迹口径；``force_bonus`` 仍是包含失败轨迹的候选
+bonus，不代表实际发放奖励。任务级 ``chunk_boundary/*`` 事件数跨 chunk 和
+worker 求和。
+
+PPO 增加 ``rollout/multi_task/<name>/rewards``、
+``advantages_mean/min/max``、``returns_mean/min/max`` 和 ``values_mean/min/max``。
+统计复用已有 loss mask 和动作对齐的任务标签，value 排除 bootstrap 行；
+全局和任务级分别提供 ``rewards_count``、``advantages_count``、``returns_count``、
+``values_count`` 分母。reward 沿用 chunk mask 下的 primitive 条目数，return、
+advantage 和 value 按 chunk 条目计数；advantage 不做任务内重新归一化。
+任务没有有效样本时只输出零计数，省略对应均值和极值。TensorBoard 与 W&B
+使用相同键名和 step。单任务日志、任务权重、奖励计算和 checkpoint 保持原行为。

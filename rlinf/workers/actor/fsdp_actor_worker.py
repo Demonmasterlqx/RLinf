@@ -1432,6 +1432,17 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             self.rollout_batch.update({"loss_mask_sum": kwargs["loss_mask_sum"]})
 
         rollout_metrics = compute_rollout_metrics(self.rollout_batch)
+        if self.multi_task_enabled:
+            from rlinf.utils.tabero_multi_task_metrics import (
+                compute_task_rollout_metrics,
+            )
+
+            rollout_metrics.update(
+                compute_task_rollout_metrics(
+                    self.rollout_batch,
+                    [task["name"] for task in task_list(self.cfg.env.train)],
+                )
+            )
         return rollout_metrics
 
     @Worker.timer("actor/compute_opd_teacher_logprobs")

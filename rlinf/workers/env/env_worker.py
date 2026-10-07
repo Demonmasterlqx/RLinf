@@ -694,7 +694,9 @@ class EnvWorker(Worker):
             records = infos.get(
                 _REALWORLD_FIRST_EPISODE_RECORDS_KEY, tabero_episode_records
             )
-            self._record_multi_task_episodes(stage_id, records, evaluation=False)
+            task_records = self._record_multi_task_episodes(
+                stage_id, records, evaluation=False
+            )
         if _REALWORLD_FIRST_EPISODE_RECORDS_KEY in infos:
             env_info.update(
                 realworld_first_episode_records_to_env_info(
@@ -736,6 +738,14 @@ class EnvWorker(Worker):
                 env_info[f"reward_audit/{key}"] = torch.tensor(
                     [value], dtype=torch.float64
                 )
+
+        if getattr(self, "multi_task_enabled", False):
+            self._attach_task_env_metrics(
+                env_info,
+                task_records,
+                stage_id,
+                realworld=_REALWORLD_FIRST_EPISODE_RECORDS_KEY in infos,
+            )
 
         intervene_actions = (
             infos["intervene_action"] if "intervene_action" in infos else None
@@ -810,7 +820,9 @@ class EnvWorker(Worker):
             records = infos.get(
                 _REALWORLD_FIRST_EPISODE_RECORDS_KEY, tabero_episode_records
             )
-            self._record_multi_task_episodes(stage_id, records, evaluation=True)
+            task_records = self._record_multi_task_episodes(
+                stage_id, records, evaluation=True
+            )
         if _REALWORLD_FIRST_EPISODE_RECORDS_KEY in infos:
             env_info.update(
                 realworld_first_episode_records_to_env_info(
@@ -844,6 +856,15 @@ class EnvWorker(Worker):
                 env_info[f"chunk_boundary/{key}"] = (
                     torch.as_tensor(value).reshape(-1).cpu()
                 )
+
+        if getattr(self, "multi_task_enabled", False):
+            self._attach_task_env_metrics(
+                env_info,
+                task_records,
+                stage_id,
+                realworld=_REALWORLD_FIRST_EPISODE_RECORDS_KEY in infos,
+                evaluation=True,
+            )
 
         rlt_switch_flags = (
             infos["rlt_switch_flags"] if "rlt_switch_flags" in infos else None
@@ -1268,12 +1289,12 @@ class EnvWorker(Worker):
         records: dict[str, torch.Tensor] | None,
         *,
         evaluation: bool = False,
-    ) -> None:
-        """Count each training episode once, before post-terminal resets."""
+    ) -> dict[str, torch.Tensor]:
+        """Count each episode once and return the same rows for task logging."""
         if records is None:
             raise ValueError("multi_task requires explicit completed-episode records.")
         if not records:
-            return
+            return {}
         seen = self._multi_task_eval_seen if evaluation else self._multi_task_seen
         counts = self._multi_task_eval_counts if evaluation else self._multi_task_counts
         env_indices = records["env_index"].cpu().long().reshape(-1)
@@ -1288,11 +1309,33 @@ class EnvWorker(Worker):
         ):
             raise ValueError("Invalid multi-task completed-episode records.")
         task_index = (self._rank * self.stage_num + stage_id) % counts.shape[1]
-        for index, succeeded in zip(env_indices.tolist(), success.tolist()):
+        selected = torch.zeros(env_indices.numel(), dtype=torch.bool)
+        for row, (index, succeeded) in enumerate(
+            zip(env_indices.tolist(), success.tolist())
+        ):
             if index not in seen[stage_id]:
                 seen[stage_id].add(index)
+                selected[row] = True
                 counts[0, task_index] += int(succeeded)
                 counts[1, task_index] += 1
+        return {key: value[selected.to(value.device)] for key, value in records.items()}
+
+    def _attach_task_env_metrics(
+        self,
+        env_info: dict[str, Any],
+        records: dict[str, torch.Tensor],
+        stage_id: int,
+        *,
+        realworld: bool,
+        evaluation: bool = False,
+    ) -> None:
+        from rlinf.utils.tabero_multi_task_metrics import attach_task_env_metrics
+
+        tasks = task_list(self.cfg.env.eval if evaluation else self.cfg.env.train)
+        task_index = (self._rank * self.stage_num + stage_id) % len(tasks)
+        attach_task_env_metrics(
+            env_info, records, tasks[task_index]["name"], realworld=realworld
+        )
 
     def record_env_metrics(
         self,

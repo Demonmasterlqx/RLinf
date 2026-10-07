@@ -274,7 +274,7 @@ class EmbodiedRunner:
                         counts[0, i] / counts[1, i]
                     ).item()
         eval_metrics_list = [results for results in env_results if results is not None]
-        eval_metrics = compute_evaluate_metrics(eval_metrics_list)
+        eval_metrics = self._compute_evaluate_metrics(eval_metrics_list)
         eval_metrics.update(task_metrics)
         return eval_metrics
 
@@ -361,6 +361,15 @@ class EmbodiedRunner:
                 )
         return aggregated_metrics, ranked_metrics_list
 
+    def _compute_evaluate_metrics(self, metrics_list: list[dict]) -> dict:
+        if self.multi_task_controller is not None:
+            from rlinf.utils.tabero_multi_task_metrics import (
+                compute_task_evaluate_metrics,
+            )
+
+            return compute_task_evaluate_metrics(metrics_list)
+        return compute_evaluate_metrics(metrics_list)
+
     def _process_ranked_eval_results(
         self, results: list[dict], metric_field: str
     ) -> tuple[dict, list[dict]]:
@@ -376,14 +385,14 @@ class EmbodiedRunner:
                 per_rank_metrics[int(rank)].append(metrics)
 
         aggregated_metrics = (
-            compute_evaluate_metrics(metric_list) if metric_list else {}
+            self._compute_evaluate_metrics(metric_list) if metric_list else {}
         )
         ranked_metrics_list: list[dict] = []
         if per_rank_metrics:
             max_rank = max(per_rank_metrics.keys())
             ranked_metrics_list = [{} for _ in range(max_rank + 1)]
             for rank, metrics_list in per_rank_metrics.items():
-                ranked_metrics_list[rank] = compute_evaluate_metrics(metrics_list)
+                ranked_metrics_list[rank] = self._compute_evaluate_metrics(metrics_list)
         return aggregated_metrics, ranked_metrics_list
 
     @staticmethod
@@ -532,7 +541,7 @@ class EmbodiedRunner:
             )
 
         env_results_list = [results for results in env_results if results is not None]
-        env_metrics = compute_evaluate_metrics(env_results_list)
+        env_metrics = self._compute_evaluate_metrics(env_results_list)
         env_metrics.update(aggregate_tabero_dsrl_env_metrics(env_results_list))
         env_metrics = {f"env/{k}": v for k, v in env_metrics.items()}
         ranked_env_results = [
