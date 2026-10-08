@@ -78,7 +78,7 @@ env:
             normalize_effort_reward:
               enabled: true
               min_effort: 2.0
-              mid_effort: 25.0
+              mid_effort: 30.0
       - name: coca_cola
         init_params:
           target_object: target_object_2
