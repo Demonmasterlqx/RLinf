@@ -35,7 +35,13 @@ def normalized(**kwargs):
 
 
 def make_term(
-    squeeze, *, direct, minimum_samples=1, terminal_reward=1.0, mode="normalized"
+    squeeze,
+    *,
+    direct,
+    minimum_samples=1,
+    terminal_reward=1.0,
+    mode="normalized",
+    **normalized_overrides,
 ):
     num_envs = len(squeeze)
     env = SimpleNamespace(
@@ -62,7 +68,11 @@ def make_term(
         force[:, :, 2] = env.squeeze[:, None] / 2
         return force[:, None] if direct else force
 
-    cfg = {"normalize_effort_reward": normalized(min_valid_samples=minimum_samples)}
+    cfg = {
+        "normalize_effort_reward": normalized(
+            min_valid_samples=minimum_samples, **normalized_overrides
+        )
+    }
     if mode == "old":
         cfg = {
             "force_bonus": {
@@ -96,26 +106,48 @@ def make_term(
 
 @pytest.mark.parametrize("direct", [True, False])
 @pytest.mark.parametrize("step_dt", [0.02, 0.05])
-def test_normalized_endpoints_clipping_and_condition_scaling(direct, step_dt):
-    env, terms, term, params = make_term([2, 10, 15, 20, 25, 30, 100], direct=direct)
+@pytest.mark.parametrize(
+    "overrides,expected_bonus,expected_reward",
+    [
+        ({}, [1, 1, 0.5, 0, -0.5, -1, -1], [2, 4, 1.5, 1, 0.5, 0, 0]),
+        ({"coefficient": 0}, [0] * 7, [1, 2, 1, 1, 1, 1, 1]),
+        (
+            {"coefficient": 0.5},
+            [0.5, 0.5, 0.25, 0, -0.25, -0.5, -0.5],
+            [1.5, 3, 1.25, 1, 0.75, 0.5, 0.5],
+        ),
+        ({"coefficient": 2}, [2, 2, 1, 0, -1, -2, -2], [3, 6, 2, 1, 0, -1, -1]),
+    ],
+)
+def test_normalized_endpoints_clipping_and_condition_scaling(
+    direct, step_dt, overrides, expected_bonus, expected_reward
+):
+    env, terms, term, params = make_term(
+        [2, 10, 15, 20, 25, 30, 100], direct=direct, **overrides
+    )
     terms["success"][:] = True
     env.step_dt = step_dt
     params["env_reward_multipliers"] = (1, 2, 1, 1, 1, 1, 1)
     reward = term(env, **params) * env.step_dt
     torch.testing.assert_close(
-        term.current_force_bonus, torch.tensor([1, 1, 0.5, 0, -0.5, -1, -1])
+        term.current_force_bonus, torch.tensor(expected_bonus, dtype=torch.float32)
     )
-    torch.testing.assert_close(reward, torch.tensor([2, 4, 1.5, 1, 0.5, 0, 0]))
+    torch.testing.assert_close(
+        reward, torch.tensor(expected_reward, dtype=torch.float32)
+    )
 
 
 @pytest.mark.parametrize("direct", [True, False])
-def test_normalized_success_only_and_negative_total(direct):
-    env, terms, term, params = make_term([40] * 4, direct=direct, terminal_reward=0.5)
+@pytest.mark.parametrize("coefficient,expected", [(1.0, -0.5), (2.0, -1.5)])
+def test_normalized_success_only_and_negative_total(direct, coefficient, expected):
+    env, terms, term, params = make_term(
+        [40] * 4, direct=direct, terminal_reward=0.5, coefficient=coefficient
+    )
     terms["success"][:] = torch.tensor([True, True, True, False])
     terms["failure"][1] = True
     env.termination_manager.time_outs[2] = True
     torch.testing.assert_close(
-        term(env, **params) * env.step_dt, torch.tensor([-0.5, 0, 0, 0])
+        term(env, **params) * env.step_dt, torch.tensor([expected, 0, 0, 0])
     )
 
 
@@ -124,7 +156,7 @@ def test_force_history_is_identical_between_reward_forms_and_partial_reset(direc
     results = []
     for mode in ("old", "normalized"):
         env, terms, term, params = make_term(
-            [0, 4], direct=direct, minimum_samples=2, mode=mode
+            [0, 4], direct=direct, minimum_samples=2, mode=mode, coefficient=2.0
         )
         term(env, **params)
         env.squeeze[:] = torch.tensor([4, 8])
@@ -181,6 +213,12 @@ def test_grasp_gate_and_multiple_sources_keep_maximum_valid_force():
         ("contact_epsilon", float("nan")),
         ("max_effort", 30),
         ("enabled", "true"),
+        ("coefficient", -1),
+        ("coefficient", True),
+        ("coefficient", float("nan")),
+        ("coefficient", float("inf")),
+        ("coefficient", "0.5"),
+        ("coefficient", None),
     ],
 )
 def test_normalized_parameters_reject_invalid_values(field, value):

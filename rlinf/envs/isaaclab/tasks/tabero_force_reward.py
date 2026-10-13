@@ -143,6 +143,11 @@ def validate_force_reward_cfg(
 
     minimum = finite_number("min_effort")
     midpoint = finite_number("mid_effort")
+    coefficient = finite_number("coefficient", 1.0)
+    if coefficient < 0:
+        raise ValueError(
+            "Tabero normalize_effort_reward.coefficient must be non-negative."
+        )
     maximum = midpoint + (midpoint - minimum)
     if minimum < 0 or midpoint <= minimum or not math.isfinite(maximum):
         raise ValueError(
@@ -167,7 +172,11 @@ def validate_force_reward_cfg(
         )
     return {
         "enabled": True,
-        "normalize_effort_reward": {"min_effort": minimum, "mid_effort": midpoint},
+        "normalize_effort_reward": {
+            "min_effort": minimum,
+            "mid_effort": midpoint,
+            "coefficient": coefficient,
+        },
         "min_valid_samples": samples,
         "contact_epsilon": contact_epsilon,
     }
@@ -233,6 +242,7 @@ def make_trajectory_force_success_reward_term(manager_term_base_cls: type) -> ty
                     .clamp(-1.0, 1.0)
                     .to(self._force_sum.dtype)
                 )
+                bonus = bonus * self._normalize_effort_reward.get("coefficient", 1.0)
             else:
                 bonus = self._coefficient / self.trajectory_mean_force.clamp(
                     min=self._epsilon

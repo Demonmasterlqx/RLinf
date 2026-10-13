@@ -1630,6 +1630,7 @@ def test_install_success_reward_installs_force_tracking_term_and_params(normaliz
 
     normalized_cfg = {
         "enabled": True,
+        "coefficient": 0.5,
         "min_effort": 10.0,
         "mid_effort": 20.0,
         "min_valid_samples": 3,
@@ -1667,7 +1668,11 @@ def test_install_success_reward_installs_force_tracking_term_and_params(normaliz
     if normalize:
         for key in ("coefficient", "epsilon", "max_bonus"):
             expected.pop(key)
-        expected["normalize_effort_reward"] = {"min_effort": 10.0, "mid_effort": 20.0}
+        expected["normalize_effort_reward"] = {
+            "min_effort": 10.0,
+            "mid_effort": 20.0,
+            "coefficient": 0.5,
+        }
     assert reward_cfg.params == expected
 
 

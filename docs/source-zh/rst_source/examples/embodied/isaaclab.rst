@@ -315,21 +315,24 @@ Tabero 按任务选择力奖励
 
 .. math::
 
-   r_{\mathrm{effort}} = \operatorname{clip}\left(
+   r_{\mathrm{effort}} = \alpha \operatorname{clip}\left(
    \frac{2(\mathrm{mid\_effort}-\mathrm{effort})}
    {\mathrm{max\_effort}-\mathrm{min\_effort}}, -1, 1\right)
 
-min/mid/max 分别对应 +1/0/-1，超出区间时裁剪。effort 复用原奖励的有效双指接触
+``coefficient`` 对应系数 α，默认 1.0，必须为有限非负数，支持逐任务覆盖；
+先裁剪到 ``[-1, 1]`` 再乘系数，min/mid/max 分别对应 +α/0/-α。
+系数为 0 时力分量为零，基础成功奖励不变。effort 复用原奖励的有效双指接触
 挤压力轨迹均值，包括原有抓取门控、多来源聚合、释放过滤和局部重置行为。
 ``min_valid_samples`` 默认 1，``contact_epsilon`` 默认 0.0001；不足有效样本时力分量为零。
 只有有效成功时才发放 ``terminal_reward + 力分量``，失败和超时为零。
-``[-1, 1]`` 限制的是力分量，后续仍应用环境 ``reward_coef`` 和已有条件倍率；
+力分量范围为 ``[-coefficient, coefficient]``，后续仍应用环境 ``reward_coef`` 和已有条件倍率；
 奖励项的 ``/ step_dt`` 与 IsaacLab RewardManager 的 ``* dt`` 抵消。
 
 成功率使用重置前的成功终止标志，不从奖励正负推断。
-例如 ``terminal_reward: 1.0`` 且 effort 达到 max 时，总奖励为零，但仍计为成功。
+例如 ``terminal_reward: 1.0``、``coefficient: 1.0`` 且 effort 达到 max 时，总奖励为零，但仍计为成功。
+若系数大于 ``terminal_reward``，成功时总奖励可以为负。
 现有 ``force_bonus`` 诊断字段保留兼容，在新模式下表示选中的有符号力分量；
-它是在成功门控及奖励缩放前的诊断值，不等于失败 episode 获得了力奖励。
+它包含 ``coefficient``，但在成功门控及环境奖励缩放前记录，不等于失败 episode 获得了力奖励。
 总回报和成功指标继续通过现有 TensorBoard、W&B 通道记录。
 
 以下为 Task820 多任务训练配置片段。数值仅为结构示例，不是物体力阈值的标定结果；
@@ -351,6 +354,7 @@ min/mid/max 分别对应 +1/0/-1，超出区间时裁剪。effort 复用原奖�
              enabled: false
            normalize_effort_reward:
              enabled: false
+             coefficient: 1.0
              min_valid_samples: 4
              contact_epsilon: 1.0
        multi_task:

@@ -132,6 +132,7 @@ env:
           contact_epsilon: 1.0
         normalize_effort_reward:
           enabled: true
+          coefficient: 1.0
           min_effort: 0.0
           mid_effort: 100.0
           min_valid_samples: 4
