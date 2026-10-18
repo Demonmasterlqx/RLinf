@@ -66,6 +66,40 @@ def _prepare_stage2_feature_model(model, actor_model_config) -> None:
     model.rlt_module.discard_decoder()
 
 
+def _load_external_rlt_encoder_state(cfg):
+    """Load an exported Stage 1 encoder into the OpenPI RLT module.
+
+    Stage 1 Hub bundles intentionally contain only ``encoder.*`` tensors,
+    while RLinf's OpenPI model stores the same tensors below
+    ``rlt_module.encoder``.  Keep the base OpenPI checkpoint and the encoder
+    bundle separate so the Stage 2 feature model can validate both artifacts.
+    """
+    encoder_path = cfg.get("rlt_encoder_path", None)
+    if not encoder_path:
+        return {}
+    import os
+    import safetensors.torch
+
+    if not os.path.isfile(str(encoder_path)):
+        raise FileNotFoundError(
+            f"Configured RLT Stage 1 encoder does not exist: {encoder_path}"
+        )
+    state = safetensors.torch.load_file(str(encoder_path), device="cpu")
+    if not state:
+        raise ValueError(f"Configured RLT Stage 1 encoder is empty: {encoder_path}")
+    normalized = {}
+    for key, value in state.items():
+        if key.startswith("encoder."):
+            key = f"rlt_module.{key}"
+        if not key.startswith("rlt_module.encoder."):
+            raise ValueError(
+                "RLT Stage 1 encoder must contain only encoder.* tensors; "
+                f"got {key!r} from {encoder_path}"
+            )
+        normalized[key] = value
+    return normalized
+
+
 def get_model(cfg: DictConfig, torch_dtype=None):
     import glob
 
@@ -109,6 +143,7 @@ def get_model(cfg: DictConfig, torch_dtype=None):
     model: OpenPi0ForRLActionPrediction = OpenPi0ForRLActionPrediction(
         actor_model_config
     )
+    external_rlt_state = _load_external_rlt_encoder_state(cfg)
     # train expert only
     if actor_model_config.train_expert_only:
         model.freeze_vlm()
@@ -117,10 +152,12 @@ def get_model(cfg: DictConfig, torch_dtype=None):
     if os.path.exists(full_weights_path):
         # Direct checkpoint directory
         model_state_dict = torch.load(full_weights_path, map_location="cpu")
+        model_state_dict.update(external_rlt_state)
         load_result = model.load_state_dict(model_state_dict, strict=False)
     elif os.path.exists(actor_full_weights_path):
         # Checkpoint directory from runner
         model_state_dict = torch.load(actor_full_weights_path, map_location="cpu")
+        model_state_dict.update(external_rlt_state)
         load_result = model.load_state_dict(model_state_dict, strict=False)
     else:
         # Original model directory with safetensors files
@@ -131,6 +168,7 @@ def get_model(cfg: DictConfig, torch_dtype=None):
         for weight_path in weight_paths:
             state_dict = safetensors.torch.load_file(weight_path, device="cpu")
             all_state_dict.update(state_dict)
+        all_state_dict.update(external_rlt_state)
         load_result = model.load_state_dict(all_state_dict, strict=False)
 
     allowed_missing_prefixes = cfg.get("checkpoint_load_allowed_missing_prefixes", None)
