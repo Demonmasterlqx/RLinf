@@ -132,7 +132,7 @@ env:
       composite_name: combined
     init_params:
       extension_path: ${oc.env:ROOT}/Tabero_X/source/tac_manip
-      realworld_config_dir: ${oc.env:ROOT}/Tabero_X/benchmarks/datasets/realworld/config/gentle_grasp_0.5_griper_pos_random_delta_500g_stage_1_3_+-2cm/stage2
+      realworld_config_dir: ${oc.env:ROOT}/Tabero_X/benchmarks/datasets/realworld/config/gentle_grasp_0.5_griper_pos_random_delta_500g_stage_1_3_+-1cm/stage2
       realworld_assets_dir: ${oc.env:ROOT}/Tabero_X/benchmarks/datasets/realworld/USD
       gripper_diagnostics_path: ''
       tactile_image_history_len: 8
