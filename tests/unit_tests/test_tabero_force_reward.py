@@ -21,10 +21,15 @@ import pytest
 import torch
 from omegaconf import OmegaConf
 
+from rlinf.envs.isaaclab.tasks.realworld_tabero_tacfield import (
+    _terminal_success_reward,
+    _termination_term_items,
+)
 from rlinf.envs.isaaclab.tasks.tabero_force_reward import (
     TERMINAL_SUCCESS_KEY,
     make_trajectory_force_success_reward_term,
     record_success_metrics,
+    valid_success_mask,
     validate_force_reward_cfg,
 )
 from rlinf.utils.multi_task import task_env_cfg, validate_environments
@@ -149,6 +154,43 @@ def test_normalized_success_only_and_negative_total(direct, coefficient, expecte
     torch.testing.assert_close(
         term(env, **params) * env.step_dt, torch.tensor([expected, 0, 0, 0])
     )
+
+
+@pytest.mark.parametrize("reward_mode", ["binary", "old", "normalized"])
+def test_gripper_slip_overrides_success_reward_and_episode_metrics(reward_mode):
+    env, terms, term, params = make_term([10, 10], direct=True, mode=reward_mode)
+    terms["gripper_slip"] = terms.pop("failure")
+    terms["success"][:] = True
+    terms["gripper_slip"][0] = True
+    env.termination_manager.active_terms = list(terms)
+    terminations_cfg = SimpleNamespace(
+        success=SimpleNamespace(func=object(), time_out=False),
+        gripper_slip=SimpleNamespace(func=object(), time_out=False),
+        time_out=SimpleNamespace(func=object(), time_out=True),
+    )
+    failure_names = tuple(
+        name
+        for name, cfg in _termination_term_items(terminations_cfg)
+        if name != "success" and not cfg.time_out
+    )
+    assert failure_names == ("gripper_slip",)
+    params["failure_term_names"] = failure_names
+    if reward_mode == "binary":
+        reward = _terminal_success_reward(env, failure_term_names=failure_names)
+    else:
+        reward = term(env, **params)
+        # The diagnostic bonus remains available, but must not be paid on failure.
+        assert term.current_force_bonus[0] > 0
+    reward *= env.step_dt
+    assert reward[0] == 0
+    assert reward[1] > 0
+    valid_success = valid_success_mask(env)
+    assert valid_success.tolist() == [False, True]
+    env.returns = torch.zeros(2)
+    env.success_once = torch.zeros(2, dtype=torch.bool)
+    env.elapsed_steps = torch.ones(2, dtype=torch.long)
+    infos = record_success_metrics(env, reward, {TERMINAL_SUCCESS_KEY: valid_success})
+    assert infos["episode"]["success_once"].tolist() == [False, True]
 
 
 @pytest.mark.parametrize("direct", [True, False])
