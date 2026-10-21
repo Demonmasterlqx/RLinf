@@ -18,12 +18,12 @@ import time
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING
 
-import numpy as np
 import torch
 import torch.distributed
 
 from rlinf.utils.dsrl_reward import (
     DSRL_REWARD_AUDIT_FIELDS,
+    chunk_valid_mask,
     combine_dsrl_reward_audits,
 )
 
@@ -434,6 +434,12 @@ def compute_evaluate_metrics(eval_metrics_list):
     """
     List of evaluate metrics, list length stands for rollout process
 
+    For terminal episode records, ``success_rate`` divides successes by completed
+    episodes. ``success_step_ratio`` divides successful terminal steps (one per
+    successful episode) by valid executed primitive actions, including unfinished
+    collection tails and excluding post-terminal holds. Pool counts across shards
+    before dividing; the task reducer uses this same function for each task.
+
     Returns:
         dict: Aggregated metrics with mean values and trajectory count
     """
@@ -460,14 +466,40 @@ def compute_evaluate_metrics(eval_metrics_list):
         if metric:
             all_eval_metrics[env_info_key] = metric
 
-    for key in all_eval_metrics:
+    for key in list(all_eval_metrics):
         shards = [_normalize_metric_shard(s) for s in all_eval_metrics[key]]
         stacked = torch.concat(shards).float()
-        all_eval_metrics[key] = (
-            stacked.mean().detach().cpu().numpy()
-            if stacked.numel() > 0
-            else np.asarray(0.0, dtype=np.float64)
+        if key.startswith("chunk_boundary/") or key == "interrupted_episode_count":
+            all_eval_metrics[key] = stacked.sum().item()
+        elif stacked.numel():
+            all_eval_metrics[key] = stacked.mean().detach().cpu().numpy()
+        else:
+            del all_eval_metrics[key]
+
+    # Pool event/step counts before dividing, including across unequal shards.
+    if any("success_once" in shard for shard in eval_metrics_list):
+        success = torch.cat(
+            [
+                _normalize_metric_shard(shard.get("success_once"))
+                for shard in eval_metrics_list
+            ]
         )
+        all_eval_metrics["episodes"] = success.numel()
+        all_eval_metrics["successes"] = success.sum().item()
+        all_eval_metrics["timeout_count"] = sum(
+            _normalize_metric_shard(shard.get("truncation")).sum().item()
+            for shard in eval_metrics_list
+        )
+        if success.numel():
+            all_eval_metrics["success_rate"] = success.mean().item()
+        valid_steps = all_eval_metrics.get("chunk_boundary/valid_primitive_actions")
+        if valid_steps is not None:
+            all_eval_metrics["valid_step_count"] = valid_steps
+            all_eval_metrics["success_step_count"] = success.sum().item()
+            if valid_steps > 0:
+                all_eval_metrics["success_step_ratio"] = (
+                    success.sum().item() / valid_steps
+                )
 
     # Add total trajectory count to metrics
     all_eval_metrics["num_trajectories"] = sum(trajectory_counts)
@@ -678,7 +710,12 @@ def compute_rollout_metrics(data_buffer: dict) -> dict:
 
     if "rewards" in data_buffer:
         rewards = data_buffer["rewards"]
-        rewards = valid_values(rewards)
+        primitive_mask = data_buffer.get("primitive_loss_mask")
+        rewards = (
+            rewards[primitive_mask.to(device=rewards.device, dtype=torch.bool)]
+            if primitive_mask is not None
+            else valid_values(rewards)
+        )
         mean_rewards, _, _ = reduce_metrics(rewards)
 
         rewards_metrics = {
@@ -787,13 +824,20 @@ def compute_embodied_loss_masks(
 ) -> dict[str, torch.Tensor]:
     """Build aligned primitive and macro masks for embodied policy updates.
 
-    ``compute_loss_mask`` accounts for RLinf's leading bootstrap done row. Its
-    primitive mask includes the first done action and excludes every later
-    action. Boundary-safe chunk-level PPO keeps this prefix for log-probability
-    reduction while using one macro loss sample for every non-empty chunk.
+    Terminal-safe environments reset at chunk boundaries. Keep the terminal
+    primitive and mask only the remaining actions of that chunk, then admit
+    the replacement episode in the next chunk. Other environments retain
+    their rollout-prefix mask.
     """
 
-    primitive_loss_mask, primitive_loss_mask_sum = compute_loss_mask(dones)
+    if use_primitive_prefix_logprobs:
+        # The first row describes the initial observation, not an action.
+        primitive_loss_mask = chunk_valid_mask(dones[1:])
+        primitive_loss_mask_sum = primitive_loss_mask.sum(
+            dim=(0, 2), keepdim=True
+        ).expand_as(primitive_loss_mask)
+    else:
+        primitive_loss_mask, primitive_loss_mask_sum = compute_loss_mask(dones)
     if reward_type != "chunk_level":
         result = {
             "loss_mask": primitive_loss_mask,

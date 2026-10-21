@@ -855,7 +855,11 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             rewards_for_bootstrap = (
                 batch["rewards"].sum(dim=-1, keepdim=True).to(self.torch_dtype)
             )
-        terminations = batch["terminations"].to(self.torch_dtype)
+        terminations = batch["terminations"].bool()
+        if use_dsrl:
+            # Task timeouts are failed attempts. A collection-window cutoff
+            # has neither flag and must still bootstrap from its final state.
+            terminations = terminations | batch["truncations"].bool()
 
         curr_obs = batch["curr_obs"]
         next_obs = batch["next_obs"]
@@ -1081,12 +1085,14 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         mean_weight = (stats[1].sum() / stats[0].sum()).cpu().float()
         batch["sample_weights"] = raw / mean_weight
         metrics = {
+            "training_sample_count": stats[0].sum().item(),
             "multi_task/normalized_weight_mean": (
                 stats[1].sum() / mean_weight.to(stats) / stats[0].sum()
-            ).item()
+            ).item(),
         }
         for i, name in enumerate(names):
             metrics[f"multi_task/{name}/sample_count"] = stats[0, i].item()
+            metrics[f"multi_task/{name}/training_sample_count"] = stats[0, i].item()
             metrics[f"multi_task/{name}/normalized_weight"] = (
                 (stats[1, i] / stats[0, i] / mean_weight.to(stats)).item()
                 if stats[0, i]
@@ -1266,7 +1272,11 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                         cpu_values.append(v.detach().cpu().item())
                     else:
                         cpu_values.append(v)
-                mean_metric_dict[key] = np.mean(cpu_values)
+                mean_metric_dict[key] = (
+                    np.sum(cpu_values)
+                    if key.endswith("training_sample_count")
+                    else np.mean(cpu_values)
+                )
             else:
                 # Handle single values
                 if isinstance(value, torch.Tensor):

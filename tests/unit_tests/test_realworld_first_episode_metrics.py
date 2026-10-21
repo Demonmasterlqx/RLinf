@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Regression coverage for first-episode logging across internal resets."""
+"""Regression coverage for all-episode logging across internal resets."""
 
 import inspect
 import json
@@ -33,7 +33,7 @@ from rlinf.utils.metric_utils import (
 from rlinf.workers.env import env_worker
 from rlinf.workers.env.env_worker import (
     EnvWorker,
-    realworld_first_episode_records_to_env_info,
+    realworld_episode_records_to_env_info,
 )
 
 
@@ -136,51 +136,75 @@ def run_rollout(env, monkeypatch):
         outputs.append(output)
         if EnvWorker.should_record_env_metrics(worker, output, info, chunk):
             EnvWorker.record_env_metrics(worker, metrics, info)
+    metrics["interrupted_episode_count"] = [
+        env.collection_window_metrics()["interrupted_episode_count"]
+    ]
     return compute_evaluate_metrics(
         [{key: torch.cat(value) for key, value in metrics.items()}]
     ), outputs
 
 
-def test_first_success_survives_reset_and_next_rollout_starts_fresh(
+def test_all_successes_survive_resets_and_next_rollout_starts_fresh(
     tmp_path, monkeypatch
 ):
     env = make_env(tmp_path)
     for _ in range(2):
         metrics, outputs = run_rollout(env, monkeypatch)
-        assert metrics["num_trajectories"] == 4
-        assert metrics["success_once"] == pytest.approx(0.75)
-        assert metrics["return"] == pytest.approx(0.75)
-        assert metrics["episode_len"] == pytest.approx((120 + 123 + 295 + 300) / 4)
-        assert metrics["reward"] == pytest.approx((1 / 120 + 1 / 123 + 1 / 295) / 4)
+        assert metrics["num_trajectories"] == 5
+        assert metrics["success_once"] == pytest.approx(0.8)
+        assert metrics["return"] == pytest.approx(0.8)
+        assert metrics["episode_len"] == pytest.approx(
+            (120 + 130 + 123 + 295 + 300) / 5
+        )
+        assert metrics["reward"] == pytest.approx(
+            (1 / 120 + 1 / 130 + 1 / 123 + 1 / 295) / 5
+        )
         assert metrics["force_valid_sample_count"] == pytest.approx(
-            (120 + 123 + 295 + 300) / 4
+            (120 + 250 + 123 + 295 + 300) / 5
         )
         assert metrics["force_bonus_mean"] == pytest.approx(0.25)
-        assert metrics["force_bonus_sum"] == pytest.approx(1.0)
+        assert metrics["force_bonus_sum"] == pytest.approx(1.25)
         assert metrics["force_bonus_max"] == pytest.approx(0.25)
         assert metrics["trajectory_mean_measured_squeeze_mean"] == pytest.approx(5.0)
         assert metrics["trajectory_mean_measured_squeeze_median"] == pytest.approx(5.0)
         assert metrics["force_valid_sample_count_mean"] == pytest.approx(
-            (120 + 123 + 295 + 300) / 4
+            (120 + 250 + 123 + 295 + 300) / 5
         )
-        assert metrics["force_trajectory_count"] == 4
+        assert metrics["force_trajectory_count"] == 5
         assert metrics["force_missing_trajectory_count"] == 0
         assert sum(float(out.rewards.sum()) for out in outputs) == 4
         assert outputs[12].rewards[1, 2] == 1
         assert not outputs[12].rewards[1, 3:].any()
+        assert metrics["successes"] == 4
+        assert metrics["episodes"] == 5
+        assert metrics["timeout_count"] == 1
+        assert metrics["interrupted_episode_count"] == 2
+        assert metrics["valid_step_count"] == 1188
+        assert metrics["success_step_count"] == 4
+        assert metrics["success_step_ratio"] == pytest.approx(4 / 1188)
         env.reset()
     rows = [
         json.loads(line)
         for path in tmp_path.glob("*.jsonl")
         for line in path.read_text().splitlines()
     ]
-    assert len(rows) == 8
-    assert len({(row["rollout_index"], row["env_index"]) for row in rows}) == 8
+    assert len(rows) == 10
+    assert (
+        len(
+            {
+                (row["rollout_index"], row["env_index"], row["rollout_step"])
+                for row in rows
+            }
+        )
+        == 10
+    )
     assert sorted(row["episode_len"] for row in rows) == [
         120,
         120,
         123,
         123,
+        130,
+        130,
         295,
         295,
         300,
@@ -195,7 +219,7 @@ def test_count_uses_episode_samples_even_when_chunk_diagnostics_arrive_first():
     }
     assert compute_evaluate_metrics([metrics])["num_trajectories"] == 2
     assert (
-        compute_evaluate_metrics([realworld_first_episode_records_to_env_info({})])[
+        compute_evaluate_metrics([realworld_episode_records_to_env_info({})])[
             "num_trajectories"
         ]
         == 0
@@ -238,15 +262,18 @@ def test_duplicate_records_are_rejected():
         )
     }
     with pytest.raises(ValueError, match="duplicate"):
-        realworld_first_episode_records_to_env_info(records)
+        realworld_episode_records_to_env_info(records)
 
 
-def test_missing_terminal_is_detected(tmp_path):
+def test_unfinished_window_is_not_a_failed_episode(tmp_path):
     env = make_env(tmp_path)
     env._episode_rollout_steps = 299
     env._elapsed_steps[:] = 0
-    with pytest.raises(RuntimeError, match="missing first-episode"):
-        env.step(torch.zeros(4, 13))
+    _, _, terminations, truncations, infos = env.step(torch.zeros(4, 13))
+    assert not (terminations | truncations).any()
+    assert infos["_realworld_episode_records"] == {}
+    assert env.collection_window_metrics()["interrupted_episode_count"].item() == 4
+    assert env._drain_episode_records() == {}
 
 
 @pytest.mark.parametrize("success_reward", [0.0, -0.5])
@@ -255,6 +282,6 @@ def test_nonpositive_success_reward_preserves_episode_counts(
 ):
     env = make_env(tmp_path, success_reward=success_reward)
     metrics, _ = run_rollout(env, monkeypatch)
-    assert metrics["num_trajectories"] == 4
-    assert metrics["success_once"] == pytest.approx(0.75)
-    assert metrics["return"] == pytest.approx(0.75 * success_reward)
+    assert metrics["num_trajectories"] == 5
+    assert metrics["success_once"] == pytest.approx(0.8)
+    assert metrics["return"] == pytest.approx(0.8 * success_reward)

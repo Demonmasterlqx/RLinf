@@ -114,7 +114,7 @@ def task_env_cfg(env_cfg, index: int):
 
 
 def validate_environments(cfg) -> None:
-    """Validate task interfaces and complete-episode collection for either algorithm."""
+    """Validate shared task interfaces and terminal-safe collection."""
     train_tasks = task_list(cfg.env.train)
     splits = ["train"]
     if cfg.runner.get("val_check_interval", -1) > 0:
@@ -130,10 +130,6 @@ def validate_environments(cfg) -> None:
         if env.get("auto_reset", True) or env.get("ignore_terminations", True):
             raise ValueError(
                 "multi_task v1 requires terminal-safe non-auto-reset envs."
-            )
-        if env.max_steps_per_rollout_epoch < env.max_episode_steps:
-            raise ValueError(
-                "multi_task rollout must cover complete episodes before reset."
             )
         stage_count = cfg.rollout.pipeline_stage_num
         if type(stage_count) is not int or stage_count < 1:

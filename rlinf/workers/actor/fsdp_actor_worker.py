@@ -1364,11 +1364,12 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             return False
         mean_weight = (stats[0] / stats[1]).cpu().float()
         batch["sample_weights"] = raw / mean_weight
-        # PPO length-corrected loss uses the full padded batch denominator;
-        # entropy retains its effective-chunk denominator.
+        # Terminal-safe chunk PPO averages all admitted decisions, including
+        # those after reset. Other PPO paths retain their length correction.
         denominator = (
             self.cfg.actor.global_batch_size
             if batch.get("loss_mask_sum") is not None
+            and batch.get("primitive_loss_mask") is None
             else stats[1].item()
         )
         multiplier = self._world_size * self.gradient_accumulation
@@ -1387,10 +1388,14 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             task_stats[0, i] = selected.sum()
             task_stats[1, i] = batch["sample_weights"][selected].double().sum()
         torch.distributed.all_reduce(task_stats)
-        data = {"multi_task/normalized_weight_mean": 1.0}
+        data = {
+            "multi_task/normalized_weight_mean": 1.0,
+            "training_sample_count": stats[1].item(),
+        }
         for i, task in enumerate(task_list(self.cfg.env.train)):
             count = task_stats[0, i].item()
             data[f"multi_task/{task['name']}/valid_samples"] = count
+            data[f"multi_task/{task['name']}/training_sample_count"] = count
             if count:
                 data[f"multi_task/{task['name']}/normalized_weight"] = (
                     task_stats[1, i] / count
@@ -1421,6 +1426,10 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             "reward_type": self.cfg.algorithm.reward_type,
             "loss_mask": self.rollout_batch.get("loss_mask", None),
             "loss_mask_sum": self.rollout_batch.get("loss_mask_sum", None),
+            "primitive_loss_mask": self.rollout_batch.get("primitive_loss_mask", None),
+            "normalize_advantages": self.cfg.algorithm.get(
+                "normalize_advantages", True
+            ),
         }
 
         advantages_and_returns = calculate_adv_and_returns(**kwargs)
@@ -1704,7 +1713,12 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         self.optimizer.zero_grad()
         clear_memory()
         explained_variance_stats = pop_critic_explained_variance_stats(metrics)
-        mean_metric_dict = {key: np.mean(value) for key, value in metrics.items()}
+        mean_metric_dict = {
+            key: np.sum(value)
+            if key.endswith("training_sample_count")
+            else np.mean(value)
+            for key, value in metrics.items()
+        }
         mean_metric_dict = all_reduce_dict(
             mean_metric_dict, op=torch.distributed.ReduceOp.AVG
         )
@@ -1740,14 +1754,9 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         if uses_tabero_primitive_prefix_boundary(
             self._tabero_ppo_transition_boundary_semantics
         ):
-            action_chunk = int(self.cfg.actor.model.num_action_chunks)
-            if loss_normalization_steps % action_chunk != 0:
-                raise ValueError(
-                    "Boundary-safe chunk PPO requires max_episode_steps divisible by "
-                    f"num_action_chunks; got {loss_normalization_steps} and "
-                    f"{action_chunk}."
-                )
-            loss_normalization_steps //= action_chunk
+            # Replacement episodes contribute equally per valid chunk. There
+            # is no first-episode length correction for this collection mode.
+            loss_normalization_steps = None
 
         kwargs = {}
         if SupportedModel(self.cfg.actor.model.model_type) in [

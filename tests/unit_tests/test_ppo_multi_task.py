@@ -467,13 +467,11 @@ def test_two_rank_accumulation_matches_full_batch(tmp_path, micro_size):
         )
 
 
-def test_worker_counts_first_episode_once_and_keeps_eval_separate():
+def test_worker_counts_replacement_episodes_and_keeps_eval_separate():
     from rlinf.workers.env.env_worker import EnvWorker
 
     worker = object.__new__(EnvWorker)
     worker._rank, worker.stage_num = 0, 2
-    worker._multi_task_seen = [set(), set()]
-    worker._multi_task_eval_seen = [set(), set()]
     worker._multi_task_counts = torch.zeros((2, 2), dtype=torch.int64)
     worker._multi_task_eval_counts = torch.zeros((2, 2), dtype=torch.int64)
     records = {
@@ -485,18 +483,21 @@ def test_worker_counts_first_episode_once_and_keeps_eval_separate():
     worker._record_multi_task_episodes(1, records)
     worker._record_multi_task_episodes(1, records)
     torch.testing.assert_close(
-        worker._multi_task_counts, torch.tensor([[0, 1], [0, 2]])
+        worker._multi_task_counts, torch.tensor([[0, 2], [0, 4]])
     )
     worker._record_multi_task_episodes(0, records, evaluation=True)
     torch.testing.assert_close(
         worker._multi_task_eval_counts, torch.tensor([[1, 0], [2, 0]])
     )
     torch.testing.assert_close(
-        worker._multi_task_counts, torch.tensor([[0, 1], [0, 2]])
+        worker._multi_task_counts, torch.tensor([[0, 2], [0, 4]])
     )
 
 
-def test_actor_uses_global_batch_weights_and_rejects_stale_table(monkeypatch):
+@pytest.mark.parametrize("primitive_prefix", [False, True])
+def test_actor_uses_global_batch_weights_and_rejects_stale_table(
+    monkeypatch, primitive_prefix
+):
     from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
 
     actor = object.__new__(EmbodiedFSDPActor)
@@ -526,14 +527,21 @@ def test_actor_uses_global_batch_weights_and_rejects_stale_table(monkeypatch):
         "loss_mask": torch.tensor([[True], [True], [False], [True]]),
         "loss_mask_sum": torch.tensor([[2], [2], [0], [2]]),
     }
+    if primitive_prefix:
+        batch["primitive_loss_mask"] = batch["loss_mask"].expand(-1, 10)
     monkeypatch.setattr(dist, "all_reduce", lambda _: None)
     metrics = {}
     assert actor._prepare_task_weighted_batch(batch, metrics)
     torch.testing.assert_close(
         batch["sample_weights"], torch.tensor([1 / 3, 4 / 3, 1 / 3, 4 / 3])
     )
-    assert batch["weighted_reduction_scale"][0] == 1
+    assert batch["weighted_reduction_scale"][0] == pytest.approx(
+        4 / 3 if primitive_prefix else 1
+    )
     assert batch["weighted_entropy_scale"][0] == pytest.approx(4 / 3)
+    assert metrics["training_sample_count"] == [3]
+    assert metrics["multi_task/a/training_sample_count"] == [1]
+    assert metrics["multi_task/b/training_sample_count"] == [2]
     actor.version = 4
     with pytest.raises(ValueError, match="Missing current"):
         actor._prepare_task_weighted_batch(batch, {})

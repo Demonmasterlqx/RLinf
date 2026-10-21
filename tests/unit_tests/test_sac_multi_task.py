@@ -253,7 +253,10 @@ def test_old_replay_samples_use_current_weights_and_reject_stale_version(monkeyp
     monkeypatch.setattr(dist, "all_reduce", lambda tensor, **kwargs: None)
     actor = worker()
     batch = {"task_indices": torch.tensor([0, 0, 0, 1])}
-    actor._prepare_sac_task_batch(batch)
+    metrics = actor._prepare_sac_task_batch(batch)
+    assert metrics["training_sample_count"] == 4
+    assert metrics["multi_task/easy/training_sample_count"] == 3
+    assert metrics["multi_task/hard/training_sample_count"] == 1
     torch.testing.assert_close(batch["sample_weights"].mean(), torch.tensor(1.0))
     first = batch["sample_weights"].clone()
     actor.version = 1
@@ -264,6 +267,28 @@ def test_old_replay_samples_use_current_weights_and_reject_stale_version(monkeyp
     assert first[-1] > first[0]
     assert batch["sample_weights"][-1] < batch["sample_weights"][0]
     assert set(batch) == {"task_indices", "sample_weights"}
+
+
+def test_training_sample_counts_sum_across_updates(monkeypatch):
+    monkeypatch.setattr(
+        "rlinf.workers.actor.fsdp_sac_policy_worker.all_reduce_dict",
+        lambda data, **kwargs: data,
+    )
+    actor = worker()
+    actor.replay_buffer = SimpleNamespace(get_stats=lambda: {})
+    actor.demo_buffer = None
+    metrics = actor.process_train_metrics(
+        {
+            "training_sample_count": [4, 4],
+            "multi_task/easy/training_sample_count": [3, 1],
+            "multi_task/hard/training_sample_count": [1, 3],
+            "critic_loss": [2.0, 4.0],
+        }
+    )
+    assert metrics["training_sample_count"] == 8
+    assert metrics["multi_task/easy/training_sample_count"] == 4
+    assert metrics["multi_task/hard/training_sample_count"] == 4
+    assert metrics["critic_loss"] == 3.0
 
 
 class Model(torch.nn.Module):

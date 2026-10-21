@@ -34,14 +34,14 @@ TASK_METRIC_PREFIX = "multi_task/"
 def attach_task_env_metrics(
     env_info: dict, records: dict, task_name: str, *, realworld: bool
 ) -> None:
-    """Attach deduplicated episode rows and per-chunk diagnostics as tensors."""
+    """Attach completed episode rows and per-chunk diagnostics as tensors."""
     from rlinf.workers.env.env_worker import (
-        realworld_first_episode_records_to_env_info,
+        realworld_episode_records_to_env_info,
         tabero_chunk_episode_records_to_env_info,
     )
 
     project = (
-        realworld_first_episode_records_to_env_info
+        realworld_episode_records_to_env_info
         if realworld
         else tabero_chunk_episode_records_to_env_info
     )
@@ -173,11 +173,16 @@ def compute_task_rollout_metrics(data_buffer: dict, task_names: Sequence[str]) -
         raise ValueError("Rollout metrics require valid action-aligned task indices.")
 
     def valid_values(
-        values: torch.Tensor, task_index: int | None = None
+        values: torch.Tensor, task_index: int | None = None, *, primitive: bool = False
     ) -> torch.Tensor:
         mask = torch.ones_like(values, dtype=torch.bool)
-        if loss_mask is not None:
-            active = loss_mask.to(device=values.device, dtype=torch.bool)
+        selected_mask = (
+            data_buffer.get("primitive_loss_mask") if primitive else loss_mask
+        )
+        if selected_mask is None:
+            selected_mask = loss_mask
+        if selected_mask is not None:
+            active = selected_mask.to(device=values.device, dtype=torch.bool)
             if active.ndim == values.ndim - 1:
                 active = active.unsqueeze(-1)
             mask &= torch.broadcast_to(active, values.shape)
@@ -209,7 +214,9 @@ def compute_task_rollout_metrics(data_buffer: dict, task_names: Sequence[str]) -
 
     # Every actor visits every configured task, including locally empty tasks.
     for name, values in signals.items():
-        mean, minimum, maximum, count = reduce_metrics(valid_values(values))
+        mean, minimum, maximum, count = reduce_metrics(
+            valid_values(values, primitive=name == "rewards")
+        )
         if name == "values":
             rollout_metrics.update(
                 {
@@ -221,7 +228,7 @@ def compute_task_rollout_metrics(data_buffer: dict, task_names: Sequence[str]) -
         rollout_metrics[f"{name}_count"] = count
         for task_index, task_name in enumerate(task_names):
             mean, minimum, maximum, count = reduce_metrics(
-                valid_values(values, task_index)
+                valid_values(values, task_index, primitive=name == "rewards")
             )
             prefix = f"multi_task/{task_name}/"
             rollout_metrics[f"{prefix}{name}_count"] = count

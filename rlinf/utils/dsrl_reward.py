@@ -38,6 +38,16 @@ def empty_dsrl_reward_audit() -> dict[str, float]:
     return dict.fromkeys(DSRL_REWARD_AUDIT_FIELDS, 0.0)
 
 
+def chunk_valid_mask(dones: torch.Tensor) -> torch.Tensor:
+    """Keep actions through the first done in each chunk, including that action.
+
+    The last axis is the execution horizon. Each chunk starts with a fresh
+    policy decision, including chunks following an episode reset.
+    """
+    done = dones.bool()
+    return done.long().cumsum(dim=-1).sub(done.long()).eq(0)
+
+
 def _validate_num_action_chunks(num_action_chunks: int) -> None:
     if type(num_action_chunks) is not int or num_action_chunks <= 0:
         raise ValueError(
@@ -116,14 +126,7 @@ def summarize_dsrl_chunk_rewards(
     terminations_bool = terminations.detach().bool()
     truncations_bool = truncations.detach().bool()
     done = terminations_bool | truncations_bool
-    done_before = torch.cat(
-        (
-            torch.zeros_like(done[:, :1], dtype=torch.int64),
-            done[:, :-1].to(torch.int64).cumsum(dim=-1),
-        ),
-        dim=-1,
-    )
-    post_done = done_before.gt(0)
+    post_done = ~chunk_valid_mask(done)
 
     scalar_tensors = (
         torch.as_tensor(rewards.shape[0], device=rewards.device),
@@ -413,20 +416,13 @@ def discounted_alive_masked_chunk_rewards(
         )
 
     done = terminations.bool() | truncations.bool()
-    done_before = torch.cat(
-        (
-            torch.zeros_like(done[:, :1], dtype=torch.int64),
-            done[:, :-1].to(torch.int64).cumsum(dim=-1),
-        ),
-        dim=-1,
-    )
-    alive_f32 = done_before.eq(0).to(torch.float32)
+    alive = chunk_valid_mask(done)
     gamma_f32 = _gamma_f32(gamma, device=rewards.device)
     discounts_f32 = gamma_f32.pow(
         torch.arange(chunk_length, device=rewards.device, dtype=torch.float32)
     )
     return torch.sum(
-        rewards.to(torch.float32) * alive_f32 * discounts_f32,
+        torch.where(alive, rewards.float(), 0.0) * discounts_f32,
         dim=-1,
         keepdim=True,
     )

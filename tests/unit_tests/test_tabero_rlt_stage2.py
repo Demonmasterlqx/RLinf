@@ -408,9 +408,7 @@ def test_predict_rlt_actions_keeps_replay_normalized_and_decodes_env_actions():
 
 def test_transition_metrics_report_normalized_saturation_and_physical_force():
     trajectory = Trajectory(max_episode_length=1)
-    trajectory.actions = torch.tensor(
-        [[[[3.99] * 13] * 10]], dtype=torch.float32
-    )
+    trajectory.actions = torch.tensor([[[[3.99] * 13] * 10]], dtype=torch.float32)
     environment_action = torch.zeros(1, 1, 130)
     environment_action.reshape(1, 1, 10, 13)[..., 7:] = 12.5
     trajectory.forward_inputs = {"environment_action": environment_action}
@@ -486,9 +484,7 @@ def test_transition_replay_keeps_all_non_auto_reset_rollout_epochs():
     )
     # Real EmbodiedRolloutResult includes one bootstrap reward/done slot at
     # the beginning of each rollout epoch.
-    epoch_rewards = torch.tensor(
-        [-10.0, 0.0, 0.0, 0.0, 1.0], dtype=torch.float32
-    )
+    epoch_rewards = torch.tensor([-10.0, 0.0, 0.0, 0.0, 1.0], dtype=torch.float32)
     trajectory.rewards = epoch_rewards.repeat(num_epochs).reshape(-1, 1, 1)
     trajectory.intervene_flags = torch.zeros(traj_len, 1, 1, dtype=torch.bool)
     trajectory.prev_logprobs = torch.zeros(traj_len, 1, 1)
@@ -497,9 +493,7 @@ def test_transition_replay_keeps_all_non_auto_reset_rollout_epochs():
 
     # Each non-auto-reset epoch contributes an initial bootstrap slot followed
     # by one terminal flag per action chunk.
-    episode_dones = torch.tensor(
-        [False, False, False, False, True], dtype=torch.bool
-    )
+    episode_dones = torch.tensor([False, False, False, False, True], dtype=torch.bool)
     trajectory.dones = episode_dones.repeat(num_epochs).reshape(-1, 1, 1)
     trajectory.terminations = trajectory.dones.clone()
     trajectory.truncations = torch.zeros_like(trajectory.dones)
@@ -507,9 +501,7 @@ def test_transition_replay_keeps_all_non_auto_reset_rollout_epochs():
         "record_transition": torch.ones(traj_len, 1, 1, dtype=torch.bool),
     }
     trajectory.curr_obs = {
-        "z_rl": torch.arange(traj_len, dtype=torch.float32).reshape(
-            traj_len, 1, 1
-        ),
+        "z_rl": torch.arange(traj_len, dtype=torch.float32).reshape(traj_len, 1, 1),
         "proprio": torch.zeros(traj_len, 1, 1),
         "ref_chunk": torch.zeros(traj_len, 1, 1),
     }
@@ -525,9 +517,7 @@ def test_transition_replay_keeps_all_non_auto_reset_rollout_epochs():
 
     assert len(transitions) == traj_len
     assert completed == num_epochs
-    assert [int(item.actions.item()) for item in transitions] == list(
-        range(traj_len)
-    )
+    assert [int(item.actions.item()) for item in transitions] == list(range(traj_len))
     assert [bool(item.dones.item()) for item in transitions] == [
         False,
         False,
@@ -550,7 +540,7 @@ def test_transition_replay_keeps_all_non_auto_reset_rollout_epochs():
     ]
 
 
-def test_unrecorded_terminal_still_stops_non_auto_reset_epoch():
+def test_unrecorded_terminal_does_not_discard_replacement_episode():
     trajectory = Trajectory(max_episode_length=30)
     trajectory.actions = torch.arange(3, dtype=torch.float32).reshape(3, 1, 1)
     trajectory.rewards = torch.zeros(4, 1, 1)
@@ -573,7 +563,7 @@ def test_unrecorded_terminal_still_stops_non_auto_reset_epoch():
 
     transitions, completed = worker._transition_replay_trajectories(trajectory)
 
-    assert [int(item.actions.item()) for item in transitions] == [0]
+    assert [int(item.actions.item()) for item in transitions] == [0, 2]
     assert completed == 1
 
 
@@ -686,21 +676,15 @@ def test_tabero_rlt_stage2_task5_firm_config_composes(monkeypatch):
     assert cfg.env.train.rollout_epoch == 4
     assert cfg.env.train.max_episode_steps == 360
     assert cfg.env.train.init_params.task_id == 5
-    assert list(cfg.env.train.init_params.prompt_conditions.condition_cycle) == [
-        "firm"
-    ]
+    assert list(cfg.env.train.init_params.prompt_conditions.condition_cycle) == ["firm"]
     assert cfg.env.train.video_cfg.save_video is False
     assert cfg.env.eval.total_num_envs == 2
     assert cfg.env.eval.rollout_epoch == 25
     assert cfg.rollout.collect_transitions is True
-    assert cfg.rollout.rlt_feature_model.openpi.rlt_action_space == (
-        "model_normalized"
-    )
+    assert cfg.rollout.rlt_feature_model.openpi.rlt_action_space == ("model_normalized")
     assert cfg.rollout.rlt_feature_model.openpi.rlt_use_normalized_proprio is True
     assert cfg.rollout.rlt_feature_model.openpi.rlt_stage2_encoder_only is True
-    assert cfg.rollout.rlt_feature_model.model_path.endswith(
-        "global_step_2000/actor"
-    )
+    assert cfg.rollout.rlt_feature_model.model_path.endswith("global_step_2000/actor")
 
 
 @pytest.mark.parametrize("worker_type", [RLTACFSDPPolicy, AsyncRLTACFSDPPolicy])
@@ -738,9 +722,7 @@ def test_rlt_checkpoint_restores_schedule_state(tmp_path, monkeypatch, worker_ty
     worker.load_checkpoint(str(actor_path))
 
     assert {key: getattr(worker, key) for key in expected} == expected
-    state_path = (
-        actor_path / "sac_components" / "rlt_schedule" / "checkpoint_rank_3.pt"
-    )
+    state_path = actor_path / "sac_components" / "rlt_schedule" / "checkpoint_rank_3.pt"
     assert state_path.is_file()
 
 
@@ -776,9 +758,7 @@ def test_rlt_checkpoint_rejects_sidecar_from_different_global_step(
     assert gathered and "global step mismatch" in gathered[0]
 
 
-def test_rlt_checkpoint_rejects_cross_rank_schedule_divergence(
-    tmp_path, monkeypatch
-):
+def test_rlt_checkpoint_rejects_cross_rank_schedule_divergence(tmp_path, monkeypatch):
     monkeypatch.setattr(
         EmbodiedSACFSDPPolicy,
         "load_checkpoint",

@@ -70,12 +70,15 @@ def preprocess_embodied_advantages_inputs(
     values: Optional[torch.Tensor] = None,
     loss_mask: Optional[torch.Tensor] = None,
     loss_mask_sum: Optional[torch.Tensor] = None,
+    primitive_loss_mask: Optional[torch.Tensor] = None,
     **kwargs,
 ) -> dict:
     """
     Preprocess inputs before computing advantages & returns.
     Unify names & formats, align with math interfaces.
     """
+    if primitive_loss_mask is not None:
+        rewards = torch.where(primitive_loss_mask, rewards, 0.0)
     if kwargs["reward_type"] == "chunk_level":
         # TODO: need check
         # rewards, dones, loss_mask, loss_mask_sum: [n_chunk_steps, bsz, num_action_chunks] -> [n_chunk_steps, bsz, 1]

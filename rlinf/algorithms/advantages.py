@@ -35,7 +35,9 @@ def compute_gae_advantages_and_returns(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Calculate advantages and returns for Proximal Policy Optimization (PPO).
-    NOTE: currently this function does not support auto-reset.
+    Every episode boundary cuts both the value bootstrap and the GAE trace.
+    An unfinished collection tail uses the supplied final value without
+    inventing an episode termination.
 
     This function implements Generalized Advantage Estimation (GAE) to compute
     advantages and returns for PPO training. The advantages are normalized

@@ -50,6 +50,34 @@ def task_fields(**tasks):
     }
 
 
+def test_success_step_ratio_pools_counts_per_task_and_globally():
+    shards = []
+    for task, successes, valid_steps, interruptions in (
+        ("vitasoy", [1, 0], 290, 1),
+        ("vitasoy", [1], 100, 0),
+        ("coca_cola", [0, 1, 1], 270, 1),
+        ("cookie", [], 300, 1),
+    ):
+        info = {
+            "success_once": torch.tensor(successes).float(),
+            "chunk_boundary/valid_primitive_actions": torch.tensor([valid_steps]),
+            "interrupted_episode_count": torch.tensor([interruptions]),
+        }
+        shards.append({**info, **task_fields(**{task: info})})
+    metrics = compute_evaluate_metrics(shards)
+    assert metrics["episodes"] == 6
+    assert metrics["successes"] == 4
+    assert metrics["success_step_ratio"] == pytest.approx(4 / 960)
+    assert metrics["interrupted_episode_count"] == 3
+    assert metrics["multi_task/vitasoy/success_rate"] == pytest.approx(2 / 3)
+    assert metrics["multi_task/vitasoy/success_step_ratio"] == pytest.approx(2 / 390)
+    assert metrics["multi_task/coca_cola/success_step_ratio"] == pytest.approx(2 / 270)
+    assert metrics["multi_task/cookie/episodes"] == 0
+    assert metrics["multi_task/cookie/success_step_ratio"] == 0
+    assert "multi_task/cookie/success_rate" not in metrics
+    assert "multi_task/cookie/success_once" not in metrics
+
+
 def finalize(env_metrics):
     return {
         key: torch.cat(value, dim=0).contiguous().cpu()
@@ -183,27 +211,48 @@ def worker_fixture(rank=0):
             }
         }
     )
-    worker._multi_task_seen = [set(), set()]
-    worker._multi_task_eval_seen = [set(), set()]
     worker._multi_task_counts = torch.zeros((2, 3), dtype=torch.int64)
     worker._multi_task_eval_counts = torch.zeros((2, 3), dtype=torch.int64)
     return worker
 
 
 @pytest.mark.parametrize("evaluation", [False, True])
-def test_worker_stage_task_assignment_dedup_and_epoch_reset(evaluation):
+def test_window_interruptions_follow_stage_task_assignment(evaluation):
+    worker = worker_fixture(rank=1)
+    envs = [
+        SimpleNamespace(
+            collection_window_metrics=lambda: {
+                "interrupted_episode_count": torch.tensor([2])
+            }
+        ),
+        SimpleNamespace(
+            collection_window_metrics=lambda: {
+                "interrupted_episode_count": torch.tensor([1])
+            }
+        ),
+    ]
+    worker.env_list = [] if evaluation else envs
+    worker.eval_env_list = envs if evaluation else []
+    recorded = {}
+    worker.record_collection_window_metrics(recorded, evaluation=evaluation)
+    metrics = compute_evaluate_metrics([finalize(recorded)])
+    assert metrics["interrupted_episode_count"] == 3
+    assert metrics["multi_task/third/interrupted_episode_count"] == 2
+    assert metrics["multi_task/easy/interrupted_episode_count"] == 1
+    assert "success_rate" not in metrics
+
+
+@pytest.mark.parametrize("evaluation", [False, True])
+def test_worker_stage_task_assignment_counts_replacement_episodes(evaluation):
     results = []
     for rank in (0, 1):
         worker = worker_fixture(rank)
         accumulated = {}
-        for epoch in range(2):
-            if evaluation:
-                worker._multi_task_eval_seen = [set(), set()]
-            else:
-                worker._multi_task_seen = [set(), set()]
+        for _ in range(2):
             for stage in (0, 1):
                 records = episodes([rank + stage + 1, 0], forces=[4, 0], counts=[4, 0])
-                for _ in range(2):  # A repeated terminal record must not double count.
+                # Two completed episodes per environment, drained in order.
+                for _ in range(2):
                     selected = worker._record_multi_task_episodes(
                         stage, records, evaluation=evaluation
                     )
@@ -226,9 +275,9 @@ def test_worker_stage_task_assignment_dedup_and_epoch_reset(evaluation):
         )
         assert unused.sum() == 0
     metrics = compute_evaluate_metrics(results)
-    assert metrics["multi_task/easy/num_trajectories"] == 8
-    assert metrics["multi_task/hard/num_trajectories"] == 4
-    assert metrics["multi_task/third/num_trajectories"] == 4
+    assert metrics["multi_task/easy/num_trajectories"] == 16
+    assert metrics["multi_task/hard/num_trajectories"] == 8
+    assert metrics["multi_task/third/num_trajectories"] == 8
     assert metrics["multi_task/easy/return"] == 1
 
 
@@ -258,7 +307,7 @@ def test_interact_and_evaluate_attach_task_envelope(monkeypatch, evaluation):
             torch.zeros(2, 2, dtype=torch.bool),
             [
                 {
-                    "_realworld_first_episode_records": records,
+                    "_realworld_episode_records": records,
                     "chunk_boundary_metrics": {"done_envs": 2},
                 }
             ],
@@ -323,9 +372,10 @@ def test_two_rank_rollout_metrics_pool_samples_and_exclude_bootstrap(tmp_path):
     mp.spawn(_rollout_process, args=(str(tmp_path / "rdzv"), str(tmp_path)), nprocs=2)
     metrics = json.loads((tmp_path / "rank_0.json").read_text())
     assert metrics == json.loads((tmp_path / "rank_1.json").read_text())
-    assert metrics["multi_task/easy/rewards"] == 4
+    # The held suffixes remove one reward of 1 and one of 10.
+    assert metrics["multi_task/easy/rewards"] == pytest.approx(21 / 6)
     assert metrics["multi_task/hard/rewards"] == 30
-    assert metrics["multi_task/easy/rewards_count"] == 8
+    assert metrics["multi_task/easy/rewards_count"] == 6
     assert metrics["multi_task/easy/returns_count"] == 4
     assert metrics["multi_task/easy/returns_mean"] == 104
     assert metrics["multi_task/easy/returns_min"] == 101
@@ -425,9 +475,9 @@ def test_libero_condition_subsets_and_success_force_metrics():
         worker._attach_task_env_metrics(info, selected, 0, realworld=False)
         worker.record_env_metrics(accumulated, info)
     result = compute_evaluate_metrics([finalize(accumulated)])
-    assert result["multi_task/easy/num_trajectories"] == 2
-    assert result["multi_task/easy/firm_episode_count"] == 1
-    assert result["multi_task/easy/gentle_episode_count"] == 1
+    assert result["multi_task/easy/num_trajectories"] == 4
+    assert result["multi_task/easy/firm_episode_count"] == 2
+    assert result["multi_task/easy/gentle_episode_count"] == 2
     assert result["multi_task/easy/firm_squeeze_pred_mean"] == 3
     assert result["multi_task/easy/gentle_squeeze_pred_mean"] == 6
     assert result["multi_task/easy/success_trajectory_mean_measured_squeeze"] == 4

@@ -20,6 +20,7 @@ import torch
 from omegaconf import OmegaConf
 
 from rlinf.algorithms.losses import compute_ppo_actor_loss
+from rlinf.algorithms.registry import calculate_adv_and_returns
 from rlinf.algorithms.utils import (
     preprocess_loss_inputs,
     reduce_embodied_entropy_with_primitive_mask,
@@ -92,7 +93,7 @@ def test_actor_releases_previous_rollout_batch_before_receiving_next(
     assert set(actor.rollout_batch) == {"current"}
 
 
-def test_prefix_masks_keep_terminal_primitive_and_mask_all_later_actions():
+def test_prefix_masks_keep_terminal_primitive_and_admit_replacement_episodes():
     masks = compute_embodied_loss_masks(
         _primitive_dones(),
         reward_type="chunk_level",
@@ -102,7 +103,7 @@ def test_prefix_masks_keep_terminal_primitive_and_mask_all_later_actions():
     expected = torch.tensor(
         [
             [[True, False, False, False], [True, True, True, False], [True] * 4],
-            [[False] * 4, [False] * 4, [True] * 4],
+            [[True] * 4, [True] * 4, [True] * 4],
         ],
         dtype=torch.bool,
     )
@@ -112,14 +113,60 @@ def test_prefix_masks_keep_terminal_primitive_and_mask_all_later_actions():
     )
     torch.testing.assert_close(masks["loss_mask"], masks["chunk_loss_mask"])
     assert masks["loss_mask_sum"][:, :, 0].tolist() == [
-        [1, 1, 2],
-        [1, 1, 2],
+        [2, 2, 2],
+        [2, 2, 2],
     ]
     assert summarize_primitive_loss_mask(expected) == {
-        "valid_primitive_actions": 12,
-        "masked_post_done_actions": 12,
+        "valid_primitive_actions": 20,
+        "masked_post_done_actions": 4,
         "partial_chunk_count": 2,
     }
+
+
+def test_reset_success_is_trainable_without_leaking_across_episode_boundary():
+    dones = torch.zeros(31, 1, 10, dtype=torch.bool)
+    dones[2, 0, 9] = True  # failure at step 20
+    dones[10, 0, 9] = True  # replacement succeeds at step 100
+    rewards = torch.zeros(30, 1, 10)
+    rewards[9, 0, 9] = 1
+    values = torch.zeros(31, 1, 1)
+    values[-1] = 2  # unfinished collection tail, before the full reset
+    masks = compute_embodied_loss_masks(
+        dones, reward_type="chunk_level", use_primitive_prefix_logprobs=True
+    )
+    kwargs = dict(
+        task_type="embodied",
+        adv_type="gae",
+        dones=dones,
+        values=values,
+        gamma=0.99,
+        gae_lambda=0.95,
+        normalize_advantages=False,
+        reward_type="chunk_level",
+        num_action_chunks=10,
+        **masks,
+    )
+    result = calculate_adv_and_returns(rewards=rewards, **kwargs)
+    assert masks["loss_mask"].all()
+    assert result["returns"][:2].eq(0).all()
+    assert result["returns"][9].item() == pytest.approx(1)
+    assert result["returns"][-1].item() == pytest.approx(1.98)
+    changed = rewards.clone()
+    changed[9] *= 100
+    other = calculate_adv_and_returns(rewards=changed, **kwargs)
+    torch.testing.assert_close(result["returns"][:2], other["returns"][:2])
+    # The replacement episode's nonzero advantage reaches the real PPO loss.
+    logprobs = torch.zeros_like(result["advantages"], requires_grad=True)
+    loss, _ = compute_ppo_actor_loss(
+        logprobs=logprobs,
+        old_logprobs=logprobs.detach(),
+        advantages=result["advantages"],
+        clip_ratio_low=0.2,
+        clip_ratio_high=0.2,
+        loss_mask=masks["loss_mask"],
+    )
+    loss.backward()
+    assert logprobs.grad[9].abs().sum() > 0
 
 
 def _ppo_result(

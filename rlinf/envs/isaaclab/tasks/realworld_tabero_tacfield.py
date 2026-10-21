@@ -1532,12 +1532,9 @@ class IsaaclabRealWorldTaberoTacFieldEnv(IsaaclabBaseEnv):
 
     def reset(self, seed=None, env_ids: torch.Tensor | None = None):
         if env_ids is None:
-            # Partial resets start replacement episodes, which PPO masks out.
-            # Only a full rollout reset starts a new first-episode cohort.
-            self._first_episode_completed = torch.zeros(
-                self.num_envs, dtype=torch.bool, device=self.device
-            )
-            self._first_episode_pending = []
+            # Partial resets preserve completed records until the chunk drains
+            # them. A full reset begins the next collection window.
+            self._episode_pending = []
             self._episode_rollout_index = (
                 getattr(self, "_episode_rollout_index", -1) + 1
             )
@@ -1566,19 +1563,14 @@ class IsaaclabRealWorldTaberoTacFieldEnv(IsaaclabBaseEnv):
         self._reset_metrics(target_env_ids)
         return obs, {}
 
-    def _capture_first_episode(
+    def _capture_episode(
         self,
         episode: dict[str, torch.Tensor],
         terminations: torch.Tensor,
         truncations: torch.Tensor,
     ) -> None:
-        """Copy first terminal metrics before reset, independently of rewards."""
-        done = terminations | truncations
-        completed = getattr(self, "_first_episode_completed", None)
-        if completed is None:
-            completed = torch.zeros_like(done)
-            self._first_episode_completed = completed
-        selected = done & ~completed
+        """Record every completed episode before reset, independently of rewards."""
+        selected = terminations | truncations
         if not selected.any():
             return
         records = {
@@ -1589,10 +1581,9 @@ class IsaaclabRealWorldTaberoTacFieldEnv(IsaaclabBaseEnv):
             termination=terminations[selected].clone(),
             truncation=truncations[selected].clone(),
         )
-        pending = getattr(self, "_first_episode_pending", [])
+        pending = getattr(self, "_episode_pending", [])
         pending.append(records)
-        self._first_episode_pending = pending
-        completed |= selected
+        self._episode_pending = pending
         records_dir = getattr(self, "_episode_records_dir", None)
         if records_dir is not None:
             records_dir.mkdir(parents=True, exist_ok=True)
@@ -1608,17 +1599,32 @@ class IsaaclabRealWorldTaberoTacFieldEnv(IsaaclabBaseEnv):
                         for key, value in row.items()
                     }
                     row.update(
-                        seed=self.seed, rollout_index=self._episode_rollout_index
+                        seed=self.seed,
+                        rollout_index=self._episode_rollout_index,
+                        rollout_step=self._episode_rollout_steps + 1,
                     )
                     stream.write(json.dumps(row, allow_nan=False) + "\n")
 
-    def _drain_first_episode_records(self) -> dict[str, torch.Tensor]:
-        pending = getattr(self, "_first_episode_pending", [])
-        self._first_episode_pending = []
+    def _drain_episode_records(self) -> dict[str, torch.Tensor]:
+        pending = getattr(self, "_episode_pending", [])
+        self._episode_pending = []
         if not pending:
             return {}
         return {
             key: torch.cat([record[key] for record in pending]) for key in pending[0]
+        }
+
+    def collection_window_metrics(self) -> dict[str, torch.Tensor]:
+        """Count unfinished attempts before the next full reset.
+
+        A freshly reset row has length zero and is not an interrupted attempt.
+        No done flag is emitted: the collected tail still bootstraps.
+        """
+        return {
+            "interrupted_episode_count": (self._elapsed_steps > 0)
+            .sum()
+            .reshape(1)
+            .cpu()
         }
 
     def step(self, actions=None, auto_reset=True):
@@ -1632,7 +1638,7 @@ class IsaaclabRealWorldTaberoTacFieldEnv(IsaaclabBaseEnv):
             env_ids = torch.nonzero(dones, as_tuple=False).squeeze(-1)
             reset_obs, _ = self.reset(env_ids=env_ids)
             obs = _replace_batch_rows(obs, reset_obs, dones)
-        infos["_realworld_first_episode_records"] = self._drain_first_episode_records()
+        infos["_realworld_episode_records"] = self._drain_episode_records()
         return obs, reward, terminations, truncations, infos
 
     def chunk_step(self, chunk_actions: torch.Tensor):
@@ -1708,6 +1714,11 @@ class IsaaclabRealWorldTaberoTacFieldEnv(IsaaclabBaseEnv):
             .item()
         )
         infos_list[-1]["chunk_boundary_metrics"] = {
+            "valid_primitive_actions": torch.tensor(
+                [self.num_envs * REALWORLD_ACTION_HORIZON - post_done_hold_steps],
+                device=self.device,
+            ),
+            "valid_chunks": torch.tensor([self.num_envs], device=self.device),
             "done_envs": torch.tensor([standard_reset_envs], device=self.device),
             "early_done_envs": torch.tensor([early_done_envs], device=self.device),
             "post_done_hold_steps": torch.tensor(
@@ -1727,9 +1738,7 @@ class IsaaclabRealWorldTaberoTacFieldEnv(IsaaclabBaseEnv):
             executed_actions, dim=1
         )
         infos_list[-1][_RAW_CHUNK_ACTIONS_KEY] = raw_chunk_actions
-        infos_list[-1]["_realworld_first_episode_records"] = (
-            self._drain_first_episode_records()
-        )
+        infos_list[-1]["_realworld_episode_records"] = self._drain_episode_records()
         return (
             obs_list,
             chunk_rewards,
@@ -1828,13 +1837,8 @@ class IsaaclabRealWorldTaberoTacFieldEnv(IsaaclabBaseEnv):
             infos["episode"][_EPISODE_FORCE_MEAN_KEY] = terminal_force_mean
             infos["episode"][_EPISODE_FORCE_COUNT_KEY] = terminal_force_count
             infos["episode"][_EPISODE_FORCE_BONUS_KEY] = terminal_force_bonus
-        self._capture_first_episode(infos["episode"], terminations, truncations)
+        self._capture_episode(infos["episode"], terminations, truncations)
         self._episode_rollout_steps = getattr(self, "_episode_rollout_steps", 0) + 1
-        if self._episode_rollout_steps == int(self.cfg.max_episode_steps):
-            if not self._first_episode_completed.all():
-                raise RuntimeError(
-                    "RealWorld rollout is missing first-episode terminal records."
-                )
         if newly_done.any():
             infos["final_observation"] = _clone_nested(obs)
             infos["final_info"] = {"episode": _clone_nested(infos["episode"])}

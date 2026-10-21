@@ -25,6 +25,7 @@ from rlinf.data.embodied_io_struct import Trajectory
 from rlinf.models.embodiment.base_policy import ForwardType
 from rlinf.scheduler import Worker
 from rlinf.utils.distributed import all_reduce_dict
+from rlinf.utils.dsrl_reward import chunk_valid_mask
 from rlinf.utils.metric_utils import (
     append_to_dict,
     collect_trajectory_replay_metrics,
@@ -88,8 +89,12 @@ class RLTACLossMixin:
         self._require_twin_q(all_q_values)
         return all_q_values[..., 0:1]
 
-    def _discounted_chunk_rewards(self, rewards: torch.Tensor) -> torch.Tensor:
+    def _discounted_chunk_rewards(
+        self, rewards: torch.Tensor, dones: torch.Tensor | None = None
+    ) -> torch.Tensor:
         rewards = rewards.reshape(rewards.shape[0], -1)
+        if dones is not None:
+            rewards = torch.where(chunk_valid_mask(dones), rewards, 0.0)
         rewards = rewards.to(self.torch_dtype)
         chunk_len = rewards.shape[-1]
         discounts = torch.pow(
@@ -106,6 +111,7 @@ class RLTACLossMixin:
         intervene_flags: torch.Tensor | None,
         *,
         per_sample: bool = False,
+        valid_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         chunk_len, action_dim = self._chunk_shape()
         pi_chunk = self._flatten_chunk(pi).reshape(-1, chunk_len, action_dim)
@@ -127,13 +133,32 @@ class RLTACLossMixin:
                 .any(dim=-1)
             )
 
+        valid = (
+            torch.ones_like(human_mask)
+            if valid_mask is None
+            else valid_mask.bool().expand_as(human_mask)
+        )
+        human_mask &= valid
         bc_target = torch.where(human_mask[..., None], action_chunk, bc_ref_chunk)
-        bc_error = torch.mean(torch.square(pi_chunk - bc_target), dim=-1)
-        bc_loss = torch.mean(bc_error)
+        # Mask before squaring: unexecuted suffixes must not affect BC gradients.
+        bc_delta = torch.where(valid[..., None], pi_chunk - bc_target, 0.0)
+        bc_error = torch.mean(torch.square(bc_delta), dim=-1)
+        per_sample_loss = bc_error.sum(dim=-1) / valid.sum(dim=-1).clamp_min(1)
+        bc_loss = per_sample_loss.mean()
 
-        policy_mask = ~human_mask
-        ref_error = torch.mean(torch.square(pi_chunk - bc_ref_chunk), dim=-1)
-        human_error = torch.mean(torch.square(pi_chunk - action_chunk), dim=-1)
+        policy_mask = valid & ~human_mask
+        ref_error = torch.mean(
+            torch.square(
+                torch.where(policy_mask[..., None], pi_chunk - bc_ref_chunk, 0.0)
+            ),
+            dim=-1,
+        )
+        human_error = torch.mean(
+            torch.square(
+                torch.where(human_mask[..., None], pi_chunk - action_chunk, 0.0)
+            ),
+            dim=-1,
+        )
         bc_ref = torch.sum(ref_error * policy_mask.to(ref_error.dtype)) / torch.clamp(
             torch.sum(policy_mask.to(ref_error.dtype)), min=1.0
         )
@@ -141,7 +166,7 @@ class RLTACLossMixin:
             human_error * human_mask.to(human_error.dtype)
         ) / torch.clamp(torch.sum(human_mask.to(human_error.dtype)), min=1.0)
 
-        human_ratio = torch.mean(human_mask.to(torch.float32)).item()
+        human_ratio = (human_mask.sum() / valid.sum().clamp_min(1)).item()
         metrics = {
             "bc_loss": bc_loss.detach().item(),
             "bc_ref_loss": bc_ref.detach().item(),
@@ -149,7 +174,7 @@ class RLTACLossMixin:
             "human_mask_ratio": human_ratio,
             "policy_mask_ratio": 1.0 - human_ratio,
         }
-        return (bc_error.mean(dim=-1) if per_sample else bc_loss), metrics
+        return (per_sample_loss if per_sample else bc_loss), metrics
 
     def _task_loss_metrics(self, batch, **values) -> dict[str, float]:
         """Keep additive diagnostics until reduction across batches and ranks."""
@@ -304,7 +329,7 @@ class RLTACLossMixin:
                 )
                 q_next = self._min_twin_q(all_qf_next.detach())
 
-            reward_target = self._discounted_chunk_rewards(rewards)
+            reward_target = self._discounted_chunk_rewards(rewards, done_source)
             reward_horizon = int(rewards.reshape(rewards.shape[0], -1).shape[-1])
             bootstrap_discount = self.cfg.algorithm.gamma**reward_horizon
             if bootstrap_type == "always":
@@ -395,6 +420,7 @@ class RLTACLossMixin:
             ref_chunk=ref_chunk,
             intervene_flags=batch.get("intervene_flags", None),
             per_sample=True,
+            valid_mask=chunk_valid_mask(batch["dones"]),
         )
         metrics.update(rlt_metrics)
 
@@ -557,7 +583,6 @@ class RLTACReplayMixin:
                 len(task_list(self.cfg.env.train)),
             )
         num_rows = int(actions.shape[0])
-        auto_reset = bool(self.cfg.env.train.get("auto_reset", False))
         bootstrap_fields = (
             trajectory.rewards,
             trajectory.dones,
@@ -595,12 +620,7 @@ class RLTACReplayMixin:
             )
 
         for env_idx in range(bsz):
-            episode_done = False
             for t in range(traj_len):
-                if t % epoch_len == 0:
-                    episode_done = False
-                if episode_done:
-                    continue
                 idx = t * bsz + env_idx
                 if idx >= num_rows:
                     break
@@ -618,8 +638,6 @@ class RLTACReplayMixin:
                 if not self._flat_record_transition(flat, idx):
                     if step_done:
                         completed_episodes += 1
-                        if not auto_reset:
-                            episode_done = True
                     continue
 
                 transition = Trajectory(
@@ -668,8 +686,6 @@ class RLTACReplayMixin:
                 replay_trajectories.append(transition)
                 if step_done:
                     completed_episodes += 1
-                    if not auto_reset:
-                        episode_done = True
 
         return replay_trajectories, completed_episodes
 

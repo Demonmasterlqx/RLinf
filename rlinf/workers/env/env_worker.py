@@ -62,13 +62,13 @@ from rlinf.utils.utils import (
 from rlinf.workers.env.history_manager import HistoryManager
 
 _TABERO_CHUNK_EPISODE_RECORDS_KEY = "_tabero_chunk_episode_records"
-_REALWORLD_FIRST_EPISODE_RECORDS_KEY = "_realworld_first_episode_records"
+_REALWORLD_EPISODE_RECORDS_KEY = "_realworld_episode_records"
 
 
-def realworld_first_episode_records_to_env_info(
+def realworld_episode_records_to_env_info(
     records: dict[str, torch.Tensor],
 ) -> dict[str, torch.Tensor]:
-    """Keep completed first-episode samples separate from per-chunk diagnostics."""
+    """Project completed episode events, drained once per chunk, into metrics."""
     fields = (
         "success_once",
         "return",
@@ -99,7 +99,7 @@ def realworld_first_episode_records_to_env_info(
         raise ValueError("RealWorld episode records must be aligned 1D tensors.")
     if records["env_index"].unique().numel() != count:
         raise ValueError(
-            "RealWorld first-episode records contain duplicate environments."
+            "RealWorld chunk episode records contain duplicate environments."
         )
     if (records["episode_len"] <= 0).any():
         raise ValueError("RealWorld completed episode lengths must be positive.")
@@ -691,16 +691,14 @@ class EnvWorker(Worker):
             else None
         )
         if getattr(self, "multi_task_enabled", False):
-            records = infos.get(
-                _REALWORLD_FIRST_EPISODE_RECORDS_KEY, tabero_episode_records
-            )
+            records = infos.get(_REALWORLD_EPISODE_RECORDS_KEY, tabero_episode_records)
             task_records = self._record_multi_task_episodes(
                 stage_id, records, evaluation=False
             )
-        if _REALWORLD_FIRST_EPISODE_RECORDS_KEY in infos:
+        if _REALWORLD_EPISODE_RECORDS_KEY in infos:
             env_info.update(
-                realworld_first_episode_records_to_env_info(
-                    infos[_REALWORLD_FIRST_EPISODE_RECORDS_KEY]
+                realworld_episode_records_to_env_info(
+                    infos[_REALWORLD_EPISODE_RECORDS_KEY]
                 )
             )
         elif tabero_episode_records is not None:
@@ -744,7 +742,7 @@ class EnvWorker(Worker):
                 env_info,
                 task_records,
                 stage_id,
-                realworld=_REALWORLD_FIRST_EPISODE_RECORDS_KEY in infos,
+                realworld=_REALWORLD_EPISODE_RECORDS_KEY in infos,
             )
 
         intervene_actions = (
@@ -817,16 +815,14 @@ class EnvWorker(Worker):
             else None
         )
         if getattr(self, "multi_task_enabled", False):
-            records = infos.get(
-                _REALWORLD_FIRST_EPISODE_RECORDS_KEY, tabero_episode_records
-            )
+            records = infos.get(_REALWORLD_EPISODE_RECORDS_KEY, tabero_episode_records)
             task_records = self._record_multi_task_episodes(
                 stage_id, records, evaluation=True
             )
-        if _REALWORLD_FIRST_EPISODE_RECORDS_KEY in infos:
+        if _REALWORLD_EPISODE_RECORDS_KEY in infos:
             env_info.update(
-                realworld_first_episode_records_to_env_info(
-                    infos[_REALWORLD_FIRST_EPISODE_RECORDS_KEY]
+                realworld_episode_records_to_env_info(
+                    infos[_REALWORLD_EPISODE_RECORDS_KEY]
                 )
             )
         elif tabero_episode_records is not None:
@@ -862,7 +858,7 @@ class EnvWorker(Worker):
                 env_info,
                 task_records,
                 stage_id,
-                realworld=_REALWORLD_FIRST_EPISODE_RECORDS_KEY in infos,
+                realworld=_REALWORLD_EPISODE_RECORDS_KEY in infos,
                 evaluation=True,
             )
 
@@ -1290,12 +1286,11 @@ class EnvWorker(Worker):
         *,
         evaluation: bool = False,
     ) -> dict[str, torch.Tensor]:
-        """Count each episode once and return the same rows for task logging."""
+        """Count the terminal events drained by this chunk, including resets."""
         if records is None:
             raise ValueError("multi_task requires explicit completed-episode records.")
         if not records:
             return {}
-        seen = self._multi_task_eval_seen if evaluation else self._multi_task_seen
         counts = self._multi_task_eval_counts if evaluation else self._multi_task_counts
         env_indices = records["env_index"].cpu().long().reshape(-1)
         success = records["success_once"].cpu().reshape(-1)
@@ -1309,16 +1304,9 @@ class EnvWorker(Worker):
         ):
             raise ValueError("Invalid multi-task completed-episode records.")
         task_index = (self._rank * self.stage_num + stage_id) % counts.shape[1]
-        selected = torch.zeros(env_indices.numel(), dtype=torch.bool)
-        for row, (index, succeeded) in enumerate(
-            zip(env_indices.tolist(), success.tolist())
-        ):
-            if index not in seen[stage_id]:
-                seen[stage_id].add(index)
-                selected[row] = True
-                counts[0, task_index] += int(succeeded)
-                counts[1, task_index] += 1
-        return {key: value[selected.to(value.device)] for key, value in records.items()}
+        counts[0, task_index] += success.long().sum()
+        counts[1, task_index] += env_indices.numel()
+        return records
 
     def _attach_task_env_metrics(
         self,
@@ -1345,6 +1333,27 @@ class EnvWorker(Worker):
         for key, value in env_info.items():
             env_metrics.setdefault(key, []).append(value)
 
+    def record_collection_window_metrics(self, metrics: dict, *, evaluation=False):
+        """Record collection interruptions separately from completed episodes."""
+        envs = self.eval_env_list if evaluation else self.env_list
+        split = self.cfg.env.eval if evaluation else self.cfg.env.train
+        for stage_id, env in enumerate(envs):
+            collect = get_env_attr(env, "collection_window_metrics")
+            if not callable(collect):
+                continue
+            info = collect()
+            if getattr(self, "multi_task_enabled", False):
+                tasks = task_list(split)
+                index = (self._rank * self.stage_num + stage_id) % len(tasks)
+                name = tasks[index]["name"]
+                info.update(
+                    {
+                        f"multi_task/{name}/{key}": value
+                        for key, value in list(info.items())
+                    }
+                )
+            self.record_env_metrics(metrics, info)
+
     def should_record_env_metrics(
         self, env_output: EnvOutput, env_info: dict[str, Any], chunk_step_idx: int
     ) -> bool:
@@ -1354,7 +1363,7 @@ class EnvWorker(Worker):
             or self.cfg.env.train.ignore_terminations
             or chunk_step_idx == self.n_train_chunk_steps - 1
             or any(key.startswith("reward_audit/") for key in env_info)
-            or _REALWORLD_FIRST_EPISODE_RECORDS_KEY in (env_output.env_infos or {})
+            or _REALWORLD_EPISODE_RECORDS_KEY in (env_output.env_infos or {})
         )
 
     def store_last_obs_and_intervened_info(self, env_output_list: list[EnvOutput]):
@@ -1419,8 +1428,6 @@ class EnvWorker(Worker):
         rlt_pending_obs: list[dict[str, Any] | None] = [None] * self.stage_num
 
         for epoch in range(self.rollout_epoch):
-            if self.multi_task_enabled:
-                self._multi_task_seen = [set() for _ in range(self.stage_num)]
             if epoch == 0 and self._prefetched_train_bootstrap is not None:
                 env_outputs = self._prefetched_train_bootstrap
                 self._prefetched_train_bootstrap = None
@@ -1646,6 +1653,7 @@ class EnvWorker(Worker):
                 )
 
             self.store_last_obs_and_intervened_info(env_outputs)
+            self.record_collection_window_metrics(env_metrics)
             self.finish_rollout()
 
         if not self.use_training_pipeline and actor_channel is not None:
@@ -1663,14 +1671,6 @@ class EnvWorker(Worker):
             env_metrics[key] = torch.cat(value, dim=0).contiguous().cpu()
 
         if self.multi_task_enabled:
-            expected = torch.zeros_like(self._multi_task_counts[1])
-            for stage_id in range(self.stage_num):
-                index = (self._rank * self.stage_num + stage_id) % expected.numel()
-                expected[index] += self.rollout_epoch * self.train_num_envs_per_stage
-            if not torch.equal(self._multi_task_counts[1], expected):
-                raise ValueError(
-                    "multi_task rollout reset would discard unfinished episodes."
-                )
             env_metrics[COUNT_KEY] = self._multi_task_counts
         return env_metrics
 
@@ -1704,8 +1704,6 @@ class EnvWorker(Worker):
                 (2, len(task_list(self.cfg.env.eval))), dtype=torch.int64
             )
         for eval_rollout_epoch in range(self.eval_rollout_epoch):
-            if self.multi_task_enabled:
-                self._multi_task_eval_seen = [set() for _ in range(self.stage_num)]
             if not self.cfg.env.eval.auto_reset or eval_rollout_epoch == 0:
                 for stage_id in range(self.stage_num):
                     self.eval_env_list[stage_id].is_start = True
@@ -1782,6 +1780,7 @@ class EnvWorker(Worker):
                         decoupled_mode=self.env_decoupled_mode,
                     )
 
+            self.record_collection_window_metrics(eval_metrics, evaluation=True)
             self.finish_rollout(mode="eval")
         for stage_id in range(self.stage_num):
             if self.eval_enable_offload:
@@ -1827,6 +1826,7 @@ class EnvWorker(Worker):
             "reward_type": self.cfg.algorithm.reward_type,
             "loss_mask": rollout_batch.get("loss_mask", None),
             "loss_mask_sum": rollout_batch.get("loss_mask_sum", None),
+            "primitive_loss_mask": rollout_batch.get("primitive_loss_mask", None),
             "normalize_advantages": self.cfg.algorithm.get("normalize_advantages", True)
             and not self.use_training_pipeline,
         }

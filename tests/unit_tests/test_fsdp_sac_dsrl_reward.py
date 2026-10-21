@@ -430,3 +430,24 @@ def test_forward_critic_non_dsrl_reward_sum_and_bootstrap_are_unchanged(monkeypa
 
     expected = 6.0 + GAMMA * 2.0
     assert captured["target"].float().unique().item() == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("crossq", [False, True])
+@pytest.mark.parametrize("timeout", [False, True])
+def test_dsrl_window_tail_bootstraps_but_task_timeout_does_not(
+    monkeypatch, crossq, timeout
+):
+    worker = _critic_worker(use_dsrl=True, crossq=crossq, next_q=2.0)
+    worker.torch_dtype = torch.float32
+    batch = _critic_batch()
+    batch["truncations"][0, -1] = timeout
+    captured = {}
+
+    def capture_loss(data_q, target_q):
+        captured["target"] = target_q.detach().clone()
+        return torch.mean((data_q - target_q) ** 2)
+
+    monkeypatch.setattr(sac_worker_module.F, "mse_loss", capture_loss)
+    EmbodiedSACFSDPPolicy.forward_critic.__wrapped__.__wrapped__(worker, batch)
+    expected = 0.0 if timeout else 2.0 * GAMMA**CHUNK_LENGTH
+    torch.testing.assert_close(captured["target"], torch.full((1, 10), expected))
