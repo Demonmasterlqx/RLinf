@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import math
+import warnings
 from typing import Any
 
 import torch
@@ -142,17 +143,38 @@ def validate_force_reward_cfg(
         return float(value)
 
     minimum = finite_number("min_effort")
-    midpoint = finite_number("mid_effort")
+    missing = object()
+    has_midpoint = _cfg_get(new_cfg, "mid_effort", missing) is not missing
+    has_maximum = _cfg_get(new_cfg, "max_effort", missing) is not missing
+    if has_midpoint:
+        warnings.warn(
+            "Tabero normalize_effort_reward.mid_effort is deprecated; "
+            + (
+                "both mid_effort and max_effort are configured, so max_effort "
+                "takes precedence and mid_effort is ignored."
+                if has_maximum
+                else "using mid_effort as max_effort. Please configure max_effort instead."
+            ),
+            UserWarning,
+            stacklevel=2,
+        )
+    maximum = finite_number(
+        "max_effort" if has_maximum or not has_midpoint else "mid_effort"
+    )
     coefficient = finite_number("coefficient", 1.0)
+    min_reward = finite_number("min_reward", -1.0)
+    max_reward = finite_number("max_reward", 1.0)
+    if min_reward > max_reward:
+        raise ValueError(
+            "Tabero normalize_effort_reward requires min_reward <= max_reward."
+        )
     if coefficient < 0:
         raise ValueError(
             "Tabero normalize_effort_reward.coefficient must be non-negative."
         )
-    maximum = midpoint + (midpoint - minimum)
-    if minimum < 0 or midpoint <= minimum or not math.isfinite(maximum):
+    if minimum < 0 or maximum <= minimum:
         raise ValueError(
-            "Tabero normalize_effort_reward requires 0 <= min_effort < mid_effort "
-            "and finite max_effort."
+            "Tabero normalize_effort_reward requires 0 <= min_effort < max_effort."
         )
     if not math.isfinite(terminal_reward) or terminal_reward <= 0:
         raise ValueError("Tabero terminal_reward must be finite and positive.")
@@ -166,16 +188,14 @@ def validate_force_reward_cfg(
         raise ValueError(
             "Tabero normalize_effort_reward.contact_epsilon must be non-negative."
         )
-    if _cfg_get(new_cfg, "max_effort") is not None:
-        raise ValueError(
-            "Tabero normalize_effort_reward.max_effort is derived, not configurable."
-        )
     return {
         "enabled": True,
         "normalize_effort_reward": {
             "min_effort": minimum,
-            "mid_effort": midpoint,
+            "max_effort": maximum,
             "coefficient": coefficient,
+            "min_reward": min_reward,
+            "max_reward": max_reward,
         },
         "min_valid_samples": samples,
         "contact_epsilon": contact_epsilon,
@@ -231,15 +251,17 @@ def make_trajectory_force_success_reward_term(manager_term_base_cls: type) -> ty
             """Selected force component; the legacy name also permits signed values."""
             if self._normalize_effort_reward is not None:
                 minimum = self._normalize_effort_reward["min_effort"]
-                midpoint = self._normalize_effort_reward["mid_effort"]
-                # Equivalent to 2 * (mid - effort) / (max - min).
+                maximum = self._normalize_effort_reward["max_effort"]
                 # Float64 avoids overflow/underflow of otherwise valid bounds.
                 bonus = (
                     (
-                        (midpoint - self.trajectory_mean_force.double())
-                        / (midpoint - minimum)
+                        (maximum - self.trajectory_mean_force.double())
+                        / (maximum - minimum)
                     )
-                    .clamp(-1.0, 1.0)
+                    .clamp(
+                        min=self._normalize_effort_reward.get("min_reward", -1.0),
+                        max=self._normalize_effort_reward.get("max_reward", 1.0),
+                    )
                     .to(self._force_sum.dtype)
                 )
                 bonus = bonus * self._normalize_effort_reward.get("coefficient", 1.0)

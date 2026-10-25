@@ -310,26 +310,35 @@ Tabero 按任务选择力奖励
 同一次多任务训练可以混用两种形式。配置按公共 ``init_params`` 与任务覆盖深度合并，
 因此切换奖励时必须显式关闭继承而来的另一种形式。其他成功判据和观测、动作、重置接口仍须一致。
 
-新形式要求显式配置有限的 ``0 <= min_effort < mid_effort``，自动计算
-``max_effort = mid_effort + (mid_effort - min_effort)``，不接受手动配置 ``max_effort``。
+新形式要求显式配置有限的 ``0 <= min_effort < max_effort``。
+兼容旧 ``mid_effort`` 配置：仅配置它时将其数值作为 ``max_effort`` 并发出警告，
+保持旧奖励数值等价；同时配置两者时使用 ``max_effort``，并警告忽略 ``mid_effort``。
+显式配置的 ``max_effort`` 不合法时会报错，不会回退到 ``mid_effort``。
 
 .. math::
 
    r_{\mathrm{effort}} = \alpha \operatorname{clip}\left(
-   \frac{2(\mathrm{mid\_effort}-\mathrm{effort})}
-   {\mathrm{max\_effort}-\mathrm{min\_effort}}, -1, 1\right)
+   \frac{\mathrm{max\_effort}-\mathrm{now\_effort}}
+   {\mathrm{max\_effort}-\mathrm{min\_effort}},
+   \mathrm{min\_reward}, \mathrm{max\_reward}\right)
 
 ``coefficient`` 对应系数 α，默认 1.0，必须为有限非负数，支持逐任务覆盖；
-先裁剪到 ``[-1, 1]`` 再乘系数，min/mid/max 分别对应 +α/0/-α。
-系数为 0 时力分量为零，基础成功奖励不变。effort 复用原奖励的有效双指接触
+先裁剪到 ``[min_reward, max_reward]`` 再乘系数。``min_reward`` 默认 -1.0，
+``max_reward`` 默认 1.0，两者必须为有限数且 ``min_reward <= max_reward``。
+使用默认裁剪边界时，力为 ``min_effort`` 时得到 +α，
+为 ``max_effort`` 时得到 0，达到 ``2 * max_effort - min_effort`` 时得到 -α。
+系数为 0 时力分量为零，基础成功奖励不变。now_effort 复用原奖励的有效双指接触
 挤压力轨迹均值，包括原有抓取门控、多来源聚合、释放过滤和局部重置行为。
 ``min_valid_samples`` 默认 1，``contact_epsilon`` 默认 0.0001；不足有效样本时力分量为零。
 只有有效成功时才发放 ``terminal_reward + 力分量``，失败和超时为零。
-力分量范围为 ``[-coefficient, coefficient]``，后续仍应用环境 ``reward_coef`` 和已有条件倍率；
+有效样本足够时，力分量范围为
+``[min_reward * coefficient, max_reward * coefficient]``，
+后续仍应用环境 ``reward_coef`` 和已有条件倍率；
 奖励项的 ``/ step_dt`` 与 IsaacLab RewardManager 的 ``* dt`` 抵消。
 
 成功率使用重置前的成功终止标志，不从奖励正负推断。
-例如 ``terminal_reward: 1.0``、``coefficient: 1.0`` 且 effort 达到 max 时，总奖励为零，但仍计为成功。
+例如使用默认裁剪边界，``terminal_reward: 1.0``、``coefficient: 1.0`` 且力达到
+``2 * max_effort - min_effort`` 时，总奖励为零，但仍计为成功。
 若系数大于 ``terminal_reward``，成功时总奖励可以为负。
 现有 ``force_bonus`` 诊断字段保留兼容，在新模式下表示选中的有符号力分量；
 它包含 ``coefficient``，但在成功门控及环境奖励缩放前记录，不等于失败 episode 获得了力奖励。
@@ -355,6 +364,8 @@ Tabero 按任务选择力奖励
            normalize_effort_reward:
              enabled: false
              coefficient: 1.0
+             min_reward: -1.0
+             max_reward: 1.0
              min_valid_samples: 4
              contact_epsilon: 1.0
        multi_task:
@@ -367,7 +378,7 @@ Tabero 按任务选择力奖励
                  normalize_effort_reward:
                    enabled: true
                    min_effort: 10.0
-                   mid_effort: 20.0  # max_effort = 30
+                   max_effort: 20.0  # 力为 30 时力分量达到 -coefficient
            - name: coca_cola
              init_params:
                target_object: target_object_2
@@ -376,7 +387,7 @@ Tabero 按任务选择力奖励
                  normalize_effort_reward:
                    enabled: true
                    min_effort: 15.0
-                   mid_effort: 30.0  # max_effort = 45
+                   max_effort: 30.0  # 力为 45 时力分量达到 -coefficient
            - name: cookie
              init_params:
                target_object: target_object_3

@@ -14,6 +14,7 @@
 
 """Synthetic force shaping and task contracts; no simulator or local assets."""
 
+import warnings
 from copy import deepcopy
 from types import SimpleNamespace
 
@@ -36,7 +37,7 @@ from rlinf.utils.multi_task import task_env_cfg, validate_environments
 
 
 def normalized(**kwargs):
-    return {"enabled": True, "min_effort": 10.0, "mid_effort": 20.0, **kwargs}
+    return {"enabled": True, "min_effort": 10.0, "max_effort": 20.0, **kwargs}
 
 
 def make_term(
@@ -122,6 +123,26 @@ def make_term(
             [1.5, 3, 1.25, 1, 0.75, 0.5, 0.5],
         ),
         ({"coefficient": 2}, [2, 2, 1, 0, -1, -2, -2], [3, 6, 2, 1, 0, -1, -1]),
+        (
+            {"min_reward": -0.25, "max_reward": 1.5, "coefficient": 2},
+            [3, 2, 1, 0, -0.5, -0.5, -0.5],
+            [4, 6, 2, 1, 0.5, 0.5, 0.5],
+        ),
+        (
+            {"min_reward": 0},
+            [1, 1, 0.5, 0, 0, 0, 0],
+            [2, 4, 1.5, 1, 1, 1, 1],
+        ),
+        (
+            {"max_reward": 0},
+            [0, 0, 0, 0, -0.5, -1, -1],
+            [1, 2, 1, 1, 0.5, 0, 0],
+        ),
+        (
+            {"min_reward": 0.25, "max_reward": 0.25, "coefficient": 2},
+            [0.5] * 7,
+            [1.5, 3, 1.5, 1.5, 1.5, 1.5, 1.5],
+        ),
     ],
 )
 def test_normalized_endpoints_clipping_and_condition_scaling(
@@ -245,15 +266,17 @@ def test_grasp_gate_and_multiple_sources_keep_maximum_valid_force():
         ("min_effort", -1),
         ("min_effort", True),
         ("min_effort", float("nan")),
-        ("mid_effort", 10),
-        ("mid_effort", float("inf")),
-        ("mid_effort", 1e308),
+        ("max_effort", 10),
+        ("max_effort", float("inf")),
+        ("max_effort", 9),
+        ("max_effort", True),
+        ("max_effort", float("nan")),
+        ("max_effort", None),
         ("min_valid_samples", 0),
         ("min_valid_samples", 1.5),
         ("min_valid_samples", True),
         ("contact_epsilon", -1),
         ("contact_epsilon", float("nan")),
-        ("max_effort", 30),
         ("enabled", "true"),
         ("coefficient", -1),
         ("coefficient", True),
@@ -270,12 +293,83 @@ def test_normalized_parameters_reject_invalid_values(field, value):
         )
 
 
-@pytest.mark.parametrize("field", ["min_effort", "mid_effort"])
+@pytest.mark.parametrize("field", ["min_effort", "max_effort"])
 def test_normalized_bounds_are_required(field):
     cfg = normalized()
     del cfg[field]
     with pytest.raises(ValueError, match=field):
         validate_force_reward_cfg({"normalize_effort_reward": cfg}, 1)
+
+
+@pytest.mark.parametrize("field", ["min_reward", "max_reward"])
+@pytest.mark.parametrize("value", [True, None, "1", float("nan"), float("inf")])
+def test_reward_clip_bounds_require_finite_numbers(field, value):
+    with pytest.raises(ValueError, match=field):
+        validate_force_reward_cfg(
+            {"normalize_effort_reward": normalized(**{field: value})}, 1
+        )
+
+
+def test_reversed_reward_clip_bounds_are_rejected():
+    with pytest.raises(ValueError, match="min_reward <= max_reward"):
+        validate_force_reward_cfg(
+            {"normalize_effort_reward": normalized(min_reward=1, max_reward=-1)}, 1
+        )
+
+
+@pytest.mark.parametrize("direct", [True, False])
+def test_legacy_mid_effort_warns_and_preserves_rewards(direct):
+    legacy = normalized()
+    legacy["mid_effort"] = legacy.pop("max_effort")
+    before = deepcopy(legacy)
+    with pytest.warns(UserWarning, match="using mid_effort as max_effort"):
+        resolved = validate_force_reward_cfg({"normalize_effort_reward": legacy}, 1)
+    assert legacy == before
+    assert resolved == validate_force_reward_cfg(
+        {"normalize_effort_reward": normalized()}, 1
+    )
+    env, terms, term, params = make_term([10, 20, 30], direct=direct)
+    term._normalize_effort_reward = resolved["normalize_effort_reward"]
+    terms["success"][:] = True
+    torch.testing.assert_close(
+        term(env, **params) * env.step_dt, torch.tensor([2.0, 1.0, 0.0])
+    )
+
+
+@pytest.mark.parametrize("midpoint", [15.0, None, float("nan"), "ignored"])
+def test_explicit_max_effort_takes_precedence_and_warns(midpoint):
+    with pytest.warns(UserWarning, match="max_effort takes precedence"):
+        env, terms, term, params = make_term(
+            [10, 20, 30, 50, 60], direct=True, max_effort=30, mid_effort=midpoint
+        )
+    terms["success"][:] = True
+    torch.testing.assert_close(
+        term(env, **params) * env.step_dt, torch.tensor([2.0, 1.5, 1.0, 0.0, 0.0])
+    )
+
+
+@pytest.mark.parametrize("maximum", [None, float("nan"), 10.0])
+def test_invalid_explicit_max_effort_does_not_fall_back_to_mid_effort(maximum):
+    with pytest.warns(UserWarning, match="max_effort takes precedence"):
+        with pytest.raises(ValueError, match="max_effort"):
+            validate_force_reward_cfg(
+                {
+                    "normalize_effort_reward": normalized(
+                        max_effort=maximum, mid_effort=20
+                    )
+                },
+                1,
+            )
+
+
+def test_max_effort_only_is_quiet_and_does_not_derive_an_overflowing_bound():
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        env, terms, term, params = make_term([10], direct=True, max_effort=1e308)
+        terms["success"][:] = True
+        torch.testing.assert_close(
+            term(env, **params) * env.step_dt, torch.tensor([2.0])
+        )
 
 
 def test_disabled_rewards_and_mutual_exclusion():
@@ -358,7 +452,7 @@ def test_tasks_may_mix_reward_forms_and_disabled_without_mutating_base(ordinary_
     ).init_params.success.normalize_effort_reward.enabled
     assert task_env_cfg(cfg.env.train, 1).init_params.success.force_bonus.enabled
     cfg.env.train.multi_task.tasks[2].init_params.success = {
-        "normalize_effort_reward": normalized(min_effort=5.0, mid_effort=7.0)
+        "normalize_effort_reward": normalized(min_effort=5.0, max_effort=7.0)
     }
     validate_environments(cfg)
     assert (
@@ -388,7 +482,7 @@ def test_evaluation_tasks_are_checked_only_when_enabled():
     cfg.env.eval = deepcopy(cfg.env.train)
     cfg.env.eval.multi_task.tasks[
         0
-    ].init_params.success.normalize_effort_reward.mid_effort = 0
+    ].init_params.success.normalize_effort_reward.max_effort = 0
     with pytest.raises(ValueError, match="env.eval task a"):
         validate_environments(cfg)
     cfg.runner.val_check_interval = -1
