@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+
 import torch
 import torch.nn.functional as F
 from torch.distributions.normal import Normal
@@ -22,9 +24,10 @@ from rlinf.models.embodiment.mlp_policy.mlp_policy import MLPPolicy
 class RLTMLPPolicy(MLPPolicy):
     """MLP actor-critic policy for RLT Stage 2 heads.
 
-    Actor input follows RLT: reference action chunk, RL token feature, and
-    proprioceptive state. Critic input follows RLT: action chunk, RL token
-    feature, and proprioceptive state.
+    By default the actor predicts a bounded residual added to the reference.
+    Explicit absolute mode returns the bounded output directly. Public action
+    outputs and critic inputs are complete actions in both modes;
+    ``normalized_action_bound`` bounds the network output before composition.
     """
 
     def __init__(
@@ -38,6 +41,7 @@ class RLTMLPPolicy(MLPPolicy):
         q_head_type: str = "default",
         fixed_std: float = 0.002,
         normalized_action_bound: float = 1.0,
+        action_parameterization: str = "residual",
     ):
         if not add_q_head:
             raise ValueError(
@@ -75,15 +79,28 @@ class RLTMLPPolicy(MLPPolicy):
         self.chunk_len = chunk_len
         self.ref_chunk_len = ref_chunk_len
         self.flat_action_dim = flat_action_dim
+        if action_parameterization not in ("absolute", "residual"):
+            raise ValueError(
+                f"Unsupported RLT action_parameterization: {action_parameterization!r}."
+            )
+        self.action_parameterization = action_parameterization
         self.fixed_std = float(fixed_std)
-        if self.fixed_std <= 0:
+        if not math.isfinite(self.fixed_std) or self.fixed_std <= 0:
             raise ValueError(f"fixed_std must be positive, got {self.fixed_std}.")
         self.normalized_action_bound = float(normalized_action_bound)
-        if self.normalized_action_bound <= 0:
+        if (
+            not math.isfinite(self.normalized_action_bound)
+            or self.normalized_action_bound <= 0
+        ):
             raise ValueError(
                 "normalized_action_bound must be positive, got "
                 f"{self.normalized_action_bound}."
             )
+        # Start deterministic control at the frozen VLA reference. Training
+        # retains the fixed-std exploration noise around this zero residual.
+        if self.action_parameterization == "residual":
+            torch.nn.init.zeros_(self.actor_mean.weight)
+            torch.nn.init.zeros_(self.actor_mean.bias)
 
     def preprocess_env_obs(self, env_obs):
         device = next(self.parameters()).device
@@ -161,7 +178,14 @@ class RLTMLPPolicy(MLPPolicy):
         probs = Normal(action_mean, action_std)
         raw_action = action_mean if deterministic else probs.rsample()
         squashed_action = torch.tanh(raw_action / self.normalized_action_bound)
-        action = self.normalized_action_bound * squashed_action
+        residual = self.normalized_action_bound * squashed_action
+        # Dropout affects conditioning only, never the reference anchor. Do not
+        # squash the sum: a zero residual must preserve the reference exactly.
+        action = (
+            self._get_ref_chunk(obs) + residual
+            if self.action_parameterization == "residual"
+            else residual
+        )
         chunk_logprobs = probs.log_prob(raw_action) - torch.log(
             1.0 - squashed_action.square() + 1.0e-6
         )
@@ -209,8 +233,7 @@ class RLTMLPPolicy(MLPPolicy):
         target_actions = self._flatten_batch(
             data["action"] if "action" in data else data["actions"]
         )
-        actor_state = self._actor_state(obs)
-        pred_actions = self.actor_mean(self.backbone(actor_state))
+        pred_actions, _, _ = self.sac_forward(obs, deterministic=True)
         return F.mse_loss(pred_actions, target_actions, reduction="none")
 
     @torch.inference_mode()

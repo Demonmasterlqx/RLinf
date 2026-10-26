@@ -35,6 +35,7 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
             q_head_type=cfg.get("q_head_type", "default"),
             fixed_std=cfg.get("fixed_std", 0.002),
             normalized_action_bound=cfg.get("normalized_action_bound", 1.0),
+            action_parameterization=cfg.get("action_parameterization", "residual"),
         )
     elif iql_config is not None:
         model = IQLMLPPolicy(

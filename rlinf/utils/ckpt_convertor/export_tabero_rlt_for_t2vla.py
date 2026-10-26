@@ -26,6 +26,8 @@ from typing import Any
 import torch
 from safetensors.torch import save_file
 
+from rlinf.utils.rlt_action_contract import checkpoint_action_contract
+
 _ENCODER_PREFIX = "rlt_module.encoder."
 _ACTOR_PREFIXES = ("backbone.", "actor_mean.")
 
@@ -164,6 +166,7 @@ def export_tabero_rlt_bundle(
     base_model: str,
     stage2_global_step: int,
     normalized_action_bound: float = 4.0,
+    action_parameterization: str | None = None,
     proprio_dim: int = 7,
     action_dim: int = 13,
     num_action_chunks: int = 10,
@@ -308,7 +311,15 @@ def export_tabero_rlt_bundle(
     if not encoder:
         raise ValueError("Stage 1 checkpoint contains no RLT encoder weights.")
 
-    stage2 = _tensor_state(_load_checkpoint(stage2_checkpoint))
+    stage2_payload = _load_checkpoint(stage2_checkpoint)
+    action_contract = checkpoint_action_contract(
+        stage2_checkpoint,
+        stage2_payload,
+        bound=normalized_action_bound,
+        step=stage2_global_step,
+        parameterization=action_parameterization,
+    )
+    stage2 = _tensor_state(_stage1_state(stage2_payload))
     actor = {
         key: value for key, value in stage2.items() if key.startswith(_ACTOR_PREFIXES)
     }
@@ -348,7 +359,7 @@ def export_tabero_rlt_bundle(
 
     manifest: dict[str, Any] = {
         "format": "tabero_rlt_t2vla",
-        "format_version": 1,
+        **action_contract,
         "action_space": "model_normalized",
         "normalized_action_bound": float(normalized_action_bound),
         "z_dim": z_dim,
@@ -395,7 +406,9 @@ def export_tabero_rlt_bundle(
                 "task_id": task_id,
                 "source_train_config": str(resolved_train_config),
                 "stage2_checkpoint_metadata": {
-                    "format": "full_weights",
+                    "format": "trainable_weights"
+                    if "model" in stage2_payload
+                    else "full_weights",
                     "method": "rlt",
                     "task_id": task_id,
                     "training_config": resolved_train_config.stem,
@@ -421,6 +434,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--base-model", required=True)
     parser.add_argument("--stage2-global-step", type=int, required=True)
     parser.add_argument("--normalized-action-bound", type=float, default=4.0)
+    parser.add_argument(
+        "--action-parameterization", choices=("absolute", "residual"), default=None
+    )
     parser.add_argument("--proprio-dim", type=int, default=7)
     parser.add_argument("--action-dim", type=int, default=13)
     parser.add_argument("--num-action-chunks", type=int, default=10)
@@ -471,6 +487,7 @@ def main() -> None:
         base_model=args.base_model,
         stage2_global_step=args.stage2_global_step,
         normalized_action_bound=args.normalized_action_bound,
+        action_parameterization=args.action_parameterization,
         proprio_dim=args.proprio_dim,
         action_dim=args.action_dim,
         num_action_chunks=args.num_action_chunks,

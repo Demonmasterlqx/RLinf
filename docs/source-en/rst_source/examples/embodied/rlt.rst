@@ -207,6 +207,52 @@ During rollout:
    action   = action actually sent to the environment
    next_obs = {next_z_rl, next_proprio, next_ref_chunk}
 
+By default, the actor predicts a bounded residual in the same action space as the
+reference (normalized model space for Tabero):
+
+.. code:: text
+
+   delta = b * tanh((mu(ref_chunk, z_rl, proprio) + sigma * epsilon) / b)
+   actor_action = ref_chunk + delta
+
+``normalized_action_bound`` is the residual bound ``b``; the final sum is not
+clipped or squashed again. Evaluation uses ``epsilon=0``. The output layer is
+zero-initialized, so a new deterministic actor exactly reproduces the reference,
+including reference values outside ``[-b, b]``. Reference dropout affects only
+network conditioning, not the reference added to the residual. BC, critic inputs,
+TD next actions and replay all use complete actions. Tabero decodes the sum to
+environment space once, after routing. ``actor/residual_saturation_ratio`` tracks
+residual saturation; ``replay/normalized_action_abs_max`` tracks the complete
+action range.
+
+Set ``actor.model.action_parameterization`` explicitly to ``absolute`` or
+``residual``. New training defaults to ``residual``; only this mode zero-initializes
+the output layer. ``absolute`` returns the bounded Actor output directly, without
+adding the VLA reference; its bound limits the complete action. Both modes use
+complete actions for BC, Q learning, replay and SFT. Standalone RLinf evaluation
+uses ``rollout.model.action_parameterization`` when explicitly configured, or the
+checkpoint declaration when present.
+
+New checkpoints persist ``rlt_action_contract`` in each rank's schedule sidecar
+and in trainable-weight metadata, even when scheduling is disabled. Resume checks
+that the configured mode and bound match. A schedule sidecar without action
+metadata requires an explicit ``actor.model.action_parameterization``; missing
+optimizer/replay/schedule state is still not a valid training continuation.
+Raw ``full_weights.pt`` export reads the rank-zero sidecar from the original
+``actor/model_state_dict`` layout; ``trainable_weights.pt`` carries its own metadata.
+Unlabelled weights require ``--action-parameterization absolute`` or ``residual``
+on the exporter. An explicit argument cannot override contradictory metadata.
+
+Bundles have no version field. They declare ``action_parameterization`` and
+``action_composition``: ``absolute`` uses ``direct``; ``residual`` uses
+``reference_plus_bounded_delta`` and a ``residual_action_bound`` equal to
+``normalized_action_bound``. T2-VLA applies the declared mode before output
+transforms. For unlabelled bundles, use ``--rlt-action-parameterization absolute``
+or ``residual`` with ``--rlt-bundle`` in ``scripts/serve_policy.py`` (Python API:
+``create_trained_policy(..., rlt_action_parameterization=...)``). Missing declarations,
+unknown modes, contradictory composition or bounds, and argument/metadata conflicts
+are rejected. Weight shapes and old format-version fields never select a mode.
+
 For the provided real-robot config, ``keyboard_reward_wrapper:
 rlt_policy_switch`` adds an ``rlt_switch_flags`` flag. Before the operator presses
 ``b``, the executed action is the VLA ``ref_chunk``; after ``b`` is pressed,

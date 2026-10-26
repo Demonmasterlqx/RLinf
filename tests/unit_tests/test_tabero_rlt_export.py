@@ -20,6 +20,7 @@ from safetensors.torch import load_file
 
 from rlinf.models.embodiment.modules.rlt_token_transformer import RLTTokenEncoder
 from rlinf.utils.ckpt_convertor import export_tabero_rlt_for_t2vla
+from rlinf.utils.rlt_action_contract import build_action_contract
 
 
 def _small_encoder_state() -> dict[str, torch.Tensor]:
@@ -38,8 +39,12 @@ def _small_encoder_state() -> dict[str, torch.Tensor]:
     }
 
 
-def _small_actor_state() -> dict[str, torch.Tensor]:
+def _small_actor_state() -> dict:
     return {
+        "metadata": {
+            "global_step": 75,
+            "rlt_action_contract": build_action_contract(4.0),
+        },
         "backbone.0.weight": torch.ones(2, 5),
         "backbone.0.bias": torch.zeros(2),
         "backbone.2.weight": torch.eye(2),
@@ -127,6 +132,9 @@ def test_export_filters_stage1_encoder_and_stage2_actor(tmp_path):
         "actor_mean.weight",
         "actor_mean.bias",
     }
+    assert "format_version" not in manifest
+    assert manifest["action_parameterization"] == "residual"
+    assert manifest["residual_action_bound"] == 4.0
     assert manifest["action_space"] == "model_normalized"
     assert manifest["normalized_action_bound"] == 4.0
     assert manifest["stage2_global_step"] == 75
@@ -149,6 +157,72 @@ def test_export_filters_stage1_encoder_and_stage2_actor(tmp_path):
         export_tabero_rlt_for_t2vla.checkpoint_sha256(stage1_path.parent / "base-model")
     )
     assert json.loads((output_dir / "manifest.json").read_text()) == manifest
+
+
+@pytest.mark.parametrize("error", ["missing", "absolute", "bound", "step"])
+def test_export_rejects_legacy_or_mismatched_action_semantics(tmp_path, error):
+    stage1_path, stage2_path = tmp_path / "stage1.pt", tmp_path / "stage2.pt"
+    torch.save({"model": _small_encoder_state()}, stage1_path)
+    actor = _small_actor_state()
+    metadata = actor["metadata"]
+    if error == "missing":
+        actor.pop("metadata")
+    elif error == "absolute":
+        metadata["rlt_action_contract"]["action_parameterization"] = "absolute"
+    elif error == "bound":
+        metadata["rlt_action_contract"]["residual_action_bound"] = 2.0
+    else:
+        metadata["global_step"] = 74
+    torch.save(actor, stage2_path)
+    with pytest.raises(ValueError, match="action contract"):
+        _export_small_bundle(stage1_path, stage2_path, tmp_path / "bundle")
+    assert not (tmp_path / "bundle/manifest.json").exists()
+
+
+def test_export_reads_wrapped_trainable_weights(tmp_path):
+    stage1_path, stage2_path = tmp_path / "stage1.pt", tmp_path / "stage2.pt"
+    torch.save({"model": _small_encoder_state()}, stage1_path)
+    actor = _small_actor_state()
+    metadata = actor.pop("metadata")
+    torch.save({"model": actor, "metadata": metadata}, stage2_path)
+    manifest = _export_small_bundle(stage1_path, stage2_path, tmp_path / "bundle")
+    assert manifest["action_composition"] == "reference_plus_bounded_delta"
+    saved_actor = load_file(tmp_path / "bundle/rlt_actor.safetensors")
+    for key, value in actor.items():
+        torch.testing.assert_close(saved_actor[key], value)
+
+
+@pytest.mark.parametrize("mode", ["absolute", "residual"])
+@pytest.mark.parametrize("labelled", [False, True])
+def test_export_explicit_absolute_and_residual_weights(tmp_path, mode, labelled):
+    stage1_path, stage2_path = tmp_path / "stage1.pt", tmp_path / "stage2.pt"
+    torch.save({"model": _small_encoder_state()}, stage1_path)
+    actor = _small_actor_state()
+    if labelled:
+        actor["metadata"]["rlt_action_contract"] = build_action_contract(4.0, mode)
+    else:
+        actor.pop("metadata")
+    torch.save(actor, stage2_path)
+    manifest = _export_small_bundle(
+        stage1_path, stage2_path, tmp_path / "bundle", action_parameterization=mode
+    )
+    assert manifest["action_parameterization"] == mode
+    assert "format_version" not in manifest
+    if mode == "absolute":
+        assert manifest["action_composition"] == "direct"
+        assert "residual_action_bound" not in manifest
+    else:
+        assert manifest["residual_action_bound"] == 4.0
+    if labelled:
+        with pytest.raises(ValueError, match="action contract mismatch"):
+            _export_small_bundle(
+                stage1_path,
+                stage2_path,
+                tmp_path / "bad",
+                action_parameterization="absolute"
+                if mode == "residual"
+                else "residual",
+            )
 
 
 def test_formal_export_binds_sources_and_explicit_provenance(tmp_path):

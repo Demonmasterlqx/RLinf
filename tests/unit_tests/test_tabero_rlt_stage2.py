@@ -94,10 +94,10 @@ def test_scaled_tanh_uses_configured_normalized_action_bound():
 
     actions, log_probs, _ = policy.sac_forward(_rlt_obs(), deterministic=True)
 
-    expected = 4.0 * torch.tanh(torch.tensor(1.0))
+    expected = 0.25 + 4.0 * torch.tanh(torch.tensor(1.0))
     torch.testing.assert_close(actions, torch.full_like(actions, expected))
     assert torch.isfinite(log_probs).all()
-    assert actions.abs().max() < 4.0
+    assert (actions - 0.25).abs().max() < 4.0
 
 
 def test_rlt_policy_builder_forwards_normalized_action_bound():
@@ -406,9 +406,9 @@ def test_predict_rlt_actions_keeps_replay_normalized_and_decodes_env_actions():
     )
 
 
-def test_transition_metrics_report_normalized_saturation_and_physical_force():
+def test_transition_metrics_report_final_action_range_and_physical_force():
     trajectory = Trajectory(max_episode_length=1)
-    trajectory.actions = torch.tensor([[[[3.99] * 13] * 10]], dtype=torch.float32)
+    trajectory.actions = torch.tensor([[[[4.01] * 13] * 10]], dtype=torch.float32)
     environment_action = torch.zeros(1, 1, 130)
     environment_action.reshape(1, 1, 10, 13)[..., 7:] = 12.5
     trajectory.forward_inputs = {"environment_action": environment_action}
@@ -419,8 +419,8 @@ def test_transition_metrics_report_normalized_saturation_and_physical_force():
 
     metrics = worker._transition_replay_metrics([trajectory])
 
-    assert metrics["replay/normalized_action_abs_max"] == pytest.approx(3.99)
-    assert metrics["replay/normalized_action_saturation_ratio"] == 1.0
+    assert metrics["replay/normalized_action_abs_max"] == pytest.approx(4.01)
+    assert metrics["replay/normalized_action_exceeds_residual_bound_ratio"] == 1.0
     assert metrics["replay/physical_force_abs_max"] == 12.5
 
 
@@ -701,6 +701,9 @@ def test_rlt_checkpoint_restores_schedule_state(tmp_path, monkeypatch, worker_ty
     )
     worker = worker_type.__new__(worker_type)
     worker._rank = 3
+    worker.cfg = OmegaConf.create(
+        {"actor": {"model": {"normalized_action_bound": 4.0}}}
+    )
     worker.use_rlt_schedule = True
     expected = {
         "update_step": 2_000,
@@ -742,6 +745,10 @@ def test_rlt_checkpoint_rejects_sidecar_from_different_global_step(
     state_path.parent.mkdir(parents=True)
     state = dict.fromkeys(worker._RLT_CHECKPOINT_FIELDS, 0)
     state["global_step"] = 5
+    worker.cfg = OmegaConf.create(
+        {"actor": {"model": {"normalized_action_bound": 4.0}}}
+    )
+    state["rlt_action_contract"] = worker._rlt_action_contract()
     torch.save(state, state_path)
     gathered = []
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
@@ -772,6 +779,10 @@ def test_rlt_checkpoint_rejects_cross_rank_schedule_divergence(tmp_path, monkeyp
     state_path.parent.mkdir(parents=True)
     state = dict.fromkeys(worker._RLT_CHECKPOINT_FIELDS, 0)
     state["global_step"] = 5
+    worker.cfg = OmegaConf.create(
+        {"actor": {"model": {"normalized_action_bound": 4.0}}}
+    )
+    state["rlt_action_contract"] = worker._rlt_action_contract()
     torch.save(state, state_path)
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
@@ -809,7 +820,7 @@ def test_rlt_checkpoint_requires_rank_schedule_sidecar(tmp_path, monkeypatch):
         worker.load_checkpoint(str(tmp_path))
 
 
-def test_rlt_checkpoint_without_schedule_preserves_legacy_resume(tmp_path, monkeypatch):
+def test_rlt_checkpoint_without_schedule_rejects_legacy_resume(tmp_path, monkeypatch):
     load_calls = []
     monkeypatch.setattr(
         EmbodiedSACFSDPPolicy,
@@ -820,9 +831,10 @@ def test_rlt_checkpoint_without_schedule_preserves_legacy_resume(tmp_path, monke
     worker._rank = 2
     worker.use_rlt_schedule = False
 
-    worker.load_checkpoint(str(tmp_path))
+    with pytest.raises(FileNotFoundError, match="action contract"):
+        worker.load_checkpoint(str(tmp_path))
 
-    assert load_calls == [str(tmp_path)]
+    assert load_calls == []
 
 
 def test_run_training_reports_post_update_schedule_step(monkeypatch):

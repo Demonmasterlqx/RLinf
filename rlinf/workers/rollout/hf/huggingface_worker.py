@@ -152,10 +152,28 @@ class MultiStepRolloutWorker(Worker):
             rollout_model_config.precision = self.cfg.rollout.model.precision
             rollout_model_config.model_path = self.cfg.rollout.model.model_path
 
-        self.hf_model: BasePolicy = get_model(rollout_model_config)
-
+        model_dict = None
         if self.cfg.runner.get("ckpt_path", None):
             model_dict = torch.load(self.cfg.runner.ckpt_path)
+            if rollout_model_config.model_type == "rlt_mlp_policy":
+                from rlinf.utils.rlt_action_contract import checkpoint_action_contract
+
+                contract = checkpoint_action_contract(
+                    self.cfg.runner.ckpt_path,
+                    model_dict,
+                    bound=rollout_model_config.get("normalized_action_bound", 1.0),
+                    parameterization=rollout_model_config.get(
+                        "action_parameterization"
+                    ),
+                )
+                with open_dict(rollout_model_config):
+                    rollout_model_config.action_parameterization = contract[
+                        "action_parameterization"
+                    ]
+                model_dict = model_dict.get("model", model_dict)
+
+        self.hf_model: BasePolicy = get_model(rollout_model_config)
+        if model_dict is not None:
             self.hf_model.load_state_dict(model_dict)
 
         rlt_feature_model_config = OmegaConf.select(

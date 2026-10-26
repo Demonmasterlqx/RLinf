@@ -29,6 +29,35 @@ class _Logger:
         pass
 
 
+def test_rlt_trainable_save_persists_runtime_action_contract(monkeypatch, tmp_path):
+    manager = FSDPModelManager.__new__(FSDPModelManager)
+    manager.model = nn.Linear(2, 1)
+    manager._cfg = SimpleNamespace(fsdp_config={"save_trainable_model_weights": True})
+    manager.cfg = OmegaConf.create(
+        {
+            "actor": {
+                "model": {
+                    "model_type": "rlt_mlp_policy",
+                    "normalized_action_bound": 2.5,
+                }
+            }
+        }
+    )
+    manager._logger = _Logger()
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 1)
+    monkeypatch.setattr(torch.distributed, "barrier", lambda: None)
+    manager._save_trainable_model_weights(str(tmp_path), step=3)
+    payload = torch.load(
+        tmp_path / "model_state_dict/trainable_weights.pt", weights_only=True
+    )
+    assert payload["metadata"]["rlt_action_contract"] == {
+        "action_parameterization": "residual",
+        "action_composition": "reference_plus_bounded_delta",
+        "residual_action_bound": 2.5,
+    }
+
+
 def test_model_weight_ema_updates_in_fp32_and_temporarily_applies_weights():
     parameter = nn.Parameter(torch.tensor([1.0], dtype=torch.bfloat16))
     ema = ModelWeightEMA([parameter], 0.99, parameter_names=["weight"])

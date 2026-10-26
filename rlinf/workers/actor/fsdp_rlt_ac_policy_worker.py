@@ -33,6 +33,10 @@ from rlinf.utils.metric_utils import (
     trajectory_has_bool_tensor,
 )
 from rlinf.utils.multi_task import task_list, validate_task_indices
+from rlinf.utils.rlt_action_contract import (
+    build_action_contract,
+    validate_action_contract,
+)
 from rlinf.utils.sac_multi_task import weighted_sac_mean
 from rlinf.utils.utils import clear_memory
 from rlinf.workers.actor.async_fsdp_sac_policy_worker import (
@@ -442,6 +446,21 @@ class RLTACLossMixin:
             .detach()
             .item()
         )
+        residual = self._flatten_chunk(pi) - self._flatten_chunk(ref_chunk)
+        residual_mode = (
+            self.cfg.actor.model.get("action_parameterization", "residual")
+            == "residual"
+        )
+        bounded_output = residual if residual_mode else self._flatten_chunk(pi)
+        output_name = "residual" if residual_mode else "action"
+        metrics[f"{output_name}_abs_max"] = bounded_output.detach().abs().max().item()
+        residual_bound = float(self.cfg.actor.model.get("normalized_action_bound", 1.0))
+        metrics[f"{output_name}_saturation_ratio"] = (
+            (bounded_output.detach().abs() >= 0.99 * residual_bound)
+            .float()
+            .mean()
+            .item()
+        )
         metrics["weighted_q"] = (q_weight * q_mean).detach().item()
         metrics["weighted_bc"] = (bc_weight * bc_mean).detach().item()
         metrics["reference_dropout_prob"] = reference_dropout_prob
@@ -722,7 +741,7 @@ class RLTACReplayMixin:
             max_stats["normalized_action_abs_max"] = float(actions.abs().max().item())
             sum_stats["action_count"] = float(actions.numel())
             sum_stats["action_saturation_count"] = float(
-                (actions.abs() >= 0.99 * action_bound).sum().item()
+                (actions.abs() > action_bound).sum().item()
             )
 
         action_dim = int(self.cfg.actor.model.get("action_dim", 13))
@@ -777,7 +796,15 @@ class RLTACReplayMixin:
             "replay/physical_force_abs_max": max_stats["physical_force_abs_max"],
         }
         if sum_stats["action_count"] > 0:
-            metrics["replay/normalized_action_saturation_ratio"] = (
+            # The complete action is unbounded by the residual tanh. This is
+            # an absolute-range diagnostic, not actor saturation.
+            bound_name = (
+                "residual"
+                if self.cfg.actor.model.get("action_parameterization", "residual")
+                == "residual"
+                else "action"
+            )
+            metrics[f"replay/normalized_action_exceeds_{bound_name}_bound_ratio"] = (
                 sum_stats["action_saturation_count"] / sum_stats["action_count"]
             )
         if sum_stats["reward_count"] > 0:
@@ -901,25 +928,31 @@ class RLTACScheduleCheckpointMixin:
     def _multi_task_checkpoint_format(self) -> str:
         return "rlt_multitask_v1"
 
+    def _rlt_action_contract(self) -> dict:
+        return build_action_contract(
+            self.cfg.actor.model.get("normalized_action_bound", 1.0),
+            self.cfg.actor.model.get("action_parameterization", "residual"),
+        )
+
     def save_checkpoint(self, save_base_path, step):
         super().save_checkpoint(save_base_path, step)
         state_path = self._rlt_checkpoint_path(save_base_path)
         os.makedirs(os.path.dirname(state_path), exist_ok=True)
         state = {field: getattr(self, field) for field in self._RLT_CHECKPOINT_FIELDS}
         state["global_step"] = int(step)
+        state["rlt_action_contract"] = self._rlt_action_contract()
         torch.save(state, state_path)
 
     def load_checkpoint(self, load_base_path):
-        receipt = super().load_checkpoint(load_base_path)
-        if not self.use_rlt_schedule:
-            return receipt
+        # Validate before restoring any model/optimizer/replay state. This also
+        # applies when the optional learner schedule is disabled.
         state_path = self._rlt_checkpoint_path(load_base_path)
         state = None
         local_error: Exception | None = None
         try:
             if not os.path.isfile(state_path):
                 raise FileNotFoundError(
-                    "RLT schedule state is required to resume actor routing and "
+                    "RLT action contract and schedule state are required to resume actor routing and "
                     f"learner schedules, but it is missing: {state_path}"
                 )
             state = torch.load(state_path, map_location="cpu", weights_only=True)
@@ -929,13 +962,15 @@ class RLTACScheduleCheckpointMixin:
                 raise ValueError(
                     f"RLT checkpoint {state_path} is missing fields: {missing}."
                 )
-            if getattr(self, "multi_task_enabled", False) and (
-                receipt["multi_task_step"] != state["global_step"]
-                or receipt["multi_task_update_step"] != state["update_step"]
-            ):
-                raise ValueError(
-                    "RLT schedule and multi-task checkpoint steps disagree."
-                )
+            contract = state.get("rlt_action_contract")
+            explicit_mode = self.cfg.actor.model.get("action_parameterization")
+            if "rlt_action_contract" not in state and explicit_mode is not None:
+                contract = self._rlt_action_contract()
+            validate_action_contract(
+                contract,
+                self.cfg.actor.model.get("normalized_action_bound", 1.0),
+                explicit_mode or "residual",
+            )
             checkpoint_dir = os.path.basename(
                 os.path.dirname(os.path.normpath(load_base_path))
             )
@@ -1005,6 +1040,12 @@ class RLTACScheduleCheckpointMixin:
                     "RLT checkpoint cross-rank schedule state mismatch for "
                     f"fields: {divergent}."
                 )
+        receipt = super().load_checkpoint(load_base_path)
+        if getattr(self, "multi_task_enabled", False) and (
+            receipt["multi_task_step"] != state["global_step"]
+            or receipt["multi_task_update_step"] != state["update_step"]
+        ):
+            raise ValueError("RLT schedule and multi-task checkpoint steps disagree.")
         for field in self._RLT_CHECKPOINT_FIELDS:
             setattr(self, field, state[field])
         return receipt

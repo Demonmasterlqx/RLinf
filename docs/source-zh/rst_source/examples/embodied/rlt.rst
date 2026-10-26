@@ -192,6 +192,43 @@ rollout 时：
    action   = 实际发送给环境的动作
    next_obs = {next_z_rl, next_proprio, next_ref_chunk}
 
+Actor 默认在参考动作所在空间预测有界残差（Tabero 使用模型归一化动作空间）：
+
+.. code:: text
+
+   delta = b * tanh((mu(ref_chunk, z_rl, proprio) + sigma * epsilon) / b)
+   actor_action = ref_chunk + delta
+
+``normalized_action_bound`` 表示残差上限 ``b``；相加后不再裁剪或经过 tanh。
+评估使用 ``epsilon=0``，新 Actor 的输出层零初始化，因此确定性输出精确还原
+参考动作，包括超出 ``[-b, b]`` 的参考值。reference dropout 只作用于网络输入，
+相加时仍使用原始参考动作。BC、Critic、TD 下一动作和 replay 均使用最终完整动作。
+Tabero 在路由后将最终动作解码到环境空间一次。``actor/residual_saturation_ratio``
+记录残差饱和比例，``replay/normalized_action_abs_max`` 记录最终动作范围。
+
+``actor.model.action_parameterization`` 支持显式设置 ``absolute`` 或 ``residual``。
+新训练默认 ``residual``，只在残差模式下零初始化输出层。``absolute`` 直接返回
+有界 Actor 输出，不加参考动作，此时边界约束完整动作。两种模式的 BC、Q、replay
+和 SFT 都使用完整动作。RLinf 独立评估读取显式的
+``rollout.model.action_parameterization``，或已有 checkpoint 中的模式声明。
+
+新 checkpoint 在每个 rank 的 schedule sidecar 和 trainable 权重元数据中写入
+``rlt_action_contract``，关闭 schedule 时也保存和校验。恢复时模式和边界必须一致。
+没有动作元数据的旧 sidecar 要求显式设置 ``actor.model.action_parameterization``；
+仍需完整 optimizer/replay/schedule 状态才能续训。原始 ``full_weights.pt`` 导出会
+从 ``actor/model_state_dict`` 对应的 rank 0 sidecar 读取语义；
+``trainable_weights.pt`` 自带元数据。未声明语义的权重需要向导出器传入
+``--action-parameterization absolute`` 或 ``residual``，参数不得覆盖冲突元数据。
+
+Bundle 不包含版本字段，显式声明 ``action_parameterization`` 和 ``action_composition``：
+``absolute`` 对应 ``direct``；``residual`` 对应 ``reference_plus_bounded_delta``，
+且 ``residual_action_bound`` 必须等于 ``normalized_action_bound``。T2-VLA 在输出
+变换前按声明处理。加载未声明语义的旧 bundle 时，在 ``scripts/serve_policy.py`` 中
+配合 ``--rlt-bundle`` 传入 ``--rlt-action-parameterization absolute`` 或 ``residual``；
+Python API 使用 ``create_trained_policy(..., rlt_action_parameterization=...)``。
+缺失声明、未知模式、组合方式或边界冲突、参数与元数据冲突均会报错。
+不会根据权重形状或旧 format-version 字段猜测动作语义。
+
 Franka 真机配置中，``keyboard_reward_wrapper: rlt_policy_switch`` 会提供
 ``rlt_switch_flags`` 标记。在操作员按下 ``b`` 之前，实际执行 VLA 的
 ``ref_chunk``；按下 ``b`` 之后，实际执行 Stage 2 actor 的动作。

@@ -647,6 +647,17 @@ class FSDPModelManager:
                     model_weight_ema_decay=self._model_weight_ema.decay,
                     model_weight_ema_num_updates=self._model_weight_ema.num_updates,
                 )
+            if (
+                full_cfg is not None
+                and OmegaConf.select(full_cfg, "actor.model.model_type")
+                == "rlt_mlp_policy"
+            ):
+                from rlinf.utils.rlt_action_contract import build_action_contract
+
+                metadata["rlt_action_contract"] = build_action_contract(
+                    full_cfg.actor.model.get("normalized_action_bound", 1.0),
+                    full_cfg.actor.model.get("action_parameterization", "residual"),
+                )
             torch.save(
                 {
                     "model": state_dict,
