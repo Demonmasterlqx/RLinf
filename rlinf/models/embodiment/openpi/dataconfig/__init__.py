@@ -77,10 +77,41 @@ from rlinf.models.embodiment.openpi.dataconfig.tabero_dataconfig import (
     TaberoTacFieldDataConfig,
     TaberoTacForceDataConfig,
     TaberoTacImgDataConfig,
+    TaberoVisionDataConfig,
 )
 from rlinf.models.embodiment.openpi.openpi_action_model import OpenPi0Config
 
 _CONFIGS = [
+    TrainConfig(
+        name="pi05_lora_vision_realworld_replayed_task820",
+        model=OpenPi0Config(
+            config_name="pi05_lora_vision_realworld_replayed_task820",
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            action_dim=32,
+            action_horizon=50,
+            discrete_state_input=False,
+            num_images_in_input=2,
+            action_chunk=50,
+            action_env_dim=13,
+            effective_action_dim=13,
+            tactile_type="expert_his_c_fut",
+            tactile_dim=6,
+            tactile_dim_in=0,
+            tactile_prefix_dim_in=0,
+            tactile_streams=(),
+            tactile_loss_weight=0.05,
+            padding_loss_weight=1.0,
+            expert_his_c_fut_loss_mode="weighted_full",
+        ),
+        data=TaberoVisionDataConfig(
+            repo_id="realworld_replay_task820_firm_mixed",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(asset_id="pi05_horizon50_vision_task820_firm_mixed"),
+            extra_delta_transform=True,
+        ),
+    ),
     TrainConfig(
         name="pi0_libero",
         model=pi0_config.Pi0Config(),

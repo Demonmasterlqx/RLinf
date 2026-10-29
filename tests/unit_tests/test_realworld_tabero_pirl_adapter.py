@@ -668,7 +668,10 @@ def test_action_filter_tuning_is_not_locked_to_an_experiment():
     )
 
 
-def test_pirl_interface_validation_does_not_read_initialization_artifacts(monkeypatch):
+@pytest.mark.parametrize("modality", ["tacfield", "tacimg", "vision"])
+def test_pirl_interface_validation_does_not_read_initialization_artifacts(
+    monkeypatch, modality
+):
     # Synthetic interface values, intentionally no local checkpoint or dataset.
     model = {
         "num_action_chunks": 10,
@@ -738,11 +741,36 @@ def test_pirl_interface_validation_does_not_read_initialization_artifacts(monkey
         }
     )
 
+    if modality != "tacfield":
+        openpi = cfg.actor.model.openpi
+        openpi.config_name = (
+            "pi05_lora_vision_realworld_replayed_task820"
+            if modality == "vision"
+            else "pi05_lora_tacimg_realworld_replayed_task820_force"
+        )
+        openpi.action_horizon = 50
+        openpi.num_images_in_input = 2 if modality == "vision" else 3
+        openpi.tactile_streams = []
+        openpi.tactile_prefix_dim_in = 0 if modality == "vision" else None
+        for key in (
+            "history",
+            "encoder_type",
+            "use_reference_frame",
+            "diff_from_reference",
+        ):
+            openpi[f"tactile_prefix_{key}"] = None
+        cfg.env.train.init_params.tactile_image_history_len = 8
+
     def forbid_artifact_read(*args, **kwargs):
         pytest.fail("Preflight must not read initialization artifacts")
 
     monkeypatch.setattr(Path, "open", forbid_artifact_read)
     _validate_tabero_realworld_pi05_pirl_contract(cfg, cfg.actor.model)
+    if modality == "vision":
+        cfg.actor.model.openpi.tactile_streams = ["tactile_prefix"]
+        with pytest.raises(ValueError, match="tactile stream contract mismatch"):
+            _validate_tabero_realworld_pi05_pirl_contract(cfg, cfg.actor.model)
+        cfg.actor.model.openpi.tactile_streams = []
     cfg.actor.model.action_dim = 12
     with pytest.raises(ValueError, match="action_dim=13"):
         _validate_tabero_realworld_pi05_pirl_contract(cfg, cfg.actor.model)

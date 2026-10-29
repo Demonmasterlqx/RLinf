@@ -24,6 +24,35 @@ from rlinf.models.embodiment.openpi.policies import tabero_policy
 
 
 @dataclasses.dataclass(frozen=True)
+class TaberoVisionDataConfig(DataConfigFactory):
+    """Two-camera Tabero policy with no tactile input and 13D outputs."""
+
+    extra_delta_transform: bool = True
+
+    @override
+    def create(
+        self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig
+    ) -> DataConfig:
+        data_transforms = _transforms.Group(
+            inputs=[
+                tabero_policy.TaberoVisionInputs(model_type=model_config.model_type)
+            ],
+            outputs=[tabero_policy.LiberoForceOutputs()],
+        )
+        if self.extra_delta_transform:
+            delta_action_mask = _transforms.make_bool_mask(6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            data_transforms=data_transforms,
+            model_transforms=ModelTransformFactory()(model_config),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class TaberoTacImgDataConfig(DataConfigFactory):
     """Tabero three-image data config with 13D action/force outputs."""
 

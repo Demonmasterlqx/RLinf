@@ -42,6 +42,38 @@ def stretch_camera_image_to_224(image: object) -> np.ndarray:
 
 
 @dataclasses.dataclass(frozen=True)
+class TaberoVisionInputs(transforms.DataTransformFn):
+    """Use only the two RGB cameras; retain state for action transforms."""
+
+    model_type: _model.ModelType
+
+    def __call__(self, data: dict) -> dict:
+        base_image = stretch_camera_image_to_224(data["image"])
+        wrist_image = stretch_camera_image_to_224(data["wrist_image"])
+        inputs = {
+            "state": data["state"],
+            "image": {
+                "base_0_rgb": base_image,
+                "left_wrist_0_rgb": wrist_image,
+                "right_wrist_0_rgb": np.zeros_like(base_image),
+            },
+            "image_mask": {
+                "base_0_rgb": np.True_,
+                "left_wrist_0_rgb": np.True_,
+                "right_wrist_0_rgb": (
+                    np.True_
+                    if self.model_type == _model.ModelType.PI0_FAST
+                    else np.False_
+                ),
+            },
+        }
+        for key in ("actions", "prompt"):
+            if key in data:
+                inputs[key] = data[key]
+        return inputs
+
+
+@dataclasses.dataclass(frozen=True)
 class TaberoTacImgInputs(transforms.DataTransformFn):
     """Map Tabero flat samples with tactile RGB into pi0 image inputs."""
 

@@ -975,7 +975,20 @@ def _validate_tabero_realworld_pi05_pirl_contract(cfg, model_cfg) -> None:
         "detach_critic_input": True,
         "use_dsrl": False,
     }
-    if list(openpi_cfg.get("tactile_streams") or []) == ["tactile_prefix"]:
+    if config_name == "pi05_lora_vision_realworld_replayed_task820":
+        tactile_kind = "vision"
+        required_openpi_values = {
+            **common_openpi_values,
+            "action_horizon": 50,
+            "num_images_in_input": 2,
+            "tactile_prefix_dim_in": 0,
+            "tactile_prefix_history": None,
+            "tactile_prefix_encoder_type": None,
+            "tactile_prefix_use_reference_frame": None,
+            "tactile_prefix_diff_from_reference": None,
+        }
+        expected_tactile_streams = []
+    elif list(openpi_cfg.get("tactile_streams") or []) == ["tactile_prefix"]:
         tactile_kind = "tacfield"
         action_horizon = openpi_cfg.get("action_horizon")
         if type(action_horizon) is not int or action_horizon < 10:
@@ -1009,7 +1022,7 @@ def _validate_tabero_realworld_pi05_pirl_contract(cfg, model_cfg) -> None:
         expected_tactile_streams = []
     else:
         raise ValueError(
-            "RealWorld Tabero PI0.5 PiRL requires a supported TacField or TacImg "
+            "RealWorld Tabero PI0.5 PiRL requires a supported vision, TacField or TacImg "
             f"OpenPI config; got {config_name!r}."
         )
     for key, expected in required_openpi_values.items():
