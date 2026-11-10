@@ -64,6 +64,7 @@ PIRL_ACTION_EXPERT_LORA_TENSOR_COUNT = 126
 BUNDLE_FORMAT = "tabero_rlinf_openpi_lora_bundle"
 BUNDLE_FORMAT_VERSION = 1
 TABERO_SFT_METHODS = {
+    "sft_full_lora_vision",
     "sft_full_lora_tacfield",
     "sft_full_lora_tacforce_tcn",
     "sft_full_lora_tacimg",
@@ -590,7 +591,7 @@ def _validate_tabero_sft_export_schema(
     method: str,
 ) -> dict[str, int]:
     """Validate the merged deployment schema for a Tabero SFT method."""
-    if method == "sft_full_lora_tacimg":
+    if method in {"sft_full_lora_vision", "sft_full_lora_tacimg"}:
         expected_extra_tensor_count = 0
         allowed_extra_prefixes: tuple[str, ...] = ()
     elif method in {"sft_full_lora_tacfield", "sft_full_lora_tacforce_tcn"}:
@@ -710,8 +711,8 @@ def _build_export_metadata(
         required["training_config"] = expected_training_config
     if method not in {"pirl", *TABERO_SFT_METHODS}:
         raise ValueError(
-            "OpenPI checkpoint provenance method must be 'pirl', "
-            "'sft_full_lora_tacfield', or 'sft_full_lora_tacforce_tcn', "
+            "OpenPI checkpoint provenance method must be 'pirl' or one of "
+            f"{sorted(TABERO_SFT_METHODS)}, "
             f"got {method!r}"
         )
     for field, expected in required.items():
@@ -746,6 +747,7 @@ def _build_export_metadata(
             "datasets/realworld_replayed_task820_firm",
             "datasets/realworld_replay_task820_firm_mixed",
             "datasets/realworld_replay_task820_firm_gentle_mixed_current",
+            "datasets/xiangxin0923/realworld_task820_firm_current",
             "datasets/tabero",
             "datasets/tabero_firmly_tightly_no_adverb",
         }:

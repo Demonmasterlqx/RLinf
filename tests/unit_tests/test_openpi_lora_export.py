@@ -365,7 +365,8 @@ def test_tabero_sft_schema_rejects_invalid_pi05_export(tmp_path, mutation, match
         )
 
 
-def test_tabero_tacimg_schema_matches_fixed_base_exactly(tmp_path):
+@pytest.mark.parametrize("method", ["sft_full_lora_tacimg", "sft_full_lora_vision"])
+def test_tabero_image_schema_matches_fixed_base_exactly(tmp_path, method):
     base = tmp_path / "pi05_base"
     base.mkdir()
     base_tensors = {
@@ -377,7 +378,7 @@ def test_tabero_tacimg_schema_matches_fixed_base_exactly(tmp_path):
     save_file(base_tensors, model)
 
     counts = exporter._validate_tabero_sft_export_schema(
-        model, base, method="sft_full_lora_tacimg"
+        model, base, method=method
     )
 
     assert counts == {
@@ -387,7 +388,8 @@ def test_tabero_tacimg_schema_matches_fixed_base_exactly(tmp_path):
     }
 
 
-def test_tabero_tacimg_schema_rejects_extra_tensors(tmp_path):
+@pytest.mark.parametrize("method", ["sft_full_lora_tacimg", "sft_full_lora_vision"])
+def test_tabero_image_schema_rejects_extra_tensors(tmp_path, method):
     base = tmp_path / "pi05_base"
     base.mkdir()
     base_tensors = {"base.weight": torch.ones(2, dtype=torch.bfloat16)}
@@ -403,7 +405,7 @@ def test_tabero_tacimg_schema_rejects_extra_tensors(tmp_path):
 
     with pytest.raises(ValueError, match="extra_count=1"):
         exporter._validate_tabero_sft_export_schema(
-            model, base, method="sft_full_lora_tacimg"
+            model, base, method=method
         )
 
 
@@ -478,6 +480,11 @@ def test_export_metadata_carries_verified_fsdp_provenance_and_hashes(tmp_path):
             "realworld_replayed_task820_firm_pi05_tacimg_sft_2gpu_gb32_mb16_gc_on_ema099_force0001_30k",
         ),
         (
+            "sft_full_lora_vision",
+            "datasets/xiangxin0923/realworld_task820_firm_current",
+            "vision_sft_force0",
+        ),
+        (
             "sft_full_lora_tacfield",
             "datasets/tabero",
             "tabero_pi05_tacfield_no_state_sft_2gpu_b64_gc_on_30k",
@@ -527,7 +534,9 @@ def test_export_metadata_accepts_replay_firm_pi05_precision_contract(
                 f"tactile_prefix_encoder.layer_{index}.weight": torch.ones(
                     1, dtype=torch.bfloat16
                 )
-                for index in range(16)
+                for index in range(
+                    0 if method in {"sft_full_lora_vision", "sft_full_lora_tacimg"} else 16
+                )
             },
         },
         model,
@@ -545,8 +554,10 @@ def test_export_metadata_accepts_replay_firm_pi05_precision_contract(
 
     assert metadata["dataset"] == dataset
     assert metadata["base_model_tensor_count"] == 1
-    assert metadata["extra_tensor_count"] == 16
-    assert metadata["model_tensor_count"] == 17
+    expected_extra = 0 if method in {"sft_full_lora_vision", "sft_full_lora_tacimg"} else 16
+    assert metadata["method"] == method
+    assert metadata["extra_tensor_count"] == expected_extra
+    assert metadata["model_tensor_count"] == 1 + expected_extra
     assert metadata["frozen_parameter_precision"] == "bf16"
     assert metadata["trainable_parameter_precision"] == "fp32"
     assert metadata["compute_precision"] == "bf16_amp"
