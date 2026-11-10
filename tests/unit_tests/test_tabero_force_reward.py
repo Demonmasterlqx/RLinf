@@ -260,6 +260,60 @@ def test_grasp_gate_and_multiple_sources_keep_maximum_valid_force():
     assert term.current_force_bonus.item() == -1
 
 
+@pytest.mark.parametrize("direct", [True, False])
+@pytest.mark.parametrize("mode,expected_bonus", [("normalized", 0.5), ("old", 2 / 3)])
+def test_asymmetric_normal_forces_drive_trajectory_mean_and_terminal_reward(
+    direct, mode, expected_bonus
+):
+    env, terms, term, params = make_term([0], direct=direct, mode=mode)
+    force = torch.zeros(1, 2, 3)
+
+    def reader(env, **kwargs):
+        return force[:, None] if direct else force
+
+    if direct:
+        term._direct_force_reader = reader
+    else:
+        term._force_reader = reader
+    force[0, :, 2] = torch.tensor([-2.0, 8.0])
+    assert term(env, **params).item() == 0
+    assert term.trajectory_mean_force.item() == 10
+    # A tangential-only left contact must still be excluded by the old gate.
+    force[0, 0] = torch.tensor([1.0, 0.0, 0.0])
+    force[0, 1, 2] = 100
+    term(env, **params)
+    assert term.valid_sample_count.item() == 1
+    force[0, 0] = torch.tensor([0.0, 0.0, 3.0])
+    force[0, 1, 2] = -17
+    terms["success"][:] = True
+    reward = term(env, **params) * env.step_dt
+    assert term.valid_sample_count.item() == 2
+    assert term.trajectory_mean_force.item() == 15
+    assert term.current_force_bonus.item() == pytest.approx(expected_bonus)
+    assert reward.item() == pytest.approx(1 + expected_bonus)
+    term.reset()
+    assert term.valid_sample_count.item() == 0
+    assert term.trajectory_mean_force.item() == 0
+
+
+def test_summed_force_keeps_paired_contact_threshold_and_zero_sample_handling():
+    env, _, term, params = make_term([0, 0, 0, 0], direct=True)
+    force = torch.tensor(
+        [
+            [[1.0, 0.0, 0.00004], [0.0, 0.0, 8.0]],
+            [[1.0, 0.0, 0.00006], [0.0, 0.0, 8.0]],
+            [[0.0, 0.0, 0.0], [0.0, 0.0, 8.0]],
+            [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+        ]
+    )
+    term._direct_force_reader = lambda env, **kwargs: force[:, None]
+    term(env, **params)
+    assert term.valid_sample_count.tolist() == [0, 1, 0, 0]
+    torch.testing.assert_close(
+        term.trajectory_mean_force, torch.tensor([0.0, 8.00006, 0.0, 0.0])
+    )
+
+
 @pytest.mark.parametrize(
     "field,value",
     [

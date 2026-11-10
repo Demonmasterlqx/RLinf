@@ -311,10 +311,12 @@ def make_trajectory_force_success_reward_term(manager_term_base_cls: type) -> ty
             both_fingers_contact = torch.all(
                 finger_norms > self._contact_epsilon, dim=1
             )
-            squeeze = 2.0 * torch.minimum(
+            # Keep the existing contact gate while accumulating total normal force.
+            paired_squeeze = 2.0 * torch.minimum(
                 force_lr[:, 0, 2].abs(), force_lr[:, 1, 2].abs()
             )
-            valid = both_fingers_contact & (squeeze > self._contact_epsilon)
+            valid = both_fingers_contact & (paired_squeeze > self._contact_epsilon)
+            squeeze = force_lr[:, 0, 2].abs() + force_lr[:, 1, 2].abs()
             return squeeze, valid
 
         def _update_direct_force_history(self, env: Any) -> None:
