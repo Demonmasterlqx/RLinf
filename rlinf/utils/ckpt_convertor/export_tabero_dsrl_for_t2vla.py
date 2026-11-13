@@ -65,22 +65,26 @@ def build_actor(contract):
         actor.actor_state_encoder = CompactStateEncoder(
             state_dim=c["state_dim"], hidden_dim=c["state_latent_dim"]
         )
-    actor.actor_tactile_encoder = TactileTCNEncoder(
-        input_dim=c["tactile_shape"][1] * 2,
-        hidden_dim=c["tactile_latent_dim"],
-        output_dim=c["tactile_latent_dim"],
-        history_len=8,
-        has_reference_frame=True,
-        diff_from_reference=False,
-    )
+    if c.get("use_tactile", True):
+        actor.actor_tactile_encoder = TactileTCNEncoder(
+            input_dim=c["tactile_shape"][1] * 2,
+            hidden_dim=c["tactile_latent_dim"],
+            output_dim=c["tactile_latent_dim"],
+            history_len=8,
+            has_reference_frame=True,
+            diff_from_reference=False,
+        )
     return actor.to(dtype=getattr(torch, c["dtype"]))
 
 
 def actor_contract(model_config, observation, state):
     """Derive architecture from training and spatial shapes from a captured observation."""
     c = model_config
-    if c.get("use_dsrl") is not True or c.get("dsrl_use_tactile") is not True:
-        raise ValueError("This exporter requires tactile DSRL training.")
+    if c.get("use_dsrl") is not True:
+        raise ValueError("This exporter requires DSRL training.")
+    use_tactile = c.get("dsrl_use_tactile")
+    if type(use_tactile) is not bool:
+        raise ValueError("dsrl_use_tactile must be boolean.")
     count = c["dsrl_num_images"]
     if type(count) is not int or count not in (1, 2, 3):
         raise ValueError("dsrl_num_images must be 1, 2, or 3.")
@@ -91,16 +95,20 @@ def actor_contract(model_config, observation, state):
         if value.ndim != 3 or value.shape[-1] != 3 or value.dtype != torch.uint8:
             raise ValueError(f"{key} must be a raw HWC uint8 image.")
         shapes.append(list(value.shape))
-    tactile = observation["tactile_marker_motion"]
-    expected_tactile = (9, c["dsrl_tactile_input_dim"] // 2, 2)
-    if c["dsrl_tactile_input_dim"] % 2 or tuple(tactile.shape) != expected_tactile:
-        raise ValueError("Tactile observation and training input dimensions disagree.")
+    expected_tactile = ()
+    if use_tactile:
+        tactile = observation["tactile_marker_motion"]
+        expected_tactile = (9, c["dsrl_tactile_input_dim"] // 2, 2)
+        if c["dsrl_tactile_input_dim"] % 2 or tuple(tactile.shape) != expected_tactile:
+            raise ValueError(
+                "Tactile observation and training input dimensions disagree."
+            )
+        if tactile.dtype != torch.float32:
+            raise ValueError("Tactile observation must use float32.")
     use_state = c.get("dsrl_actor_use_state", True)
     if type(use_state) is not bool:
         raise ValueError("dsrl_actor_use_state must be boolean.")
-    checked_keys = [*image_keys, "tactile_marker_motion"]
-    if tactile.dtype != torch.float32:
-        raise ValueError("Tactile observation must use float32.")
+    checked_keys = image_keys + (["tactile_marker_motion"] if use_tactile else [])
     if use_state:
         proprio = observation["state"]
         if (
@@ -116,6 +124,7 @@ def actor_contract(model_config, observation, state):
         raise ValueError("Actor weights must have one supported floating dtype.")
     return {
         "use_state": use_state,
+        "use_tactile": use_tactile,
         "image_keys": image_keys,
         "image_shapes": shapes,
         "state_key": "state",
@@ -124,17 +133,19 @@ def actor_contract(model_config, observation, state):
         "tactile_shape": list(expected_tactile),
         "image_latent_dim": c["dsrl_image_latent_dim"],
         "state_latent_dim": c["dsrl_state_latent_dim"],
-        "tactile_latent_dim": c["dsrl_tactile_latent_dim"],
+        "tactile_latent_dim": c["dsrl_tactile_latent_dim"] if use_tactile else 0,
         "hidden_dims": list(c["dsrl_hidden_dims"]),
         "noise_dim": c["dsrl_action_noise_dim"],
         "horizon": c["action_horizon"],
         "num_steps": c["num_steps"],
         "dtype": str(next(iter(dtypes))).removeprefix("torch."),
         "image_preprocessing": "uint8_bilinear64_align_false_minus_one_one",
-        "tactile_processing": "reference_plus_history8_no_difference_causal_tcn2_kernel3",
-        "feature_order": "state_ordered_images_tactile"
-        if use_state
-        else "ordered_images_tactile",
+        "tactile_processing": "reference_plus_history8_no_difference_causal_tcn2_kernel3"
+        if use_tactile
+        else "none",
+        "feature_order": ("state_" if use_state else "")
+        + "ordered_images"
+        + ("_tactile" if use_tactile else ""),
     }
 
 
@@ -286,7 +297,8 @@ def export_tabero_dsrl_bundle(
     ):
         raise ValueError("Training/base config or noise dimension mismatch.")
     if (
-        model.get("tactile_prefix_dim_in")
+        contract["use_tactile"]
+        and model.get("tactile_prefix_dim_in")
         != contract["tactile_shape"][0] * contract["tactile_shape"][1] * 2
     ):
         raise ValueError("Base VLA and DSRL tactile shapes disagree.")
@@ -294,7 +306,13 @@ def export_tabero_dsrl_bundle(
     norm = base / "assets" / asset / "norm_stats.json"
     norm_hash = checkpoint_sha256(norm)
     hashes[norm] = norm_hash
-    if base_meta.get("norm_stats_sha256") != norm_hash:
+    # Older exports recorded indent=2 serialization before the asset was copied
+    # with different whitespace. Accept only that exact value-preserving form;
+    # the deployment manifest still pins the actual on-disk bytes.
+    serialized_norm_hash = hashlib.sha256(
+        json.dumps(json.loads(norm.read_text()), indent=2).encode()
+    ).hexdigest()
+    if base_meta.get("norm_stats_sha256") not in {norm_hash, serialized_norm_hash}:
         raise ValueError("Base normalization metadata mismatch.")
     training_contract = cfg.actor.model.get("tabero_pi05_checkpoint_contract", {})
     for key, actual in [

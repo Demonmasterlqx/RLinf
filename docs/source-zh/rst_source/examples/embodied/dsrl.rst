@@ -269,10 +269,20 @@ checkpoint 步数。旧 bundle 必须重新导出。训练流程原有的 rollou
 
 导出需要已解析的训练 YAML（例如 TensorBoard 保存的 ``config.yaml``）、
 ``trainable_weights.pt``、基座导出目录，以及一次真实原始观测的 tensor mapping。
-观测使用客户端字段 ``dsrl_raw_image``、``dsrl_raw_wrist_image``（按训练的视图数量）、``state``、
-``tactile_marker_motion``；三视图模型另需 ``tactile_image``。保存的是单次观测，
+观测使用客户端字段 ``dsrl_raw_image``、``dsrl_raw_wrist_image``（按训练的视图数量）；
+三视图模型另需 ``tactile_image``。仅在 ``dsrl_actor_use_state=true`` 时要求 ``state``，
+仅在 ``dsrl_use_tactile=true`` 时要求 ``tactile_marker_motion``。保存的是单次观测，
 没有 batch 维。由观测确认原图尺寸，由训练配置确定网络结构，并与实际权重校验。
 当前触觉编码语义为参考帧加8帧历史、不作参考帧差分、两层因果 TCN；不转换 marker 布局。
+
+TacImage DSRL 使用三路图像时，``dsrl_use_tactile=false`` 只关闭独立 marker TCN，
+不会关闭第三路触觉 RGB。导出和服务端均不创建 marker encoder，也不要求数值力或 marker
+观测。``dsrl_actor_use_state=false`` 时，actor 特征只包含按主相机、腕部、触觉图像顺序
+拼接的编码；缺少任意必需图像都会报错。正式评测前仍需核验客户端触觉历史拼图和训练侧
+的布局、采样时序及缩放方法一致。
+
+导出时，normalization 文件可匹配原始字节哈希，或旧导出器记录的同一 JSON 的
+``indent=2`` 序列化哈希；值不匹配时拒绝导出。生成的 bundle 始终固定实际文件字节哈希。
 
 .. code-block:: bash
 
