@@ -115,6 +115,38 @@ class TaberoTacFieldDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class TaberoTacCoRLDataConfig(TaberoTacFieldDataConfig):
+    """TacField transforms with a raw-pixel contact gate for TacCoRL.
+
+    Gate parameters can be overridden through ``actor.model.openpi_data``.
+    Normalization follows this input transform and uses offline union stats.
+    """
+
+    contact_threshold: float = 1.0
+    contact_min_active: int = 5
+
+    @override
+    def create(
+        self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig
+    ) -> DataConfig:
+        config = super().create(assets_dirs, model_config)
+        return dataclasses.replace(
+            config,
+            data_transforms=dataclasses.replace(
+                config.data_transforms,
+                inputs=[
+                    tabero_policy.TaberoTacCoRLInputs(
+                        model_type=model_config.model_type,
+                        contact_threshold=self.contact_threshold,
+                        contact_min_active=self.contact_min_active,
+                    ),
+                    *config.data_transforms.inputs[1:],
+                ],
+            ),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class TaberoTacForceDataConfig(DataConfigFactory):
     """Tabero two-image plus measured-force TCN-prefix data config."""
 

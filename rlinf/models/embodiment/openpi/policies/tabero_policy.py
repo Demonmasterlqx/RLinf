@@ -153,6 +153,47 @@ class TaberoTacFieldInputs(transforms.DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class TaberoTacCoRLInputs(TaberoTacFieldInputs):
+    """Add a contact gate from raw marker pixels before normalization.
+
+    Frame zero is the reference; contact requires enough displaced markers
+    in any one of the following eight frames. The pixel comparison is strict.
+    """
+
+    contact_threshold: float = 1.0
+    contact_min_active: int = 5
+
+    def __post_init__(self) -> None:
+        if not np.isfinite(self.contact_threshold) or self.contact_threshold < 0:
+            raise ValueError("contact_threshold must be finite and non-negative.")
+        if (
+            isinstance(self.contact_min_active, bool)
+            or not isinstance(self.contact_min_active, int)
+            or self.contact_min_active <= 0
+        ):
+            raise ValueError("contact_min_active must be a positive integer.")
+
+    def __call__(self, data: dict) -> dict:
+        inputs = super().__call__(data)
+        # Cast before subtraction: unsigned pixel coordinates can wrap around.
+        motion = np.asarray(data["tactile_marker_motion"], dtype=np.float64)
+        if motion.shape[0] != 9 or motion.shape[1] == 0 or motion.shape[2] != 2:
+            raise ValueError(
+                "TacCoRL requires tactile_marker_motion shape (9, markers, 2); "
+                f"got {motion.shape}."
+            )
+        displacement = np.linalg.norm(motion[1:] - motion[0], axis=-1)
+        active = np.count_nonzero(displacement > self.contact_threshold, axis=-1)
+        # Keep the scalar as a zero-dimensional ndarray so torch's default
+        # collate treats a batch of contact gates as booleans rather than
+        # interpreting ``np.bool_`` scalars as indices.
+        inputs["tactile_contact"] = np.asarray(
+            np.any(active >= self.contact_min_active), dtype=np.bool_
+        )
+        return inputs
+
+
+@dataclasses.dataclass(frozen=True)
 class TaberoTacForceInputs(transforms.DataTransformFn):
     """Map an 8x6 measured gripper-force history to one TCN prefix stream."""
 

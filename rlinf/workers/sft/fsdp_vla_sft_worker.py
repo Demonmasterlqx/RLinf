@@ -23,6 +23,11 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 
 from rlinf.config import SupportedModel
 from rlinf.data.lerobot_paths import resolve_lerobot_repo_id
+from rlinf.data.openpi_cotrain import (
+    CoTrainConfig,
+    create_cotrain_data_loader,
+    domain_loss_metrics,
+)
 from rlinf.models.embodiment.base_policy import ForwardType
 from rlinf.utils.utils import get_rng_state, set_rng_state
 from rlinf.workers.sft.fsdp_sft_worker import FSDPSftWorker
@@ -31,10 +36,16 @@ from rlinf.workers.sft.fsdp_sft_worker import FSDPSftWorker
 class _OpenPiTactileDataLoader:
     """Expose finite OpenPI epochs and preserve RLinf-local tactile fields."""
 
-    def __init__(self, delegate):
+    def __init__(self, delegate, *, data_config=None, cotrain=None):
         self._delegate = delegate
-        self._data_loader = delegate._data_loader
-        self._pytorch_data_loader = self._resolve_pytorch_data_loader()
+        self._cotrain = cotrain
+        self._cotrain_data_config = data_config
+        if cotrain is None:
+            self._data_loader = delegate._data_loader
+            self._pytorch_data_loader = self._resolve_pytorch_data_loader()
+        else:
+            self._data_loader = delegate
+            self._pytorch_data_loader = delegate
 
     def _resolve_pytorch_data_loader(self):
         return getattr(self._data_loader, "_data_loader", None) or getattr(
@@ -45,6 +56,8 @@ class _OpenPiTactileDataLoader:
     def sampler(self):
         if self._pytorch_data_loader is None:
             return None
+        if self._cotrain is not None:
+            return self._pytorch_data_loader.batch_sampler
         return getattr(self._pytorch_data_loader, "sampler", None)
 
     @property
@@ -67,7 +80,18 @@ class _OpenPiTactileDataLoader:
             dataset.set_epoch(epoch)
 
     def data_config(self):
+        if self._cotrain is not None:
+            return self._cotrain_data_config
         return self._delegate.data_config()
+
+    def resume_signature(self) -> dict[str, Any] | None:
+        """Guard against resuming with a different rank/domain sampling contract."""
+        if self._cotrain is None:
+            return None
+        return {
+            **self.sampler.resume_signature(),
+            "datasets": json.loads(json.dumps(dataclasses.asdict(self._cotrain))),
+        }
 
     def __iter__(self):
         from openpi.models import model as _model
@@ -85,6 +109,13 @@ class _OpenPiTactileDataLoader:
                 # Keep tactile as an explicit payload field. Extra attributes on
                 # OpenPI's Observation do not survive every FSDP argument path.
                 payload["tactile_prefix"] = batch["tactile_prefix"]
+            if "tactile_contact" in batch:
+                object.__setattr__(
+                    observation, "tactile_contact", batch["tactile_contact"]
+                )
+                payload["tactile_contact"] = batch["tactile_contact"]
+            if "domain" in batch:
+                payload["domain"] = batch["domain"]
             yield payload
 
 
@@ -105,7 +136,23 @@ class FSDPVlaSftWorker(FSDPSftWorker):
                 self.cfg, self._world_size, self._rank, data_paths, eval_dataset
             )
         if SupportedModel(self.cfg.actor.model.model_type) in [SupportedModel.OPENPI]:
-            repo_id = resolve_lerobot_repo_id(data_paths)
+            cotrain_value = self.cfg.get("data", {}).get("cotrain")
+            cotrain = (
+                CoTrainConfig.from_mapping(cotrain_value)
+                if cotrain_value is not None and not eval_dataset
+                else None
+            )
+            if cotrain is not None:
+                openpi_data = self.cfg.actor.model.get("openpi_data", {})
+                if not openpi_data or not openpi_data.get("norm_stats_path"):
+                    raise ValueError(
+                        "data.cotrain requires actor.model.openpi_data.norm_stats_path "
+                        "pointing to offline union statistics."
+                    )
+                repo_id = cotrain.real.dataset_path
+                self._logger.info("OpenPI co-training overrides data.train_data_paths.")
+            else:
+                repo_id = resolve_lerobot_repo_id(data_paths)
             if repo_id is None:
                 raise ValueError(
                     "OpenPI SFT requires data.train_data_paths to be set to a local "
@@ -136,10 +183,23 @@ class FSDPVlaSftWorker(FSDPSftWorker):
                 "OpenPI SFT data discrete_state_input=%s",
                 config.model.discrete_state_input,
             )
-            data_loader = openpi_data_loader.create_data_loader(
-                config, framework="pytorch", shuffle=True
-            )
-            data_loader = _OpenPiTactileDataLoader(data_loader)
+            if cotrain is None:
+                data_loader = openpi_data_loader.create_data_loader(
+                    config, framework="pytorch", shuffle=True
+                )
+                data_loader = _OpenPiTactileDataLoader(data_loader)
+            else:
+                torch_loader, data_config = create_cotrain_data_loader(
+                    config,
+                    cotrain,
+                    micro_batch_size=self.cfg.actor.micro_batch_size,
+                    rank=self._rank,
+                    world_size=self._world_size,
+                    seed=self.cfg.actor.seed,
+                )
+                data_loader = _OpenPiTactileDataLoader(
+                    torch_loader, data_config=data_config, cotrain=cotrain
+                )
             return data_loader, data_loader.data_config()
         elif SupportedModel(self.cfg.actor.model.model_type) in [
             SupportedModel.LINGBOTVLA
@@ -171,6 +231,10 @@ class FSDPVlaSftWorker(FSDPSftWorker):
         raise NotImplementedError("eval is not supported for embodied sft right now.")
 
     def get_train_model_output(self, batch: Any) -> tuple[torch.Tensor, dict[str, Any]]:
+        domain = None
+        if isinstance(batch, dict) and "domain" in batch:
+            batch = dict(batch)
+            domain = batch.pop("domain")
         if not getattr(self, "_released_cuda_cache_before_first_forward", False):
             torch.cuda.empty_cache()
             self._released_cuda_cache_before_first_forward = True
@@ -189,28 +253,30 @@ class FSDPVlaSftWorker(FSDPSftWorker):
         step_metrics = {"loss": loss.detach().item()}
         if isinstance(output, dict):
             for key, value in output.items():
-                if key == "loss":
+                if key in {"loss", "per_sample_loss"}:
                     continue
                 if torch.is_tensor(value):
                     if value.numel() == 1:
                         step_metrics[key] = value.detach().item()
                 elif isinstance(value, (float, int)):
                     step_metrics[key] = value
+        step_metrics.update(domain_loss_metrics(output, domain))
         return loss, step_metrics
 
     def _save_openpi_data_state(self, save_path: str) -> None:
+        state: dict[str, Any] = {
+            "data_epoch": self._data_epoch,
+            "data_iter_offset": self._data_iter_offset,
+        }
+        signature = self.data_loader.resume_signature()
+        if signature is not None:
+            state["cotrain"] = signature
         with open(
             os.path.join(save_path, "data_state.json"),
             "w",
             encoding="utf-8",
         ) as handle:
-            json.dump(
-                {
-                    "data_epoch": self._data_epoch,
-                    "data_iter_offset": self._data_iter_offset,
-                },
-                handle,
-            )
+            json.dump(state, handle)
 
     def _load_openpi_data_state(self, load_path: str) -> None:
         state_path = os.path.join(load_path, "data_state.json")
@@ -220,6 +286,11 @@ class FSDPVlaSftWorker(FSDPSftWorker):
             )
         with open(state_path, encoding="utf-8") as handle:
             state = json.load(handle)
+        if state.get("cotrain") != self.data_loader.resume_signature():
+            raise ValueError(
+                "OpenPI co-training stream differs from the checkpoint "
+                "(datasets, seed, world size, batch size or domain split)."
+            )
         self._data_epoch = int(state["data_epoch"])
         self._data_iter_offset = int(state["data_iter_offset"])
         if self._data_epoch < 0 or self._data_iter_offset < 0:

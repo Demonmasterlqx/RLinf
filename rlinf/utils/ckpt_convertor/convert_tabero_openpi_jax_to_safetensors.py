@@ -134,6 +134,85 @@ def convert_tactile_prefix_encoder_params(params: dict) -> dict[str, torch.Tenso
     return converted
 
 
+def convert_taccorl_params(params: dict) -> dict[str, torch.Tensor]:
+    """Convert JAX TacCoRL marker-token and cross-attention parameters."""
+    converted: dict[str, torch.Tensor] = {}
+    encoder = params.get("marker_token_encoder")
+    if encoder is not None:
+        for block_name in sorted(encoder.get("blocks", {})):
+            block_idx = int(block_name.split("_")[-1])
+            block = encoder["blocks"][block_name]
+            for kernel_name in sorted(block.get("kernels", {})):
+                kernel_idx = int(kernel_name.split("_")[-1])
+                linear = block["kernels"][kernel_name]
+                prefix = f"marker_token_encoder.blocks.{block_idx}.kernels.{kernel_idx}"
+                converted[f"{prefix}.weight"] = _linear_weight(
+                    linear["kernel"], linear["bias"], prefix
+                )
+                converted[f"{prefix}.bias"] = _linear_bias(linear["bias"])
+            if block.get("residual_proj") is not None:
+                linear = block["residual_proj"]
+                prefix = f"marker_token_encoder.blocks.{block_idx}.residual_proj"
+                converted[f"{prefix}.weight"] = _linear_weight(
+                    linear["kernel"], linear["bias"], prefix
+                )
+                converted[f"{prefix}.bias"] = _linear_bias(linear["bias"])
+        for name in ("prefix_proj", "suffix_proj"):
+            linear = encoder[name]
+            prefix = f"marker_token_encoder.{name}"
+            converted[f"{prefix}.weight"] = _linear_weight(
+                linear["kernel"], linear["bias"], prefix
+            )
+            converted[f"{prefix}.bias"] = _linear_bias(linear["bias"])
+        converted["marker_token_encoder.prefix_token_embedding"] = torch.from_numpy(
+            np.asarray(_as_array(encoder["prefix_token_embedding"]))
+        )
+        converted["marker_token_encoder.suffix_token_embedding"] = torch.from_numpy(
+            np.asarray(_as_array(encoder["suffix_token_embedding"]))
+        )
+
+    cross_attn = params.get("tactile_cross_attn")
+    if cross_attn is not None:
+        norm = cross_attn.get("norm", {})
+        scale = norm.get("scale", norm.get("weight"))
+        if scale is None:
+            raise KeyError("tactile_cross_attn.norm.scale is missing")
+        converted["tactile_cross_attn.norm.weight"] = torch.from_numpy(
+            np.asarray(_as_array(scale))
+        )
+        if "bias" in norm:
+            converted["tactile_cross_attn.norm.bias"] = _linear_bias(norm["bias"])
+        for name in ("query", "key", "value", "out"):
+            linear = cross_attn[name]
+            prefix = f"tactile_cross_attn.{name}"
+            converted[f"{prefix}.weight"] = _linear_weight(
+                linear["kernel"], linear["bias"], prefix
+            )
+            converted[f"{prefix}.bias"] = _linear_bias(linear["bias"])
+        converted["tactile_cross_attn.alpha"] = torch.from_numpy(
+            np.asarray(_as_array(cross_attn["alpha"])).reshape(1)
+        )
+    return converted
+
+
+def convert_marker_token_encoder_params(params: dict) -> dict[str, torch.Tensor]:
+    """Convert only the JAX ``marker_token_encoder`` subtree."""
+    return {
+        key: value
+        for key, value in convert_taccorl_params({"marker_token_encoder": params}).items()
+        if key.startswith("marker_token_encoder.")
+    }
+
+
+def convert_tactile_cross_attn_params(params: dict) -> dict[str, torch.Tensor]:
+    """Convert only the JAX ``tactile_cross_attn`` subtree."""
+    return {
+        key: value
+        for key, value in convert_taccorl_params({"tactile_cross_attn": params}).items()
+        if key.startswith("tactile_cross_attn.")
+    }
+
+
 def _projection_params(params: dict, model_config: OpenPi0Config) -> dict[str, torch.Tensor]:
     keys = (
         ["action_in_proj", "action_out_proj", "time_mlp_in", "time_mlp_out"]
@@ -249,6 +328,7 @@ def convert_pi0_checkpoint(
     tactile_params = convert_tactile_prefix_encoder_params(
         initial_params["projection_params"]
     )
+    tactile_params.update(convert_taccorl_params(initial_params["projection_params"]))
 
     model = OpenPi0ForRLActionPrediction(model_config)
     all_params = {
@@ -261,7 +341,7 @@ def convert_pi0_checkpoint(
     critical_missing = [
         key
         for key in missing_keys
-        if key.startswith("tactile_prefix_encoder")
+        if key.startswith(("tactile_prefix_encoder", "marker_token_encoder", "tactile_cross_attn"))
         or key
         in {
             "action_in_proj.weight",

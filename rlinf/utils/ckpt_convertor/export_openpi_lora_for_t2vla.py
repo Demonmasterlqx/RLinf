@@ -20,6 +20,12 @@ either an RLinf FSDP full-weights checkpoint or a lightweight
 ``trainable_weights.pt`` checkpoint, saves the trained LoRA adapter for
 inspection, merges the adapter back into the selected submodule, drops RL-only
 heads, and writes T2-VLA-compatible safetensors plus OpenPI assets.
+
+TacCoRL SFT exports include the configured marker encoder and cross-attention
+state in BF16. Their expected keys and count come from the source model. For
+these methods, the YAML's trainable_checkpoint_metadata.deployment_config_name
+selects the T2-VLA serving config even when an older sidecar saved a training
+config name; the original checkpoint metadata remains in the bundle.
 """
 
 from __future__ import annotations
@@ -63,12 +69,29 @@ DROP_EXACT_KEYS = {
 PIRL_ACTION_EXPERT_LORA_TENSOR_COUNT = 126
 BUNDLE_FORMAT = "tabero_rlinf_openpi_lora_bundle"
 BUNDLE_FORMAT_VERSION = 1
+TACCORL_SFT_METHODS = {
+    "sft_full_lora_taccorl",
+    "sft_full_lora_taccorl_cotrain",
+}
+TACCORL_EXTRA_PREFIXES = ("marker_token_encoder.", "tactile_cross_attn.")
 TABERO_SFT_METHODS = {
     "sft_full_lora_vision",
     "sft_full_lora_tacfield",
     "sft_full_lora_tacforce_tcn",
     "sft_full_lora_tacimg",
+    *TACCORL_SFT_METHODS,
 }
+
+
+def _validate_taccorl_export_method(method: str | None, openpi_cfg: Mapping) -> None:
+    """Require TacCoRL architecture and SFT provenance to agree in both directions."""
+    is_taccorl = openpi_cfg.get("tactile_fusion", "none") == "taccorl"
+    if (method in TACCORL_SFT_METHODS) != is_taccorl:
+        raise ValueError(
+            "TacCoRL export methods require tactile_fusion == 'taccorl', and "
+            "TacCoRL models require a TacCoRL SFT method; "
+            f"method={method!r}, tactile_fusion={openpi_cfg.get('tactile_fusion')!r}"
+        )
 
 
 def _is_action_expert_lora_weight(key: str) -> bool:
@@ -589,14 +612,43 @@ def _validate_tabero_sft_export_schema(
     base_model_path: str | Path,
     *,
     method: str,
+    source_model: torch.nn.Module | None = None,
+    openpi_cfg: Mapping | None = None,
 ) -> dict[str, int]:
     """Validate the merged deployment schema for a Tabero SFT method."""
+    openpi_cfg = openpi_cfg or {}
+    _validate_taccorl_export_method(method, openpi_cfg)
+    expected_extra_state = None
     if method in {"sft_full_lora_vision", "sft_full_lora_tacimg"}:
         expected_extra_tensor_count = 0
         allowed_extra_prefixes: tuple[str, ...] = ()
     elif method in {"sft_full_lora_tacfield", "sft_full_lora_tacforce_tcn"}:
         expected_extra_tensor_count = 16
         allowed_extra_prefixes = ("tactile_prefix_encoder.",)
+    elif method in TACCORL_SFT_METHODS:
+        if source_model is None:
+            raise ValueError("TacCoRL SFT schema validation requires the source model.")
+        allowed_extra_prefixes = TACCORL_EXTRA_PREFIXES
+        # Derive the exact schema from the configured model, never from the file
+        # being validated. Token encoders and optional cross-attention may vary.
+        expected_extra_state = {
+            key: value
+            for key, value in source_model.state_dict().items()
+            if key.startswith(allowed_extra_prefixes)
+        }
+        required_prefixes = (
+            allowed_extra_prefixes
+            if openpi_cfg.get("tactile_prefix_cross_attn", True)
+            else allowed_extra_prefixes[:1]
+        )
+        if any(
+            not any(key.startswith(prefix) for key in expected_extra_state)
+            for prefix in required_prefixes
+        ):
+            raise ValueError(
+                "TacCoRL source model is missing required tactile modules."
+            )
+        expected_extra_tensor_count = len(expected_extra_state)
     else:
         raise ValueError(f"Unsupported Tabero SFT export method: {method!r}")
 
@@ -615,6 +667,10 @@ def _validate_tabero_sft_export_schema(
             for key in extra
             if not any(key.startswith(prefix) for prefix in allowed_extra_prefixes)
         )
+        missing_extra = []
+        if expected_extra_state is not None:
+            missing_extra = sorted(set(expected_extra_state) - set(extra))
+            invalid_extra = sorted(set(extra) - set(expected_extra_state))
         shape_mismatches = sorted(
             (
                 key,
@@ -624,22 +680,32 @@ def _validate_tabero_sft_export_schema(
             for key in model_keys & base_keys
             if model.get_slice(key).get_shape() != base.get_slice(key).get_shape()
         )
+        if expected_extra_state is not None:
+            shape_mismatches.extend(
+                (key, tuple(model.get_slice(key).get_shape()), tuple(value.shape))
+                for key, value in expected_extra_state.items()
+                if key in model_keys
+                and tuple(model.get_slice(key).get_shape()) != tuple(value.shape)
+            )
         dtypes = {str(model.get_slice(key).get_dtype()) for key in model_keys}
     if (
         missing
         or invalid_extra
+        or missing_extra
         or shape_mismatches
         or len(extra) != expected_extra_tensor_count
         or dtypes != {"BF16"}
     ):
         raise ValueError(
             "Tabero SFT export must preserve every fixed-base key and shape, "
-            f"contain exactly {expected_extra_tensor_count} method-specific extra tensors, "
+            f"contain exactly {expected_extra_tensor_count} "
+            "method-specific extra tensors, "
             "and contain only BF16 tensors; "
             f"method={method!r}, "
             f"base_count={len(base_keys)}, model_count={len(model_keys)}, "
             f"extra_count={len(extra)}, missing={missing[:10]}, "
             f"invalid_extra={invalid_extra[:10]}, "
+            f"missing_extra={missing_extra[:10]}, "
             f"shape_mismatches={shape_mismatches[:10]}, dtypes={sorted(dtypes)}"
         )
     return {
@@ -898,6 +964,7 @@ def _build_lora_bundle_manifest(
     norm_stats_path: Path,
     norm_asset_id: str,
     final_model_path: Path,
+    deployment_config_name: str | None = None,
 ) -> dict:
     expected_targets = (
         {"paligemma", "action_expert"} if lora_target == "both" else {lora_target}
@@ -919,8 +986,11 @@ def _build_lora_bundle_manifest(
     base_checkpoint = _checkpoint_path(str(model_cfg.model_path))
     base_config_path = base_checkpoint.parent / "config.json"
     openpi_cfg = model_cfg.get("openpi", {})
-    config_name = checkpoint_meta.get("deployment_config_name") or openpi_cfg.get(
-        "config_name"
+    _validate_taccorl_export_method(checkpoint_meta.get("method"), openpi_cfg)
+    config_name = (
+        deployment_config_name
+        or checkpoint_meta.get("deployment_config_name")
+        or openpi_cfg.get("config_name")
     )
     if not isinstance(config_name, str) or not config_name:
         raise ValueError(
@@ -930,7 +1000,68 @@ def _build_lora_bundle_manifest(
 
     extra_contract = _safetensors_contract(extra_path)
     final_contract = _safetensors_contract(final_model_path)
+    if checkpoint_meta.get("method") in TACCORL_SFT_METHODS:
+        required_modules = tuple(
+            prefix.rstrip(".") for prefix in TACCORL_EXTRA_PREFIXES
+        )
+        if not set(required_modules).issubset(canonical_extra_prefixes):
+            raise ValueError(
+                "TacCoRL bundle canonical_prefixes must include both tactile modules."
+            )
+        required_prefixes = (
+            TACCORL_EXTRA_PREFIXES
+            if openpi_cfg.get("tactile_prefix_cross_attn", True)
+            else TACCORL_EXTRA_PREFIXES[:1]
+        )
+        expected_tactile_keys = {
+            entry["key"]
+            for entry in final_contract["schema"]
+            if entry["key"].startswith(TACCORL_EXTRA_PREFIXES)
+        }
+        if (
+            any(
+                not any(key.startswith(prefix) for key in extra_key_map)
+                for prefix in required_prefixes
+            )
+            or not expected_tactile_keys.issubset(extra_key_map)
+            or set(extra_key_map)
+            != {entry["key"] for entry in extra_contract["schema"]}
+        ):
+            raise ValueError(
+                "TacCoRL bundle extra_trainable must contain its tactile weights."
+            )
     relative_norm_path = norm_stats_path.relative_to(bundle_root).as_posix()
+    policy_contract = {
+        "config_name": config_name,
+        "norm_asset_id": norm_asset_id,
+        "norm_stats_path": relative_norm_path,
+        "norm_stats_sha256": _sha256_file(norm_stats_path),
+        "dataset": checkpoint_meta.get("dataset"),
+        "model_family": checkpoint_meta.get("model_family"),
+        "action_horizon": checkpoint_meta.get(
+            "action_horizon", openpi_cfg.get("action_horizon")
+        ),
+        "effective_action_dim": checkpoint_meta.get(
+            "effective_action_dim", openpi_cfg.get("effective_action_dim")
+        ),
+        "state_dim": checkpoint_meta.get("state_dim", 7),
+        "tactile_prefix_dim_in": checkpoint_meta.get(
+            "tactile_prefix_dim_in", openpi_cfg.get("tactile_prefix_dim_in")
+        ),
+        "tactile_prefix_history": checkpoint_meta.get(
+            "tactile_prefix_history", openpi_cfg.get("tactile_prefix_history")
+        ),
+        "gripper_coordinate": checkpoint_meta.get("gripper_coordinate"),
+    }
+    if openpi_cfg.get("tactile_fusion", "none") == "taccorl":
+        policy_contract.update(
+            tactile_fusion="taccorl",
+            tactile_prefix_num_tokens=openpi_cfg.get("tactile_prefix_num_tokens", 8),
+            tactile_suffix_num_tokens=openpi_cfg.get("tactile_suffix_num_tokens", 8),
+            tactile_prefix_cross_attn=openpi_cfg.get("tactile_prefix_cross_attn", True),
+            tactile_cross_attn_heads=openpi_cfg.get("tactile_cross_attn_heads", 8),
+            image_noise_std=openpi_cfg.get("image_noise_std", 0.0),
+        )
     return {
         "format": BUNDLE_FORMAT,
         "format_version": BUNDLE_FORMAT_VERSION,
@@ -946,28 +1077,7 @@ def _build_lora_bundle_manifest(
                 _sha256_file(base_config_path) if base_config_path.is_file() else None
             ),
         },
-        "policy_contract": {
-            "config_name": config_name,
-            "norm_asset_id": norm_asset_id,
-            "norm_stats_path": relative_norm_path,
-            "norm_stats_sha256": _sha256_file(norm_stats_path),
-            "dataset": checkpoint_meta.get("dataset"),
-            "model_family": checkpoint_meta.get("model_family"),
-            "action_horizon": checkpoint_meta.get(
-                "action_horizon", openpi_cfg.get("action_horizon")
-            ),
-            "effective_action_dim": checkpoint_meta.get(
-                "effective_action_dim", openpi_cfg.get("effective_action_dim")
-            ),
-            "state_dim": checkpoint_meta.get("state_dim", 7),
-            "tactile_prefix_dim_in": checkpoint_meta.get(
-                "tactile_prefix_dim_in", openpi_cfg.get("tactile_prefix_dim_in")
-            ),
-            "tactile_prefix_history": checkpoint_meta.get(
-                "tactile_prefix_history", openpi_cfg.get("tactile_prefix_history")
-            ),
-            "gripper_coordinate": checkpoint_meta.get("gripper_coordinate"),
-        },
+        "policy_contract": policy_contract,
         "checkpoint": {
             "source": export_metadata.get("source_ckpt"),
             "sha256": export_metadata.get("source_ckpt_sha256"),
@@ -1019,6 +1129,16 @@ def export_checkpoint(
 
     checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=True)
     checkpoint_meta = _checkpoint_metadata(checkpoint)
+    openpi_cfg = model_cfg.get("openpi", {})
+    _validate_taccorl_export_method(checkpoint_meta.get("method"), openpi_cfg)
+    deployment_config_name = None
+    if checkpoint_meta.get("method") in TACCORL_SFT_METHODS:
+        # Deployment is an export target. Allow the supplied YAML to correct an
+        # older sidecar's serving name without rewriting checkpoint provenance.
+        deployment_config_name = OmegaConf.select(
+            OmegaConf.load(train_config_path),
+            "actor.fsdp_config.trainable_checkpoint_metadata.deployment_config_name",
+        )
     if model_cfg.get("deployment_config_name") or (
         checkpoint_meta.get("task_domain") == "realworld"
         and checkpoint_meta.get("method") == "pirl"
@@ -1102,9 +1222,13 @@ def export_checkpoint(
             model,
             str(model_path),
             base_model_path=str(model_cfg.model_path),
-            allowed_extra_prefixes=("tactile_prefix_encoder.",)
-            if is_tabero_sft
-            else (),
+            allowed_extra_prefixes=(
+                TACCORL_EXTRA_PREFIXES
+                if checkpoint_meta.get("method") in TACCORL_SFT_METHODS
+                else ("tactile_prefix_encoder.",)
+                if is_tabero_sft
+                else ()
+            ),
             output_dtype=torch.bfloat16 if is_tabero_sft else None,
         )
         if is_tabero_sft:
@@ -1112,6 +1236,8 @@ def export_checkpoint(
                 model_path,
                 str(model_cfg.model_path),
                 method=checkpoint_meta["method"],
+                source_model=model,
+                openpi_cfg=openpi_cfg,
             )
             reference_model_path = model_cfg.get("export_reference_model_path")
             if reference_model_path is not None:
@@ -1187,6 +1313,7 @@ def export_checkpoint(
                 norm_stats_path=bundle_norm_path,
                 norm_asset_id=norm_asset_id,
                 final_model_path=model_path,
+                deployment_config_name=deployment_config_name,
             )
             with (bundle_staging / "manifest.json").open(
                 "w", encoding="utf-8"
