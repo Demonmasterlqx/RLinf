@@ -40,8 +40,7 @@ runner:
   weight_sync_interval: 1
 algorithm:
   multi_task:
-    # PPO multi-task validation currently rejects SFT co-training.  This recipe
-    # has one Coca-Cola task, so the SFT anchor runs on the single-task path.
+    # Single Coca-Cola task; use pirl_multitask for shared multi-task SFT.
     enabled: false
     ema_decay: 0.9
     weight_min: 0.5

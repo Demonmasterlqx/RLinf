@@ -14,6 +14,8 @@
 
 """PPO-specific validation and reductions; shared task helpers remain exported."""
 
+import math
+
 import torch
 from omegaconf import OmegaConf
 
@@ -53,11 +55,27 @@ def validate_config(cfg) -> None:
         "runner.use_training_pipeline",
         "runner.only_eval",
         "actor.model.openpi.use_dsrl",
-        "actor.enable_sft_co_train",
         "reward.use_reward_model",
     ):
         if OmegaConf.select(cfg, key, default=False):
             raise ValueError(f"PPO multi_task does not support {key}.")
+    if OmegaConf.select(cfg, "actor.enable_sft_co_train", default=False):
+        for key in ("actor.sft_data_path", "actor.config_name"):
+            value = OmegaConf.select(cfg, key)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"PPO SFT co-training requires {key}.")
+        if cfg.actor.config_name != OmegaConf.select(
+            cfg, "actor.model.openpi.config_name"
+        ):
+            raise ValueError("SFT and RL must use the same OpenPI config_name.")
+        weight = cfg.actor.get("sft_loss_weight", 0.1)
+        if (
+            isinstance(weight, bool)
+            or not isinstance(weight, (int, float))
+            or not math.isfinite(weight)
+            or weight <= 0
+        ):
+            raise ValueError("actor.sft_loss_weight must be finite and positive.")
     if (
         OmegaConf.select(cfg, "algorithm.tabero_ppo_transition_boundary_semantics")
         is None

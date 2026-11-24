@@ -1,0 +1,34 @@
+# @package _global_
+# Shared real-data SFT anchor with independent, dynamically weighted PPO tasks.
+defaults:
+  - pirl
+  - _self_
+
+runner:
+  logger:
+    experiment_name: 2026-11-23-taccorl-pirl-multitask
+
+algorithm:
+  multi_task:
+    enabled: true
+
+env:
+  train:
+    multi_task:
+      tasks:
+        - name: vitasoy
+          init_params:
+            target_object: target_object_1
+            task_description: pick up the Vitasoy and put it into the basket
+            success:
+              normalize_effort_reward:
+                min_effort: 2.0
+                max_effort: 36.0
+        - name: coca_cola
+          init_params:
+            target_object: target_object_2
+            task_description: Pick up the Coca-Cola and put it into the basket
+            success:
+              normalize_effort_reward:
+                min_effort: 4.0
+                max_effort: 12.0

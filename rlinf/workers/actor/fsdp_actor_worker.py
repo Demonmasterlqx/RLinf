@@ -13,8 +13,10 @@
 # limitations under the License.
 
 import dataclasses
+import json
 import time
 from functools import partial
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -1141,7 +1143,23 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             self.offload_param_and_grad()
             self.offload_optimizer()
 
-    def load_checkpoint(self, load_base_path: str) -> None:
+    def load_checkpoint(self, load_base_path: str) -> dict | None:
+        joint_state_path = Path(load_base_path) / "sft_training_state.json"
+        joint_state = None
+        if joint_state_path.exists():
+            if not (self.multi_task_enabled and self.enable_sft_co_train):
+                raise ValueError(
+                    "Multi-task SFT continuation cannot disable co-training."
+                )
+            joint_state = json.loads(joint_state_path.read_text())
+            if joint_state["contract"] != self._sft_resume_contract:
+                raise ValueError(
+                    "Multi-task SFT training contract differs from the checkpoint."
+                )
+        elif self.multi_task_enabled and self.enable_sft_co_train:
+            raise FileNotFoundError(
+                f"Multi-task SFT checkpoint is missing {joint_state_path.name}."
+            )
         expected_semantics = self._tabero_ppo_transition_boundary_semantics
         if expected_semantics is not None:
             validate_tabero_ppo_checkpoint_boundary_metadata(
@@ -1153,6 +1171,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             from rlinf.workers.sft.fsdp_vla_sft_worker import FSDPVlaSftWorker
 
             FSDPVlaSftWorker._load_openpi_data_state(self, load_base_path)
+        if joint_state is not None:
+            return {"multi_task_step": joint_state["step"]}
 
     def save_checkpoint(self, save_path: str, step: int = 0) -> None:
         super().save_checkpoint(save_path, step)
@@ -1161,6 +1181,12 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
             if self._rank == 0:
                 FSDPVlaSftWorker._save_openpi_data_state(self, save_path)
+                if self.multi_task_enabled:
+                    (Path(save_path) / "sft_training_state.json").write_text(
+                        json.dumps(
+                            {"step": step, "contract": self._sft_resume_contract}
+                        )
+                    )
             torch.distributed.barrier()
 
     def model_provider_func(self) -> nn.Module:
@@ -1643,6 +1669,21 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             self._data_epoch = 0
             self._data_iter_offset = 0
             self.sft_loss_weight = self.cfg.actor.get("sft_loss_weight", 0.1)
+            self._sft_resume_contract = {
+                "repo_id": repo_id,
+                "config_name": training_config_name,
+                "data_kwargs": OmegaConf.to_container(
+                    self.cfg.actor.model.openpi_data, resolve=True
+                )
+                if self.cfg.actor.model.get("openpi_data") is not None
+                else None,
+                "discrete_state_input": data_loader_config.model.discrete_state_input,
+                "world_size": self._world_size,
+                "micro_batch_size": self.cfg.actor.micro_batch_size,
+                "global_batch_size": self.cfg.actor.get("global_batch_size"),
+                "sft_loss_weight": self.sft_loss_weight,
+                "seed": data_loader_config.seed,
+            }
         else:
             raise KeyError(
                 f"not support such model type {self.cfg.actor.model.model_type} for SFT right now."
@@ -1695,7 +1736,10 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         else:
             sft_loss = sft_output
         metrics_data["sft_loss"] = sft_loss.detach().item()
-        total_loss = loss + self.sft_loss_weight * sft_loss
+        weighted_sft_loss = self.sft_loss_weight * sft_loss
+        metrics_data["sft_weighted_loss"] = weighted_sft_loss.detach().item()
+        metrics_data["sft_loss_weight"] = self.sft_loss_weight
+        total_loss = loss + weighted_sft_loss
         loss = total_loss
 
         metrics_data["loss_ratio"] = (

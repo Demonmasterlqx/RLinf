@@ -40,6 +40,7 @@ from rlinf.utils.ppo_multi_task import (
     enabled,
     task_env_cfg,
     task_list,
+    validate_config,
     weighted_reduce,
 )
 
@@ -825,10 +826,13 @@ def test_actor_sft_co_train_accepts_taccorl_loss_dict():
     assert metrics["sft_loss"] == pytest.approx(3.0)
     assert metrics["sft_action_loss"] == pytest.approx(2.0)
     assert metrics["sft_tactile_loss"] == pytest.approx(4.0)
+    assert metrics["sft_weighted_loss"] == pytest.approx(1.5)
+    assert metrics["sft_loss_weight"] == pytest.approx(0.5)
 
 
+@pytest.mark.parametrize("multi_task", [False, True])
 def test_actor_checkpoint_restores_sft_cursor_without_consuming_model_rng(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, multi_task
 ):
     from rlinf.hybrid_engines.fsdp.fsdp_model_manager import FSDPModelManager
     from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
@@ -853,7 +857,9 @@ def test_actor_checkpoint_restores_sft_cursor_without_consuming_model_rng(
     monkeypatch.setattr(dist, "barrier", lambda: None)
     actor = object.__new__(EmbodiedFSDPActor)
     actor._rank = 0
+    actor.multi_task_enabled = multi_task
     actor.enable_sft_co_train = True
+    actor._sft_resume_contract = {"repo_id": "synthetic", "sft_loss_weight": 0.5}
     actor._tabero_ppo_transition_boundary_semantics = None
     actor.data_loader = Loader()
     actor.data_iter = iter(actor.data_loader)
@@ -872,11 +878,23 @@ def test_actor_checkpoint_restores_sft_cursor_without_consuming_model_rng(
     actor._train_sft_epoch({}, torch.tensor(1.0, requires_grad=True))
     rng = torch.get_rng_state()
 
-    actor.load_checkpoint(str(tmp_path))
+    receipt = actor.load_checkpoint(str(tmp_path))
 
     assert torch.equal(torch.get_rng_state(), rng)
     assert actor._data_iter_offset == 2
     assert next(actor.data_iter)[1].item() == 2
+    if multi_task:
+        assert receipt == {"multi_task_step": 2}
+        actor._sft_resume_contract["repo_id"] = "different"
+        with pytest.raises(ValueError, match="contract differs"):
+            actor.load_checkpoint(str(tmp_path))
+        actor.enable_sft_co_train = False
+        with pytest.raises(ValueError, match="cannot disable"):
+            actor.load_checkpoint(str(tmp_path))
+        actor.enable_sft_co_train = True
+        (tmp_path / "sft_training_state.json").unlink()
+        with pytest.raises(FileNotFoundError, match="sft_training_state"):
+            actor.load_checkpoint(str(tmp_path))
 
 
 def test_actor_sft_loader_uses_actor_micro_batch(monkeypatch):
@@ -896,6 +914,7 @@ def test_actor_sft_loader_uses_actor_micro_batch(monkeypatch):
     class DataConfig:
         model: ModelConfig
         batch_size: int
+        seed: int = 42
 
     get_config = MagicMock(
         side_effect=lambda *args, **kwargs: DataConfig(
@@ -926,3 +945,244 @@ def test_actor_sft_loader_uses_actor_micro_batch(monkeypatch):
     resolved = create_loader.call_args.args[0]
     assert resolved.batch_size == 2
     assert resolved.model.discrete_state_input is False
+
+
+@pytest.fixture
+def multitask_sft_cfg():
+    return OmegaConf.create(
+        {
+            "runner": {"task_type": "embodied", "val_check_interval": -1},
+            "actor": {
+                "training_backend": "fsdp",
+                "enable_sft_co_train": True,
+                "sft_data_path": "synthetic/demo",
+                "config_name": "synthetic",
+                "sft_loss_weight": 0.7,
+                "global_batch_size": 4,
+                "model": {
+                    "model_type": "openpi",
+                    "action_dim": 1,
+                    "openpi": {"config_name": "synthetic"},
+                },
+            },
+            "algorithm": {
+                "multi_task": {"enabled": True},
+                "adv_type": "gae",
+                "loss_type": "actor_critic",
+                "reward_type": "chunk_level",
+                "logprob_type": "chunk_level",
+                "clip_ratio_high": 0.2,
+                "clip_ratio_low": 0.2,
+                "value_clip": 0.2,
+                "huber_delta": 1.0,
+                "entropy_bonus": 0.005,
+                "tabero_ppo_transition_boundary_semantics": "realworld_terminal_prefix",
+            },
+            "rollout": {"pipeline_stage_num": 1},
+            "env": {
+                "train": {
+                    "env_type": "isaaclab",
+                    "auto_reset": False,
+                    "ignore_terminations": False,
+                    "max_episode_steps": 4,
+                    "init_params": {
+                        "id": "Isaac-RealWorld-GentleGrasp-XarmUmi-Hybrid-Tactile-v0"
+                    },
+                    "multi_task": {
+                        "tasks": [
+                            {"name": "a", "init_params": {"target_object": "a"}},
+                            {"name": "b", "init_params": {"target_object": "b"}},
+                        ]
+                    },
+                }
+            },
+        }
+    )
+
+
+@pytest.mark.parametrize("enabled_sft", [False, True])
+def test_multitask_accepts_optional_sft(multitask_sft_cfg, enabled_sft):
+    multitask_sft_cfg.actor.enable_sft_co_train = enabled_sft
+    validate_config(multitask_sft_cfg)
+
+
+@pytest.mark.parametrize(
+    "field,value,message",
+    [
+        ("sft_data_path", "", "sft_data_path"),
+        ("config_name", "other", "same OpenPI"),
+        ("sft_loss_weight", -0.1, "finite and positive"),
+        ("sft_loss_weight", float("nan"), "finite and positive"),
+    ],
+)
+def test_multitask_rejects_invalid_sft_contract(
+    multitask_sft_cfg, field, value, message
+):
+    multitask_sft_cfg.actor[field] = value
+    with pytest.raises(ValueError, match=message):
+        validate_config(multitask_sft_cfg)
+
+
+class _JointPolicy(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.parameter = torch.nn.Parameter(torch.tensor(0.01))
+
+    def forward(self, *, data=None, forward_inputs=None, **kwargs):
+        if data is not None:
+            return {"loss": (self.parameter * data[1]).square().mean()}
+        x = forward_inputs["action"]
+        return {
+            "logprobs": (self.parameter * x).reshape(-1, 1, 1),
+            "values": (self.parameter * x).reshape(-1),
+            "entropy": (self.parameter * x + 2).reshape(-1, 1),
+        }
+
+
+def _joint_actor_gradient(rank, rendezvous, output_dir, cfg, micro_size, empty_rank):
+    from types import SimpleNamespace
+
+    from torch.nn.parallel import DistributedDataParallel
+
+    from rlinf.scheduler import Worker
+    from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
+
+    dist.init_process_group(
+        "gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2
+    )
+    try:
+        Worker.torch_platform = SimpleNamespace(current_device=lambda: "cpu")
+        actor = object.__new__(EmbodiedFSDPActor)
+        actor.cfg = cfg
+        actor._world_size = 2
+        actor.multi_task_enabled = True
+        actor.version = 0
+        actor.set_task_weights([0.5, 2.0], 1)
+        actor.device = "cpu"
+        actor.amp_context = nullcontext()
+        actor.before_micro_batch = lambda *args, **kwargs: nullcontext()
+        actor._tabero_ppo_transition_boundary_semantics = "realworld_terminal_prefix"
+        actor.optimizer_steps = 1
+        actor.critic_warmup_steps = 0
+        actor.enable_sft_co_train = True
+        actor.sft_loss_weight = 0.7
+        actor._data_iter_offset = 0
+        actor.gradient_accumulation = 2 // micro_size
+        actor.grad_scaler = SimpleNamespace(scale=lambda loss: loss)
+        actor.logger = MagicMock()
+        actor.model = DistributedDataParallel(_JointPolicy())
+        x = torch.arange(1.0, 5.0)[rank * 2 : rank * 2 + 2]
+        actor.data_iter = iter((None, part) for part in x.flip(0).split(micro_size))
+        batch = {
+            "task_indices": torch.tensor([0, 1]),
+            "advantages": torch.ones(2, 1),
+            "prev_logprobs": torch.zeros(2, 1, 1),
+            "returns": torch.ones(2, 1),
+            "prev_values": torch.zeros(2, 1),
+            "loss_mask": torch.full((2, 1), not (empty_rank and rank == 0)),
+        }
+        metrics = {}
+        assert actor._prepare_task_weighted_batch(batch, metrics)
+        for offset in range(0, 2, micro_size):
+            part = slice(offset, offset + micro_size)
+            micro = {key: value[part] for key, value in batch.items()}
+            micro["forward_inputs"] = {"action": x[part]}
+            actor.train_micro_batch(micro, metrics, is_last=offset + micro_size == 2)
+        assert actor._data_iter_offset == actor.gradient_accumulation
+        assert len(metrics["sft_weighted_loss"]) == actor.gradient_accumulation
+        gradient = actor.model.module.parameter.grad.clone()
+        # An empty global RL batch must also leave the shared SFT stream untouched.
+        batch["loss_mask"].zero_()
+        assert not actor._prepare_task_weighted_batch(batch, metrics)
+        assert actor._data_iter_offset == actor.gradient_accumulation
+        torch.save(gradient, Path(output_dir) / f"rank_{rank}.pt")
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("micro_size,empty_rank", [(1, False), (1, True), (2, True)])
+def test_multitask_sft_two_rank_gradient_matches_joint_objective(
+    tmp_path, multitask_sft_cfg, micro_size, empty_rank
+):
+    from rlinf.algorithms.registry import policy_loss
+
+    mp.spawn(
+        _joint_actor_gradient,
+        args=(
+            str(tmp_path / "rdzv"),
+            str(tmp_path),
+            multitask_sft_cfg,
+            micro_size,
+            empty_rank,
+        ),
+        nprocs=2,
+    )
+    model = _JointPolicy()
+    x = torch.arange(1.0, 5.0)
+    output = model(forward_inputs={"action": x})
+    mask = torch.tensor([not empty_rank, not empty_rank, True, True]).reshape(4, 1)
+    weights = torch.tensor([0.5, 2.0, 0.5, 2.0])
+    weights /= weights[mask.flatten()].mean()
+    loss, _ = policy_loss(
+        loss_type="actor_critic",
+        task_type="embodied",
+        logprob_type="chunk_level",
+        reward_type="chunk_level",
+        single_action_dim=1,
+        logprobs=output["logprobs"],
+        values=output["values"],
+        old_logprobs=torch.zeros(4, 1, 1),
+        advantages=torch.ones(4, 1),
+        returns=torch.ones(4, 1),
+        prev_values=torch.zeros(4, 1),
+        loss_mask=mask,
+        clip_ratio_high=0.2,
+        clip_ratio_low=0.2,
+        value_clip=0.2,
+        huber_delta=1.0,
+        sample_weights=weights,
+    )
+    loss -= 0.005 * weighted_reduce(output["entropy"], mask, sample_weights=weights)
+    loss += 0.7 * model(data=(None, x))["loss"]
+    loss.backward()
+    for rank in range(2):
+        torch.testing.assert_close(
+            torch.load(tmp_path / f"rank_{rank}.pt", weights_only=True),
+            model.parameter.grad,
+        )
+
+
+@pytest.mark.parametrize("actor_step", [1, 2])
+def test_runner_checks_multitask_sft_restore_step(tmp_path, actor_step):
+    from rlinf.runners.embodied_runner import EmbodiedRunner
+
+    resume = tmp_path / "global_step_2"
+    (resume / "actor").mkdir(parents=True)
+    tracker = controller()
+    tracker.update(torch.tensor([[1, 0], [1, 1]]), 1)
+    tracker.update(torch.tensor([[0, 1], [1, 1]]), 2)
+    tracker.save(str(resume), 2)
+    runner = object.__new__(EmbodiedRunner)
+    runner.cfg = OmegaConf.create(
+        {
+            "runner": {"resume_dir": str(resume)},
+            "algorithm": {"loss_type": "actor_critic"},
+            "actor": {"enable_sft_co_train": True},
+        }
+    )
+    runner.multi_task_controller = controller()
+    runner.actor, runner.env, runner.rollout = MagicMock(), MagicMock(), MagicMock()
+    runner.actor.load_checkpoint.return_value.wait.return_value = [
+        {"multi_task_step": actor_step}
+    ] * 2
+    runner.reward = None
+    runner.logger = MagicMock()
+    if actor_step != 2:
+        with pytest.raises(ValueError, match="steps disagree"):
+            runner.init_workers()
+    else:
+        runner.init_workers()
+        assert runner.global_step == 2
+        torch.testing.assert_close(
+            runner.multi_task_controller.weights, tracker.weights
+        )
