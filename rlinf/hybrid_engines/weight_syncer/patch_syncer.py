@@ -926,7 +926,23 @@ class PatchWeightSyncer(WeightSyncer):
         self.param_names_need_sync = param_names_need_sync
         receiver_dtypes = metadata["receiver_dtypes"]
 
-        if set(state_dict.keys()) != set(self.ordered_keys):
+        sender_keys = set(state_dict.keys())
+        receiver_keys = set(self.ordered_keys)
+        if sender_keys != receiver_keys:
+            missing_on_sender = sorted(receiver_keys - sender_keys)
+            extra_on_sender = sorted(sender_keys - receiver_keys)
+            # Keep this diagnostic bounded: the full model has hundreds of keys,
+            # while the first few names are enough to identify wrapper prefixes.
+            import logging
+
+            logging.getLogger(__name__).error(
+                "PatchWeightSyncer state-dict key mismatch: sender=%d receiver=%d "
+                "missing_on_sender=%s extra_on_sender=%s",
+                len(sender_keys),
+                len(receiver_keys),
+                missing_on_sender[:20],
+                extra_on_sender[:20],
+            )
             raise ValueError("Sender state dict keys do not match receiver keys")
 
         if self.init_sync_enabled:

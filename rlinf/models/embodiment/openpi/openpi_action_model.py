@@ -173,14 +173,21 @@ def _reduce_sft_action_loss_per_sample(
     if not _uses_expert_future_tactile(config):
         return elementwise_loss.mean(dim=(1, 2))
     action_dim = int(getattr(config, "action_dim", elementwise_loss.shape[-1]))
-    effective_action_dim = int(getattr(config, "effective_action_dim", action_dim) or action_dim)
+    effective_action_dim = int(
+        getattr(config, "effective_action_dim", action_dim) or action_dim
+    )
     tactile_dim = int(getattr(config, "tactile_dim", 0))
     control_dim = effective_action_dim - tactile_dim
     tactile_slice = slice(control_dim, effective_action_dim)
     tactile_weight = float(getattr(config, "tactile_loss_weight", 0.1))
     padding_weight = float(getattr(config, "padding_loss_weight", 0.0))
-    if str(getattr(config, "expert_his_c_fut_loss_mode", "weighted_full")) == "weighted_full":
-        weights = torch.ones(action_dim, device=elementwise_loss.device, dtype=elementwise_loss.dtype)
+    if (
+        str(getattr(config, "expert_his_c_fut_loss_mode", "weighted_full"))
+        == "weighted_full"
+    ):
+        weights = torch.ones(
+            action_dim, device=elementwise_loss.device, dtype=elementwise_loss.dtype
+        )
         weights[tactile_slice] = tactile_weight
         if effective_action_dim < action_dim:
             weights[effective_action_dim:] = padding_weight
@@ -189,7 +196,9 @@ def _reduce_sft_action_loss_per_sample(
     tactile_loss = elementwise_loss[..., tactile_slice].mean(dim=(1, 2))
     total = action_loss + tactile_weight * tactile_loss
     if effective_action_dim < action_dim:
-        total = total + padding_weight * elementwise_loss[..., effective_action_dim:].mean(dim=(1, 2))
+        total = total + padding_weight * elementwise_loss[
+            ..., effective_action_dim:
+        ].mean(dim=(1, 2))
     return total
 
 
@@ -242,6 +251,8 @@ class OpenPi0Config(Pi0Config):
     tactile_suffix_num_tokens: int = 8
     tactile_prefix_cross_attn: bool = True
     tactile_cross_attn_heads: int = 8
+    tactile_contact_threshold: float = 1.0
+    tactile_contact_min_active: int = 5
     image_noise_std: float = 0.0
 
     # training config
@@ -327,8 +338,13 @@ class OpenPi0Config(Pi0Config):
             ):
                 if getattr(self, name) is None:
                     raise ValueError(f"taccorl requires {name} to be set explicitly.")
-            steps = self.tactile_prefix_history + int(self.tactile_prefix_use_reference_frame)
-            if self.tactile_prefix_dim_in % steps or (self.tactile_prefix_dim_in // steps) % 2:
+            steps = self.tactile_prefix_history + int(
+                self.tactile_prefix_use_reference_frame
+            )
+            if (
+                self.tactile_prefix_dim_in % steps
+                or (self.tactile_prefix_dim_in // steps) % 2
+            ):
                 raise ValueError(
                     "taccorl requires tactile_prefix_dim_in = frames * markers * 2."
                 )
@@ -339,6 +355,10 @@ class OpenPi0Config(Pi0Config):
             ):
                 if getattr(self, name) <= 0:
                     raise ValueError(f"taccorl requires {name} > 0.")
+            if self.tactile_contact_threshold < 0:
+                raise ValueError("tactile_contact_threshold must be non-negative.")
+            if self.tactile_contact_min_active <= 0:
+                raise ValueError("tactile_contact_min_active must be positive.")
             if self.tactile_prefix_cross_attn:
                 width = _gemma.get_config(self.paligemma_variant).width
                 if width % self.tactile_cross_attn_heads:
@@ -376,7 +396,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
 
     @property
     def _no_split_modules(self) -> list[str]:
-        if self.config.train_expert_only:
+        if self.config.train_expert_only and self.config.tactile_fusion != "taccorl":
             no_split_modules = [
                 "GemmaDecoderLayer",
                 "SiglipVisionEmbeddings",
@@ -398,7 +418,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
 
     @property
     def _no_split_names(self) -> list[str]:
-        return [
+        names = [
             "action_in_proj",
             "action_out_proj",
             "lm_head",
@@ -416,6 +436,11 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             # Keep trainable RLT parameters separate from the frozen backbone.
             "rlt_module",
         ]
+        if self.config.tactile_fusion == "taccorl":
+            # PaliGemma ties lm_head to embed_tokens. Both must stay in the
+            # root FSDP unit so embedding lookup sees the unsharded weight.
+            names.remove("lm_head")
+        return names
 
     def __init__(
         self,
@@ -701,15 +726,24 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             "tactile_prefix_diff_from_reference",
         )
         if any(getattr(self.config, name, None) is None for name in required):
-            raise ValueError("taccorl requires explicit marker history and frame settings.")
+            raise ValueError(
+                "taccorl requires explicit marker history and frame settings."
+            )
         steps = self.config.tactile_prefix_history + int(
             self.config.tactile_prefix_use_reference_frame
         )
-        if self.config.tactile_prefix_dim_in <= 0 or self.config.tactile_prefix_dim_in % steps:
-            raise ValueError("taccorl tactile_prefix_dim_in must be divisible by frame count.")
+        if (
+            self.config.tactile_prefix_dim_in <= 0
+            or self.config.tactile_prefix_dim_in % steps
+        ):
+            raise ValueError(
+                "taccorl tactile_prefix_dim_in must be divisible by frame count."
+            )
         input_dim = self.config.tactile_prefix_dim_in // steps
         if input_dim % 2:
-            raise ValueError("taccorl requires tactile_prefix_dim_in = frames * markers * 2.")
+            raise ValueError(
+                "taccorl requires tactile_prefix_dim_in = frames * markers * 2."
+            )
         prefix_width = _gemma.get_config(self.config.paligemma_variant).width
         suffix_width = _gemma.get_config(self.config.action_expert_variant).width
         self.marker_token_encoder = MarkerTokenEncoder(
@@ -725,7 +759,9 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         self.tactile_cross_attn = None
         if self.config.tactile_prefix_cross_attn:
             if prefix_width % self.config.tactile_cross_attn_heads:
-                raise ValueError("tactile_cross_attn_heads must divide the PaliGemma width.")
+                raise ValueError(
+                    "tactile_cross_attn_heads must divide the PaliGemma width."
+                )
             self.tactile_cross_attn = TactilePrefixCrossAttention(
                 prefix_width, self.config.tactile_cross_attn_heads
             )
@@ -763,7 +799,9 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             tactile_prefix = None
             extra = ()
         else:
-            images, img_masks, lang_tokens, lang_masks, state, tactile_prefix = result[:6]
+            images, img_masks, lang_tokens, lang_masks, state, tactile_prefix = result[
+                :6
+            ]
             extra = tuple(result[6:])
         noisy_images = [
             (image + torch.randn_like(image) * (2.0 * sigma)).clamp(-1.0, 1.0)
@@ -771,11 +809,54 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         ]
         if len(result) == 5:
             return noisy_images, img_masks, lang_tokens, lang_masks, state
-        return (noisy_images, img_masks, lang_tokens, lang_masks, state, tactile_prefix, *extra)
+        return (
+            noisy_images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            state,
+            tactile_prefix,
+            *extra,
+        )
 
     @staticmethod
     def _get_tactile_contact(observation):
         return getattr(observation, "tactile_contact", None)
+
+    def _derive_tactile_contact(self, tactile_marker_motion):
+        """Apply the data transform's contact rule to batched rollout history."""
+        motion = torch.as_tensor(tactile_marker_motion, dtype=torch.float32)
+        if motion.ndim == 3:
+            motion = motion.unsqueeze(0)
+        expected_steps = self.config.tactile_prefix_history + int(
+            self.config.tactile_prefix_use_reference_frame
+        )
+        if (
+            motion.ndim != 4
+            or motion.shape[1] != expected_steps
+            or motion.shape[-1] != 2
+        ):
+            raise ValueError(
+                "TacCoRL rollout tactile_marker_motion must have shape "
+                f"(batch, {expected_steps}, markers, 2), got {tuple(motion.shape)}."
+            )
+        displacement = torch.linalg.vector_norm(motion[:, 1:] - motion[:, 0:1], dim=-1)
+        active = (displacement > self.config.tactile_contact_threshold).sum(dim=-1)
+        return (active >= self.config.tactile_contact_min_active).any(dim=-1)
+
+    def _taccorl_metrics(self, observation) -> dict[str, torch.Tensor]:
+        """Return scalar TacCoRL diagnostics carried by the SFT output."""
+        metrics: dict[str, torch.Tensor] = {}
+        tactile_contact = self._get_tactile_contact(observation)
+        if tactile_contact is not None:
+            metrics["contact_gate_rate"] = torch.as_tensor(
+                tactile_contact,
+                device=next(self.parameters()).device,
+                dtype=torch.float32,
+            ).mean()
+        if self.tactile_cross_attn is not None:
+            metrics["cross_attn_alpha"] = self.tactile_cross_attn.last_alpha
+        return metrics
 
     def _marker_token_mask(self, tactile_tokens, tactile_contact):
         if tactile_contact is None:
@@ -794,7 +875,10 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         return contact[:, None].expand(-1, tactile_tokens.shape[1])
 
     def _encode_marker_tokens(self, tactile_prefix):
-        if not hasattr(self, "marker_token_encoder") or self.marker_token_encoder is None:
+        if (
+            not hasattr(self, "marker_token_encoder")
+            or self.marker_token_encoder is None
+        ):
             return None
         if tactile_prefix is None:
             raise ValueError(
@@ -813,7 +897,9 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             images, img_masks, lang_tokens, lang_masks, state = result
             tactile_prefix = getattr(observation, "tactile_prefix", None)
         elif len(result) >= 6:
-            images, img_masks, lang_tokens, lang_masks, state, tactile_prefix = result[:6]
+            images, img_masks, lang_tokens, lang_masks, state, tactile_prefix = result[
+                :6
+            ]
             if tactile_prefix is None:
                 tactile_prefix = getattr(observation, "tactile_prefix", None)
         else:
@@ -989,7 +1075,9 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             )
 
         if self.config.tactile_fusion == "taccorl" and self.config.use_rlt:
-            raise NotImplementedError("TacCoRL is not implemented for RLT prefix extraction.")
+            raise NotImplementedError(
+                "TacCoRL is not implemented for RLT prefix extraction."
+            )
 
         if self.config.use_rlt and self.config.rlt_train_module_only:
             prefix_output, prefix_mask = self._extract_rlt_prefix_embeddings(
@@ -1037,7 +1125,12 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 return {
                     "loss": vla_loss,
                     "per_sample_loss": per_sample_loss,
-                    **{name: value for name, value in loss_output.items() if name != "loss"},
+                    **self._taccorl_metrics(observation),
+                    **{
+                        name: value
+                        for name, value in loss_output.items()
+                        if name != "loss"
+                    },
                 }
             if len(loss_output) == 1:
                 return vla_loss
@@ -1067,7 +1160,9 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         time = self.sample_time(actions.shape[0], actions.device)
         x_t = time[:, None, None] * noise + (1 - time[:, None, None]) * actions
         u_t = noise - actions
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+        # The prefix cannot attend the suffix. Reuse PPO's differentiable KV
+        # cache path so each decoder enters its FSDP forward/backward hooks.
+        _, prefix_pad_masks, past_key_values = self._build_prefix_cache(
             images,
             img_masks,
             lang_tokens,
@@ -1076,47 +1171,16 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             marker_tokens=marker_tokens,
             tactile_contact=tactile_contact,
         )
-        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(
+        v_t = self.denoise_step(
             state,
+            prefix_pad_masks,
+            past_key_values,
             x_t,
             time,
-            tactile_prefix=tactile_prefix,
             marker_tokens=marker_tokens,
+            tactile_prefix=tactile_prefix,
             tactile_contact=tactile_contact,
         )
-        backbone_dtype = self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
-        prefix_embs = prefix_embs.to(dtype=backbone_dtype)
-        suffix_embs = suffix_embs.to(dtype=backbone_dtype)
-        pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
-        att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
-        att_2d_masks_4d = self._prepare_attention_masks_4d(
-            make_att_2d_masks(pad_masks, att_masks)
-        )
-        position_ids = torch.cumsum(pad_masks, dim=1) - 1
-
-        def forward_func(prefix, suffix, masks, positions, cond):
-            paired_model = self.paligemma_with_expert
-            paired_training = paired_model.training
-            if not getattr(self, "_rlinf_gradient_checkpointing_enabled", False):
-                paired_model.training = False
-            try:
-                (_, suffix_out), _ = paired_model.forward(
-                    attention_mask=masks,
-                    position_ids=positions,
-                    past_key_values=None,
-                    inputs_embeds=[prefix, suffix],
-                    use_cache=False,
-                    adarms_cond=[None, cond],
-                )
-            finally:
-                paired_model.training = paired_training
-            return suffix_out
-
-        suffix_out = self._apply_checkpoint(
-            forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
-        )
-        suffix_out = suffix_out[:, -self.config.action_horizon :].to(dtype=torch.float32)
-        v_t = self._apply_checkpoint(self.action_out_proj, suffix_out)
         return F.mse_loss(u_t, v_t, reduction="none")
 
     def _sft_forward_with_rlt_prefix(self, observation, actions):
@@ -1204,7 +1268,9 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
 
     def _build_rlt_prefix_cache(self, observation, *, train: bool):
         if self.config.tactile_fusion == "taccorl":
-            raise NotImplementedError("TacCoRL is not implemented for RLT prefix extraction.")
+            raise NotImplementedError(
+                "TacCoRL is not implemented for RLT prefix extraction."
+            )
         images, img_masks, lang_tokens, lang_masks, state, tactile_prefix = (
             self._preprocess_observation_with_tactile(observation, train=train)
         )
@@ -1243,7 +1309,9 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         tactile_token_count: int = 0,
     ):
         if self.config.tactile_fusion == "taccorl":
-            raise NotImplementedError("TacCoRL is not implemented for RLT prefix extraction.")
+            raise NotImplementedError(
+                "TacCoRL is not implemented for RLT prefix extraction."
+            )
         if self.config.rlt_image_only and lang_tokens is not None:
             num_image_tokens = (
                 prefix_output.shape[1] - lang_tokens.shape[1] - tactile_token_count
@@ -1264,7 +1332,9 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
 
     def _extract_rlt_prefix_embeddings(self, observation, *, train: bool):
         if self.config.tactile_fusion == "taccorl":
-            raise NotImplementedError("TacCoRL is not implemented for RLT prefix extraction.")
+            raise NotImplementedError(
+                "TacCoRL is not implemented for RLT prefix extraction."
+            )
         with torch.no_grad():
             (
                 prefix_output,
@@ -1360,7 +1430,9 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         env_obs: dict[str, Any],
     ) -> dict[str, torch.Tensor]:
         if self.config.tactile_fusion == "taccorl":
-            raise NotImplementedError("TacCoRL is not implemented for RLT prefix extraction.")
+            raise NotImplementedError(
+                "TacCoRL is not implemented for RLT prefix extraction."
+            )
         if not self.config.use_rlt or not hasattr(self, "rlt_module"):
             raise ValueError("extract_rlt_obs requires openpi.use_rlt=True.")
 
@@ -1646,7 +1718,10 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                         "'extra_view_images' in env_obs."
                     )
                 processed_obs["tactile_image"] = tactile_image
-            if "tacfield" in self.config.config_name or "taccorl" in self.config.config_name:
+            if (
+                "tacfield" in self.config.config_name
+                or "taccorl" in self.config.config_name
+            ):
                 if "tactile_marker_motion" not in env_obs:
                     raise KeyError(
                         "Tabero tacfield expects 'tactile_marker_motion' in env_obs."
@@ -1656,6 +1731,10 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 ]
                 if "tactile_contact" in env_obs:
                     processed_obs["tactile_contact"] = env_obs["tactile_contact"]
+                elif self.config.tactile_fusion == "taccorl":
+                    processed_obs["tactile_contact"] = self._derive_tactile_contact(
+                        env_obs["tactile_marker_motion"]
+                    )
             if "tacforce" in self.config.config_name:
                 if "tactile_gripper_force" not in env_obs:
                     raise KeyError(
@@ -2204,28 +2283,24 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         tactile_contact=None,
     ):
         """Embed image/language prefix tokens and optional tactile tokens."""
+        if self.config.tactile_fusion == "taccorl":
+            # PI0Pytorch owns the TacCoRL marker-token insertion and requires
+            # the contact gate to be explicit.  The adapter's legacy wrapper
+            # used to call ``super`` without these keyword arguments, which
+            # left the sentinel unset during rollout and failed before the
+            # first policy action.
+            return super().embed_prefix(
+                images,
+                img_masks,
+                lang_tokens,
+                lang_masks,
+                tactile_prefix=tactile_prefix,
+                marker_tokens=marker_tokens,
+                tactile_contact=tactile_contact,
+            )
         prefix_embs, prefix_pad_masks, prefix_att_masks = super().embed_prefix(
             images, img_masks, lang_tokens, lang_masks
         )
-        if self.config.tactile_fusion == "taccorl":
-            if marker_tokens is None:
-                marker_tokens = self._encode_marker_tokens(tactile_prefix)
-            tactile_emb = marker_tokens[0].to(
-                device=prefix_embs.device, dtype=prefix_embs.dtype
-            )
-            tactile_mask = self._marker_token_mask(tactile_emb, tactile_contact)
-            if self.tactile_cross_attn is not None:
-                prefix_embs = self._apply_checkpoint(
-                    self.tactile_cross_attn,
-                    prefix_embs,
-                    tactile_emb,
-                    tactile_mask,
-                )
-            prefix_embs = torch.cat([prefix_embs, tactile_emb], dim=1)
-            prefix_pad_masks = torch.cat([prefix_pad_masks, tactile_mask], dim=1)
-            tactile_att = torch.zeros_like(tactile_mask, dtype=torch.bool)
-            prefix_att_masks = torch.cat([prefix_att_masks.bool(), tactile_att], dim=1)
-            return prefix_embs, prefix_pad_masks, prefix_att_masks
         if self.tactile_prefix_encoder is None or tactile_prefix is None:
             return prefix_embs, prefix_pad_masks, prefix_att_masks
 
@@ -2288,22 +2363,17 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         """Embed TacCoRL suffix marker tokens before the action suffix."""
         if self.config.tactile_fusion != "taccorl":
             return super().embed_suffix(state, noisy_actions, timestep)
-        if marker_tokens is None:
-            marker_tokens = self._encode_marker_tokens(tactile_prefix)
-        tactile_emb = marker_tokens[1].to(
-            device=noisy_actions.device, dtype=noisy_actions.dtype
+        # PI0Pytorch now owns marker-token placement and the explicit contact
+        # gate. Forward the payload instead of calling the strict base method
+        # without its keyword arguments (and then inserting a second copy).
+        return super().embed_suffix(
+            state,
+            noisy_actions,
+            timestep,
+            tactile_prefix=tactile_prefix,
+            marker_tokens=marker_tokens,
+            tactile_contact=tactile_contact,
         )
-        tactile_mask = self._marker_token_mask(tactile_emb, tactile_contact)
-        base_embs, base_masks, base_att, adarms_cond = super().embed_suffix(
-            state, noisy_actions, timestep
-        )
-        base_att = base_att.bool()
-        tactile_att = torch.zeros_like(tactile_mask, dtype=torch.bool)
-        tactile_att[:, 0] = True
-        embs = torch.cat([tactile_emb, base_embs], dim=1)
-        pad_masks = torch.cat([tactile_mask, base_masks], dim=1)
-        att_masks = torch.cat([tactile_att, base_att], dim=1)
-        return embs, pad_masks, att_masks, adarms_cond
 
     def _build_prefix_cache(
         self,

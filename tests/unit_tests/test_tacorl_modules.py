@@ -1,3 +1,17 @@
+# Copyright 2026 The RLinf Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Synthetic TacCoRL module and conversion checks."""
 
 from __future__ import annotations
@@ -50,6 +64,8 @@ def _taccorl_config(**overrides):
         "tactile_suffix_num_tokens": 2,
         "tactile_prefix_cross_attn": True,
         "tactile_cross_attn_heads": 2,
+        "tactile_contact_threshold": 1.0,
+        "tactile_contact_min_active": 5,
         "tactile_prefix_encoder_type": "tcn",
         "paligemma_variant": "tiny",
         "action_expert_variant": "tiny",
@@ -93,44 +109,151 @@ def _bare_taccorl_model(**config_overrides):
     return model
 
 
-def _install_embedding_stubs(monkeypatch):
-    def embed_prefix(self, images, img_masks, lang_tokens, lang_masks):
-        del img_masks, lang_tokens, lang_masks
-        batch_size = images[0].shape[0]
-        base = torch.arange(batch_size * 4 * 8, dtype=torch.float32).reshape(
-            batch_size, 4, 8
-        )
-        return (
-            base,
-            torch.ones(batch_size, 4, dtype=torch.bool),
-            torch.zeros(batch_size, 4, dtype=torch.bool),
-        )
+def _tiny_taccorl_gemma():
+    from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
+    from transformers import (
+        GemmaConfig,
+        GemmaForCausalLM,
+        PaliGemmaConfig,
+        PaliGemmaForConditionalGeneration,
+        SiglipVisionConfig,
+    )
 
-    def embed_suffix(self, state, noisy_actions, timestep):
-        del state, timestep
-        batch_size, action_horizon = noisy_actions.shape[:2]
-        base = torch.arange(
-            batch_size * action_horizon * 6,
-            dtype=noisy_actions.dtype,
-            device=noisy_actions.device,
-        ).reshape(batch_size, action_horizon, 6)
-        return (
-            base,
-            torch.ones(batch_size, action_horizon, dtype=torch.bool),
-            torch.zeros(batch_size, action_horizon, dtype=torch.bool),
-            None,
+    model = _bare_taccorl_model(train_expert_only=True, noise_method="flow_sde")
+    model.pi05 = True
+    backbone = PaliGemmaWithExpertModel.__new__(PaliGemmaWithExpertModel)
+    nn.Module.__init__(backbone)
+    text = GemmaConfig(
+        vocab_size=32,
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=8,
+        num_key_value_heads=1,
+        head_dim=4,
+        use_adarms=False,
+        hidden_activation="gelu_pytorch_tanh",
+    )
+    vision = SiglipVisionConfig(
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        image_size=16,
+        patch_size=8,
+    )
+    backbone.paligemma = PaliGemmaForConditionalGeneration(
+        PaliGemmaConfig(text_config=text, vision_config=vision, projection_dim=32)
+    )
+    backbone.gemma_expert = GemmaForCausalLM(
+        GemmaConfig(
+            vocab_size=32,
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=8,
+            num_key_value_heads=1,
+            head_dim=4,
+            use_adarms=True,
+            adarms_cond_dim=16,
+            hidden_activation="gelu_pytorch_tanh",
         )
+    )
+    backbone.gemma_expert.model.embed_tokens = None
+    model.paligemma_with_expert = backbone
+    model.marker_token_encoder = MarkerTokenEncoder(
+        in_dim=4,
+        history_len=2,
+        has_reference_frame=False,
+        diff_from_reference=False,
+        prefix_width=32,
+        suffix_width=16,
+        prefix_num_tokens=3,
+        suffix_num_tokens=2,
+    )
+    model.tactile_cross_attn = TactilePrefixCrossAttention(32, 2)
+    model.tactile_cross_attn.alpha.data.fill_(0.3)
+    model.action_in_proj = nn.Linear(6, 16)
+    model.action_out_proj = nn.Linear(16, 6)
+    model.time_mlp_in = nn.Linear(16, 16)
+    model.time_mlp_out = nn.Linear(16, 16)
+    model._preprocess_observation = lambda obs, train: (
+        obs.images,
+        obs.image_masks,
+        obs.tokenized_prompt,
+        obs.tokenized_prompt_mask,
+        obs.state,
+        obs.tactile_prefix,
+    )
+    return model
 
-    monkeypatch.setattr(PI0Pytorch, "embed_prefix", embed_prefix)
-    monkeypatch.setattr(PI0Pytorch, "embed_suffix", embed_suffix)
+
+@pytest.mark.parametrize("contact", [True, False])
+def test_taccorl_cached_sft_matches_joint_loss_and_gradients(contact):
+    import copy
+
+    torch.manual_seed(42)
+    joint = _tiny_taccorl_gemma()
+    joint.paligemma_with_expert.paligemma.requires_grad_(False)
+    cached = copy.deepcopy(joint)
+    observation = SimpleNamespace(
+        images=[torch.randn(1, 3, 16, 16)],
+        image_masks=[torch.ones(1, dtype=torch.bool)],
+        tokenized_prompt=torch.tensor([[1, 3, 7]]),
+        tokenized_prompt_mask=torch.tensor([[True, True, False]]),
+        state=torch.zeros(1, 6),
+        tactile_prefix=torch.randn(1, 2, 4),
+        tactile_contact=torch.tensor([contact]),
+    )
+    actions = torch.randn(1, 4, 6)
+    torch.manual_seed(5)
+    expected = PI0Pytorch.forward(joint, observation, actions).mean()
+    expected.backward()
+    torch.manual_seed(5)
+    actual = cached._sft_forward_taccorl(observation, actions).mean()
+    actual.backward()
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
+    expected_params = dict(joint.named_parameters())
+    for name, parameter in cached.named_parameters():
+        reference_grad = expected_params[name].grad
+        if reference_grad is None:
+            assert parameter.grad is None, name
+        else:
+            torch.testing.assert_close(
+                parameter.grad, reference_grad, atol=2e-6, rtol=1e-4, msg=name
+            )
+    if contact:
+        assert cached.marker_token_encoder.prefix_proj.weight.grad.norm() > 0
+        assert cached.marker_token_encoder.suffix_proj.weight.grad.norm() > 0
+        assert cached.tactile_cross_attn.alpha.grad.norm() > 0
+
+
+class _EmbeddingBackbone:
+    def embed_image(self, image):
+        return image
+
+    def embed_language_tokens(self, tokens):
+        return tokens
+
+
+def _install_embedding_stubs(model):
+    model.paligemma_with_expert = _EmbeddingBackbone()
+    model.pi05 = True
+    model.action_in_proj = nn.Linear(6, 6)
+    model.time_mlp_in = nn.Linear(6, 6)
+    model.time_mlp_out = nn.Linear(6, 6)
 
 
 def _prefix_inputs(batch_size):
     return (
-        [torch.zeros(batch_size, 1, 1, 1)],
+        [
+            torch.arange(batch_size * 3 * 8, dtype=torch.float32).reshape(
+                batch_size, 3, 8
+            )
+        ],
         [torch.ones(batch_size, dtype=torch.bool)],
-        None,
-        None,
+        torch.zeros(batch_size, 1, 8),
+        torch.ones(batch_size, 1, dtype=torch.bool),
     )
 
 
@@ -186,8 +309,14 @@ def test_taccorl_converter_transposes_linear_kernels():
     )
 
     def linear(in_dim, out_dim, offset):
-        values = torch.arange(in_dim * out_dim, dtype=torch.float32).reshape(in_dim, out_dim) + offset
-        return {"kernel": values.numpy(), "bias": torch.arange(out_dim).numpy() + offset}
+        values = (
+            torch.arange(in_dim * out_dim, dtype=torch.float32).reshape(in_dim, out_dim)
+            + offset
+        )
+        return {
+            "kernel": values.numpy(),
+            "bias": torch.arange(out_dim).numpy() + offset,
+        }
 
     params = {
         "marker_token_encoder": {
@@ -245,17 +374,15 @@ def test_taccorl_converter_transposes_linear_kernels():
 def test_embed_prefix_closed_contact_keeps_base_tokens_and_masks_tactile_tokens(
     monkeypatch,
 ):
-    _install_embedding_stubs(monkeypatch)
     model = _bare_taccorl_model()
+    _install_embedding_stubs(model)
     with torch.no_grad():
         model.tactile_cross_attn.alpha.fill_(1.0)
     images, image_masks, lang_tokens, lang_masks = _prefix_inputs(2)
     tactile = torch.randn(2, 2, 4)
     marker_tokens = model._encode_marker_tokens(tactile)
 
-    base, _, _ = PI0Pytorch.embed_prefix(
-        model, images, image_masks, lang_tokens, lang_masks
-    )
+    base = torch.cat([images[0], lang_tokens], dim=1)
     result, pad_masks, att_masks = model.embed_prefix(
         images,
         image_masks,
@@ -297,8 +424,8 @@ def test_embed_prefix_closed_contact_keeps_base_tokens_and_masks_tactile_tokens(
 def test_embed_suffix_places_marker_tokens_before_actions_with_contact_padding(
     monkeypatch,
 ):
-    _install_embedding_stubs(monkeypatch)
     model = _bare_taccorl_model()
+    _install_embedding_stubs(model)
     noisy_actions = torch.zeros(2, 4, 6)
     tactile = torch.randn(2, 2, 4)
     marker_tokens = model._encode_marker_tokens(tactile)
@@ -314,18 +441,18 @@ def test_embed_suffix_places_marker_tokens_before_actions_with_contact_padding(
     assert suffix.shape == (2, 6, 6)
     assert pad_masks[:, :2].tolist() == [[False, False], [True, True]]
     assert att_masks[:, :6].tolist() == [
-        [True, False, False, False, False, False],
-        [True, False, False, False, False, False],
+        [True, False, True, False, False, False],
+        [True, False, True, False, False, False],
     ]
     assert pad_masks[:, 2:].all()
 
 
 def test_prefix_cache_attention_masks_closed_tactile_keys(monkeypatch):
-    _install_embedding_stubs(monkeypatch)
     model = _bare_taccorl_model()
+    _install_embedding_stubs(model)
     captured = {}
 
-    class PrefixBackbone:
+    class PrefixBackbone(_EmbeddingBackbone):
         def __init__(self):
             self.paligemma = SimpleNamespace(
                 language_model=SimpleNamespace(
@@ -406,7 +533,9 @@ def test_sft_forward_returns_per_sample_loss_with_matching_mean(monkeypatch):
         action_env_dim=4,
         action_chunk=3,
     )
-    monkeypatch.setattr(openpi_action_model, "register_pytree_dataclasses", lambda _: None)
+    monkeypatch.setattr(
+        openpi_action_model, "register_pytree_dataclasses", lambda _: None
+    )
     monkeypatch.setattr(openpi_action_model, "tree_map", lambda fn, value: value)
     per_element = torch.arange(2 * 3 * 4, dtype=torch.float32).reshape(2, 3, 4)
     model._sft_forward_taccorl = lambda observation, actions: per_element
@@ -421,9 +550,35 @@ def test_sft_forward_returns_per_sample_loss_with_matching_mean(monkeypatch):
 
     assert result["per_sample_loss"].shape == (2,)
     torch.testing.assert_close(result["loss"], result["per_sample_loss"].mean())
-    torch.testing.assert_close(
-        result["per_sample_loss"], per_element.mean(dim=(1, 2))
+    torch.testing.assert_close(result["per_sample_loss"], per_element.mean(dim=(1, 2)))
+    assert result["contact_gate_rate"].item() == pytest.approx(0.5)
+    assert result["cross_attn_alpha"].item() == pytest.approx(0.0)
+
+
+def test_cross_attention_metric_survives_parameter_resharding():
+    model = _bare_taccorl_model()
+    attention = model.tactile_cross_attn
+    attention.alpha.data.fill_(0.7)
+    attention(
+        torch.randn(2, 3, 8), torch.randn(2, 2, 8), torch.ones(2, 2, dtype=torch.bool)
     )
+    attention.alpha.data = torch.empty(0)
+
+    metrics = model._taccorl_metrics(SimpleNamespace(tactile_contact=None))
+
+    torch.testing.assert_close(metrics["cross_attn_alpha"], torch.tensor(0.7).tanh())
+    assert not metrics["cross_attn_alpha"].requires_grad
+    assert "last_alpha" not in attention.state_dict()
+
+
+def test_rollout_contact_gate_is_derived_from_marker_history():
+    model = _bare_taccorl_model()
+    motion = torch.zeros(2, 2, 6, 2)
+    motion[0, 1, :5, 0] = 2.0
+
+    contact = model._derive_tactile_contact(motion)
+
+    assert contact.tolist() == [True, False]
 
 
 def test_image_noise_is_train_only_bounded_and_zero_is_a_noop(monkeypatch):
@@ -432,7 +587,14 @@ def test_image_noise_is_train_only_bounded_and_zero_is_a_noop(monkeypatch):
 
     def preprocess(self, observation, *, train=True):
         del observation, train
-        return ([image.clone()], [torch.ones(2, dtype=torch.bool)], None, None, state, None)
+        return (
+            [image.clone()],
+            [torch.ones(2, dtype=torch.bool)],
+            None,
+            None,
+            state,
+            None,
+        )
 
     monkeypatch.setattr(PI0Pytorch, "_preprocess_observation", preprocess)
     monkeypatch.setattr(torch, "randn_like", lambda value: torch.ones_like(value))
@@ -469,10 +631,7 @@ def test_legacy_tactile_encoder_contract_is_unchanged(monkeypatch):
     assert legacy.tactile_prefix_encoder is not None
     assert not hasattr(legacy, "marker_token_encoder")
     legacy_keys = [key for key in legacy.state_dict() if key != "_test_parameter"]
-    assert all(
-        key.startswith("tactile_prefix_encoder.")
-        for key in legacy_keys
-    )
+    assert all(key.startswith("tactile_prefix_encoder.") for key in legacy_keys)
 
     taccorl = _bare_taccorl_model()
     taccorl._init_tactile_prefix_encoder()

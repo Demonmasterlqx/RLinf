@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 from types import SimpleNamespace
 
 import pytest
@@ -27,6 +28,46 @@ from rlinf.hybrid_engines.fsdp.model_weight_ema import ModelWeightEMA
 class _Logger:
     def info(self, *_args, **_kwargs):
         pass
+
+
+def test_cpu_staged_checkpoint_restores_model_optimizer_and_scheduler():
+    from torch.distributed.checkpoint.state_dict import StateDictOptions
+
+    from rlinf.hybrid_engines.fsdp.strategy.checkpoint import Checkpoint
+    from rlinf.hybrid_engines.fsdp.utils import FSDPVersion
+
+    model = nn.Linear(2, 1)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01, weight_decay=0.1)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=2)
+    model(torch.ones(1, 2)).square().mean().backward()
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    scheduler.step()
+    expected_model = copy.deepcopy(model.state_dict())
+    expected_optimizer = copy.deepcopy(optimizer.state_dict())
+    expected_scheduler = copy.deepcopy(scheduler.state_dict())
+    checkpoint = Checkpoint(
+        model,
+        optimizer,
+        scheduler,
+        StateDictOptions(cpu_offload=True),
+        FSDPVersion.FSDP,
+    )
+    saved = copy.deepcopy(checkpoint.state_dict())
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.add_(0.25)
+        for state in optimizer.state.values():
+            for value in state.values():
+                if isinstance(value, torch.Tensor):
+                    value.zero_()
+    scheduler.last_epoch = 99
+
+    checkpoint.load_state_dict(saved)
+
+    torch.testing.assert_close(model.state_dict(), expected_model)
+    torch.testing.assert_close(optimizer.state_dict(), expected_optimizer)
+    assert scheduler.state_dict() == expected_scheduler
 
 
 def test_rlt_trainable_save_persists_runtime_action_contract(monkeypatch, tmp_path):

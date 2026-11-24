@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dataclasses
 import time
 from functools import partial
 from typing import Optional
@@ -34,6 +35,7 @@ from rlinf.config import SupportedModel, torch_dtype_from_precision
 from rlinf.data.embodied_io_struct import Trajectory, convert_trajectories_to_batch
 from rlinf.data.io_struct import BatchResizingIterator, RolloutResult
 from rlinf.data.lerobot_paths import resolve_lerobot_repo_id
+from rlinf.hybrid_engines.fsdp import FSDP
 from rlinf.hybrid_engines.fsdp.fsdp_model_manager import FSDPModelManager
 from rlinf.hybrid_engines.fsdp.utils import (
     pack_fsdp_input,
@@ -1146,7 +1148,20 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 load_base_path,
                 expected_semantics=expected_semantics,
             )
-        return super().load_checkpoint(load_base_path)
+        super().load_checkpoint(load_base_path)
+        if self.enable_sft_co_train:
+            from rlinf.workers.sft.fsdp_vla_sft_worker import FSDPVlaSftWorker
+
+            FSDPVlaSftWorker._load_openpi_data_state(self, load_base_path)
+
+    def save_checkpoint(self, save_path: str, step: int = 0) -> None:
+        super().save_checkpoint(save_path, step)
+        if self.enable_sft_co_train:
+            from rlinf.workers.sft.fsdp_vla_sft_worker import FSDPVlaSftWorker
+
+            if self._rank == 0:
+                FSDPVlaSftWorker._save_openpi_data_state(self, save_path)
+            torch.distributed.barrier()
 
     def model_provider_func(self) -> nn.Module:
         model = get_model(self.cfg.actor.model)
@@ -1160,7 +1175,45 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         return model
 
     def get_rollout_state_dict(self) -> dict:
-        return self.get_model_state_dict(cpu_offload=False, full_state_dict=False)
+        ignore_frozen_params = self.cfg.actor.get(
+            "rollout_sync_ignore_frozen_params", False
+        )
+        if ignore_frozen_params and isinstance(self.model, FSDP):
+            # PyTorch filters frozen parameters only after its sharded exporter
+            # has cloned them on GPU. Stage full parameters on CPU and copy only
+            # synchronized tensors before FSDP restores its sharded views.
+            allowed_names = set(self.param_names_need_sync)
+            state_dict = {}
+            with FSDP.summon_full_params(
+                self.model, writeback=False, offload_to_cpu=True
+            ):
+                for tensors in (
+                    self.model.named_parameters(remove_duplicate=False),
+                    self.model.named_buffers(remove_duplicate=False),
+                ):
+                    for name, value in tensors:
+                        name = self._normalize_fsdp_param_name(name)
+                        if name in allowed_names:
+                            state_dict[name] = value.detach().to("cpu", copy=True)
+            return {name: value.to(self.device) for name, value in state_dict.items()}
+        state_dict = self.get_model_state_dict(
+            cpu_offload=False,
+            full_state_dict=False,
+            ignore_frozen_params=ignore_frozen_params,
+        )
+        if ignore_frozen_params:
+            # FSDP can retain a tied frozen alias (for example Gemma's
+            # ``lm_head.weight``) in the materialized state dict even when
+            # ``ignore_frozen_params`` is requested.  Rollout builds its
+            # receiver dict from the actual trainable parameters and buffers,
+            # so apply the same pre-FSDP whitelist on the sender side.
+            allowed_names = set(self.param_names_need_sync)
+            state_dict = {
+                name: value
+                for name, value in state_dict.items()
+                if name in allowed_names
+            }
+        return state_dict
 
     @Worker.timer("actor/sync_model_to_rollout")
     async def sync_model_to_rollout(self) -> None:
@@ -1560,14 +1613,35 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             data_loader_config = get_openpi_config(
                 training_config_name,
                 model_path=self.cfg.actor.model.model_path,
+                batch_size=self.cfg.actor.micro_batch_size * self._world_size,
                 repo_id=repo_id,
                 data_kwargs=getattr(self.cfg.actor.model, "openpi_data", None),
+            )
+            data_loader_config = dataclasses.replace(
+                data_loader_config,
+                model=dataclasses.replace(
+                    data_loader_config.model,
+                    discrete_state_input=self.cfg.actor.model.openpi.get(
+                        "discrete_state_input",
+                        data_loader_config.model.discrete_state_input,
+                    ),
+                ),
             )
             self.data_loader = _data.create_data_loader(
                 data_loader_config, framework="pytorch", shuffle=True
             )
-            self.sft_iterator = iter(self.data_loader)
-            self.train_epoch = 0
+            # OpenPI's DataLoaderImpl converts each batch to the standard
+            # Observation dataclass and drops RLinf-local fields such as
+            # tactile_prefix/tactile_contact. Reuse the shared adapter so
+            # TacCoRL SFT receives those fields as an explicit payload.
+            from rlinf.workers.sft.fsdp_vla_sft_worker import (
+                _OpenPiTactileDataLoader,
+            )
+
+            self.data_loader = _OpenPiTactileDataLoader(self.data_loader)
+            self.data_iter = iter(self.data_loader)
+            self._data_epoch = 0
+            self._data_iter_offset = 0
             self.sft_loss_weight = self.cfg.actor.get("sft_loss_weight", 0.1)
         else:
             raise KeyError(
@@ -1584,17 +1658,42 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         # Get next data batch
         try:
-            observation, actions = next(self.sft_iterator)
+            sft_batch = next(self.data_iter)
         except StopIteration:
-            self.train_epoch += 1
-            self.data_loader.set_epoch(self.train_epoch)
-            self.sft_iterator = iter(self.data_loader)
-            observation, actions = next(self.sft_iterator)
+            self._data_epoch += 1
+            self._data_iter_offset = 0
+            self.data_loader.set_epoch(self._data_epoch)
+            self.data_iter = iter(self.data_loader)
+            sft_batch = next(self.data_iter)
+        self._data_iter_offset += 1
 
-        sft_loss = self.model(
-            data=(observation, actions),
-            forward_type=ForwardType.SFT,
-        )
+        if isinstance(sft_batch, dict):
+            observation = sft_batch["observation"]
+            actions = sft_batch["actions"]
+            sft_data = sft_batch
+        else:
+            observation, actions = sft_batch
+            sft_data = (observation, actions)
+
+        with self.amp_context:
+            sft_output = self.model(
+                data=sft_data,
+                forward_type=ForwardType.SFT,
+            )
+        if isinstance(sft_output, dict):
+            sft_loss = sft_output["loss"]
+            for name in (
+                "action_loss",
+                "tactile_loss",
+                "padding_loss",
+                "contact_gate_rate",
+                "cross_attn_alpha",
+            ):
+                value = sft_output.get(name)
+                if value is not None:
+                    metrics_data[f"sft_{name}"] = value.detach().item()
+        else:
+            sft_loss = sft_output
         metrics_data["sft_loss"] = sft_loss.detach().item()
         total_loss = loss + self.sft_loss_weight * sft_loss
         loss = total_loss
@@ -1874,7 +1973,14 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         metrics_data["actor/entropy_loss"] = entropy_loss.detach().item()
 
         if self.enable_sft_co_train:
-            loss = self._train_sft_epoch(metrics_data, loss)
+            # Accumulate both objectives before the optimizer step, but release
+            # the PPO activations before building the SFT graph.
+            with backward_ctx:
+                self.grad_scaler.scale(loss / self.gradient_accumulation).backward()
+            loss = self._train_sft_epoch(metrics_data, loss.detach())
+            backward_ctx = self.before_micro_batch(
+                self.model, is_last_micro_batch=is_last
+            )
 
         loss /= self.gradient_accumulation
         with backward_ctx:

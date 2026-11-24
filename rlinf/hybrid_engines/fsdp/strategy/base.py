@@ -401,7 +401,11 @@ class FSDPStrategyBase(ABC):
         torch.distributed.barrier()
 
     def get_model_state_dict(
-        self, model: Union[FSDP, FSDPModule], cpu_offload: bool, full_state_dict: bool
+        self,
+        model: Union[FSDP, FSDPModule],
+        cpu_offload: bool,
+        full_state_dict: bool,
+        ignore_frozen_params: bool = False,
     ) -> dict:
         """
         Get the full model state dict of FSDP2 from all ranks.
@@ -416,7 +420,9 @@ class FSDPStrategyBase(ABC):
             - dict: The state dict of the FSDP/FSDP2 wrapped model according to the specified options.
         """
         opts = StateDictOptions(
-            cpu_offload=cpu_offload, full_state_dict=full_state_dict
+            cpu_offload=cpu_offload,
+            full_state_dict=full_state_dict,
+            ignore_frozen_params=ignore_frozen_params,
         )
         state_dict = get_model_state_dict(model=model, options=opts)
         return state_dict

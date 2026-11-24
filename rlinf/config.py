@@ -16,6 +16,7 @@ import dataclasses
 import importlib.util
 import json
 import logging
+import math
 import os
 from dataclasses import asdict
 from pathlib import Path
@@ -988,6 +989,30 @@ def _validate_tabero_realworld_pi05_pirl_contract(cfg, model_cfg) -> None:
             "tactile_prefix_diff_from_reference": None,
         }
         expected_tactile_streams = []
+    elif (
+        config_name == "pi05_lora_taccorl_realworld_replayed_task820"
+        and openpi_cfg.get("tactile_fusion") == "taccorl"
+        and list(openpi_cfg.get("tactile_streams") or [])
+        == ["tactile_prefix", "tactile_suffix"]
+    ):
+        tactile_kind = "taccorl"
+        required_openpi_values = {
+            **common_openpi_values,
+            "config_name": config_name,
+            "action_horizon": 50,
+            "num_images_in_input": 2,
+            "tactile_prefix_dim_in": 9 * 440 * 2,
+            "tactile_prefix_history": 8,
+            "tactile_prefix_encoder_type": "tcn",
+            "tactile_prefix_use_reference_frame": True,
+            "tactile_prefix_diff_from_reference": False,
+            "tactile_fusion": "taccorl",
+            "tactile_prefix_num_tokens": 8,
+            "tactile_suffix_num_tokens": 8,
+            "tactile_prefix_cross_attn": True,
+            "tactile_cross_attn_heads": 8,
+        }
+        expected_tactile_streams = ["tactile_prefix", "tactile_suffix"]
     elif list(openpi_cfg.get("tactile_streams") or []) == ["tactile_prefix"]:
         tactile_kind = "tacfield"
         action_horizon = openpi_cfg.get("action_horizon")
@@ -1846,6 +1871,11 @@ def validate_embodied_cfg(cfg):
     component_placement = HybridComponentPlacement(cfg, Cluster())
     stage_num = cfg.rollout.pipeline_stage_num
     env_world_size = component_placement.get_world_size("env")
+    actor_world_size = component_placement.get_world_size("actor")
+    logical_env_shards = env_world_size * stage_num
+    actor_split_num = (
+        math.lcm(actor_world_size, logical_env_shards) // logical_env_shards
+    )
 
     use_reward_model = cfg.get("reward", {}).get("use_reward_model", False)
     standalone_realworld = cfg.get("reward", {}).get("standalone_realworld", False)
@@ -1914,6 +1944,11 @@ def validate_embodied_cfg(cfg):
         ), (
             "env.eval.max_steps_per_rollout_epoch must be divisible by actor.model.num_action_chunks"
         )
+        eval_envs_per_logical_shard = cfg.env.eval.total_num_envs // logical_env_shards
+        assert eval_envs_per_logical_shard % actor_split_num == 0, (
+            "env.eval.total_num_envs per logical env shard must be divisible by "
+            f"the actor split count ({actor_split_num})"
+        )
 
     if not only_eval:
         assert cfg.env.train.total_num_envs > 0, (
@@ -1941,6 +1976,13 @@ def validate_embodied_cfg(cfg):
             cfg.env.train.max_steps_per_rollout_epoch % model_cfg.num_action_chunks == 0
         ), (
             "env.train.max_steps_per_rollout_epoch must be divisible by actor.model.num_action_chunks"
+        )
+        train_envs_per_logical_shard = (
+            cfg.env.train.total_num_envs // logical_env_shards
+        )
+        assert train_envs_per_logical_shard % actor_split_num == 0, (
+            "env.train.total_num_envs per logical env shard must be divisible by "
+            f"the actor split count ({actor_split_num})"
         )
     with open_dict(cfg):
         weight_sync_interval = cfg.runner.get("weight_sync_interval", 1)

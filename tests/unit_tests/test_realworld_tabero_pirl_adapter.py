@@ -668,7 +668,7 @@ def test_action_filter_tuning_is_not_locked_to_an_experiment():
     )
 
 
-@pytest.mark.parametrize("modality", ["tacfield", "tacimg", "vision"])
+@pytest.mark.parametrize("modality", ["tacfield", "tacimg", "vision", "taccorl"])
 def test_pirl_interface_validation_does_not_read_initialization_artifacts(
     monkeypatch, modality
 ):
@@ -741,7 +741,18 @@ def test_pirl_interface_validation_does_not_read_initialization_artifacts(
         }
     )
 
-    if modality != "tacfield":
+    if modality == "taccorl":
+        openpi = cfg.actor.model.openpi
+        openpi.config_name = "pi05_lora_taccorl_realworld_replayed_task820"
+        openpi.action_horizon = 50
+        openpi.num_images_in_input = 2
+        openpi.tactile_fusion = "taccorl"
+        openpi.tactile_streams = ["tactile_prefix", "tactile_suffix"]
+        openpi.tactile_prefix_num_tokens = 8
+        openpi.tactile_suffix_num_tokens = 8
+        openpi.tactile_prefix_cross_attn = True
+        openpi.tactile_cross_attn_heads = 8
+    elif modality != "tacfield":
         openpi = cfg.actor.model.openpi
         openpi.config_name = (
             "pi05_lora_vision_realworld_replayed_task820"

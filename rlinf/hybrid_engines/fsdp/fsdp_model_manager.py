@@ -369,7 +369,12 @@ class FSDPModelManager:
             self._cfg.fsdp_config.grad_scaler.get("enabled", False), **kwargs
         )
 
-    def get_model_state_dict(self, cpu_offload: bool, full_state_dict: bool) -> dict:
+    def get_model_state_dict(
+        self,
+        cpu_offload: bool,
+        full_state_dict: bool,
+        ignore_frozen_params: bool = False,
+    ) -> dict:
         """
         Get the model state dict according to the specified options.
 
@@ -382,7 +387,10 @@ class FSDPModelManager:
             - dict: The state dict of the FSDP wrapped model according to the specified options
         """
         state_dict = self._strategy.get_model_state_dict(
-            self.model, cpu_offload, full_state_dict
+            self.model,
+            cpu_offload,
+            full_state_dict,
+            ignore_frozen_params=ignore_frozen_params,
         )
         return state_dict
 

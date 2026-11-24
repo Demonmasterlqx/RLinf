@@ -43,6 +43,7 @@ from rlinf.utils.dsrl_rollout_sync import (
     validate_dsrl_rollout_sync_config,
 )
 from rlinf.utils.placement import HybridComponentPlacement
+from rlinf.utils.utils import collect_param_names_need_sync
 
 
 class MultiStepRolloutWorker(Worker):
@@ -698,6 +699,11 @@ class MultiStepRolloutWorker(Worker):
     def _get_rollout_sync_state_dict(self) -> dict[str, torch.Tensor]:
         """Build the receiver state dictionary for actor weight synchronization."""
         state_dict = self.hf_model.state_dict()
+        if self.cfg.actor.get("rollout_sync_ignore_frozen_params", False):
+            sync_names = set(collect_param_names_need_sync(self.hf_model))
+            state_dict = {
+                key: value for key, value in state_dict.items() if key in sync_names
+            }
         use_dsrl = self.model_cfg.get("openpi", {}).get("use_dsrl", False)
         if not use_dsrl:
             return state_dict

@@ -567,7 +567,8 @@ def test_task_indices_follow_multi_epoch_flattening_and_shuffle():
     )
 
 
-def test_real_actor_micro_batch_weights_all_three_terms(monkeypatch):
+@pytest.mark.parametrize("sft_co_train", [False, True])
+def test_real_actor_micro_batch_weights_all_three_terms(monkeypatch, sft_co_train):
     from contextlib import nullcontext
     from types import SimpleNamespace
 
@@ -595,8 +596,13 @@ def test_real_actor_micro_batch_weights_all_three_terms(monkeypatch):
         }
     )
     parameter = torch.nn.Parameter(torch.tensor(0.1))
+    backward_calls = []
+    parameter.register_hook(lambda gradient: backward_calls.append(1))
 
     def model(**kwargs):
+        if "data" in kwargs:
+            assert backward_calls, "PPO backward must precede SFT forward"
+            return {"loss": parameter.square()}
         n = kwargs["forward_inputs"]["action"].shape[0]
         return {
             "logprobs": parameter.expand(n, 1, 1),
@@ -611,7 +617,11 @@ def test_real_actor_micro_batch_weights_all_three_terms(monkeypatch):
     actor._tabero_ppo_transition_boundary_semantics = None
     actor.optimizer_steps = 1
     actor.critic_warmup_steps = 0
-    actor.enable_sft_co_train = False
+    actor.enable_sft_co_train = sft_co_train
+    actor.data_iter = iter([(None, None)])
+    actor._data_iter_offset = 0
+    actor.sft_loss_weight = 0.7
+    actor.logger = MagicMock()
     actor.gradient_accumulation = 2
     actor.grad_scaler = SimpleNamespace(scale=lambda loss: loss)
     monkeypatch.setattr(
@@ -651,6 +661,10 @@ def test_real_actor_micro_batch_weights_all_three_terms(monkeypatch):
         sample_weights=batch["sample_weights"],
     )
     reference -= 0.005 * ((parameter + 2) * batch["sample_weights"]).mean()
+    if sft_co_train:
+        reference += (
+            actor.sft_loss_weight * parameter.square() / actor.gradient_accumulation
+        )
     reference.backward()
     torch.testing.assert_close(actual_grad, parameter.grad)
 
@@ -781,3 +795,134 @@ def test_controller_failed_migration_is_atomic(tmp_path):
         (target.ema, target.initialized, target.totals), before
     ):
         torch.testing.assert_close(actual, expected)
+
+
+def test_actor_sft_co_train_accepts_taccorl_loss_dict():
+    from types import SimpleNamespace
+
+    from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
+
+    actor = object.__new__(EmbodiedFSDPActor)
+    actor.data_iter = iter([(None, None)])
+    actor.data_loader = SimpleNamespace()
+    actor._data_epoch = 0
+    actor._data_iter_offset = 0
+    actor.sft_loss_weight = 0.5
+    actor.amp_context = nullcontext()
+    actor.logger = MagicMock()
+    actor.model = lambda **_: {
+        "loss": torch.tensor(3.0, requires_grad=True),
+        "action_loss": torch.tensor(2.0),
+        "tactile_loss": torch.tensor(4.0),
+    }
+
+    metrics = {}
+    total = EmbodiedFSDPActor._train_sft_epoch(
+        actor, metrics, torch.tensor(1.0, requires_grad=True)
+    )
+
+    assert total.item() == pytest.approx(2.5)
+    assert metrics["sft_loss"] == pytest.approx(3.0)
+    assert metrics["sft_action_loss"] == pytest.approx(2.0)
+    assert metrics["sft_tactile_loss"] == pytest.approx(4.0)
+
+
+def test_actor_checkpoint_restores_sft_cursor_without_consuming_model_rng(
+    monkeypatch, tmp_path
+):
+    from rlinf.hybrid_engines.fsdp.fsdp_model_manager import FSDPModelManager
+    from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
+
+    class Loader:
+        def __len__(self):
+            return 3
+
+        def __iter__(self):
+            for index in range(3):
+                torch.rand(1)
+                yield None, torch.tensor(index)
+
+        def set_epoch(self, epoch):
+            self.epoch = epoch
+
+        def resume_signature(self):
+            return None
+
+    monkeypatch.setattr(FSDPModelManager, "save_checkpoint", lambda *args: None)
+    monkeypatch.setattr(FSDPModelManager, "load_checkpoint", lambda *args: None)
+    monkeypatch.setattr(dist, "barrier", lambda: None)
+    actor = object.__new__(EmbodiedFSDPActor)
+    actor._rank = 0
+    actor.enable_sft_co_train = True
+    actor._tabero_ppo_transition_boundary_semantics = None
+    actor.data_loader = Loader()
+    actor.data_iter = iter(actor.data_loader)
+    actor._data_epoch = 0
+    actor._data_iter_offset = 0
+    actor.sft_loss_weight = 0.5
+    actor.amp_context = nullcontext()
+    actor.logger = MagicMock()
+    actor.model = lambda **kwargs: torch.tensor(3.0, requires_grad=True)
+    for _ in range(2):
+        actor._train_sft_epoch({}, torch.tensor(1.0, requires_grad=True))
+    actor.save_checkpoint(str(tmp_path), step=2)
+    assert (
+        json.loads((tmp_path / "data_state.json").read_text())["data_iter_offset"] == 2
+    )
+    actor._train_sft_epoch({}, torch.tensor(1.0, requires_grad=True))
+    rng = torch.get_rng_state()
+
+    actor.load_checkpoint(str(tmp_path))
+
+    assert torch.equal(torch.get_rng_state(), rng)
+    assert actor._data_iter_offset == 2
+    assert next(actor.data_iter)[1].item() == 2
+
+
+def test_actor_sft_loader_uses_actor_micro_batch(monkeypatch):
+    import dataclasses
+
+    import openpi.training.data_loader as data_module
+
+    from rlinf.models.embodiment.openpi import dataconfig
+    from rlinf.workers.actor.fsdp_actor_worker import EmbodiedFSDPActor
+    from rlinf.workers.sft import fsdp_vla_sft_worker
+
+    @dataclasses.dataclass
+    class ModelConfig:
+        discrete_state_input: bool = True
+
+    @dataclasses.dataclass
+    class DataConfig:
+        model: ModelConfig
+        batch_size: int
+
+    get_config = MagicMock(
+        side_effect=lambda *args, **kwargs: DataConfig(
+            model=ModelConfig(), batch_size=kwargs.get("batch_size", 32)
+        )
+    )
+    create_loader = MagicMock()
+    monkeypatch.setattr(dataconfig, "get_openpi_config", get_config)
+    monkeypatch.setattr(data_module, "create_data_loader", create_loader)
+    monkeypatch.setattr(fsdp_vla_sft_worker, "_OpenPiTactileDataLoader", MagicMock())
+    actor = object.__new__(EmbodiedFSDPActor)
+    actor._world_size = 2
+    actor.cfg = OmegaConf.create(
+        {
+            "actor": {
+                "micro_batch_size": 1,
+                "config_name": "synthetic",
+                "sft_data_path": "synthetic/repo",
+                "model": {
+                    "model_type": "openpi",
+                    "model_path": None,
+                    "openpi": {"discrete_state_input": False},
+                },
+            }
+        }
+    )
+    actor._build_sft_data_loader()
+    resolved = create_loader.call_args.args[0]
+    assert resolved.batch_size == 2
+    assert resolved.model.discrete_state_input is False

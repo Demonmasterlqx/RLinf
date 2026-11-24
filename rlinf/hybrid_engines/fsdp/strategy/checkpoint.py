@@ -19,6 +19,8 @@ import torch
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
     get_state_dict,
+    set_model_state_dict,
+    set_optimizer_state_dict,
     set_state_dict,
 )
 from torch.distributed.checkpoint.stateful import Stateful
@@ -27,7 +29,8 @@ from torch.optim.lr_scheduler import LRScheduler
 
 from rlinf.hybrid_engines.fsdp import FSDP, FSDPModule
 from rlinf.hybrid_engines.fsdp.utils import FSDPVersion, to_local_if_dtensor
-from rlinf.utils.utils import get_rng_state, set_rng_state
+from rlinf.utils.nested_dict_process import put_tensor_device
+from rlinf.utils.utils import clear_memory, get_rng_state, set_rng_state
 
 
 class Checkpoint(Stateful):
@@ -114,6 +117,26 @@ class Checkpoint(Stateful):
 
             self._load_local_optim_state_dicts(state["optimizers"])
 
+        elif self.opts.cpu_offload:
+            # The combined PyTorch setter loads optimizer moments onto GPU
+            # before FSDP gathers model weights. Keep moments on CPU until the
+            # model writeback has released its full parameter buffers.
+            optimizers = (
+                (self.optimizers,)
+                if isinstance(self.optimizers, Optimizer)
+                else tuple(self.optimizers)
+            )
+            for optimizer in optimizers:
+                for parameter_state in optimizer.state.values():
+                    put_tensor_device(parameter_state, "cpu")
+            clear_memory()
+            set_model_state_dict(self.model, state["model"], options=self.opts)
+            set_optimizer_state_dict(
+                self.model,
+                optimizers,
+                state.get("optimizers", state.get("optim")),
+                options=self.opts,
+            )
         else:
             set_state_dict(
                 model=self.model,

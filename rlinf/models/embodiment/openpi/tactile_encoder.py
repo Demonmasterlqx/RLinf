@@ -13,8 +13,8 @@
 # limitations under the License.
 
 import torch
-from torch import nn
 import torch.nn.functional as F
+from torch import nn
 
 
 class TactileTCNBlock(nn.Module):
@@ -145,11 +145,17 @@ class MarkerTokenEncoder(nn.Module):
     ):
         super().__init__()
         if in_dim <= 0 or in_dim % 2:
-            raise ValueError("MarkerTokenEncoder.in_dim must be a positive even number.")
+            raise ValueError(
+                "MarkerTokenEncoder.in_dim must be a positive even number."
+            )
         if history_len <= 0 or min(prefix_num_tokens, suffix_num_tokens) <= 0:
-            raise ValueError("MarkerTokenEncoder requires positive history and token counts.")
+            raise ValueError(
+                "MarkerTokenEncoder requires positive history and token counts."
+            )
         if num_layers != 2:
-            raise ValueError("MarkerTokenEncoder uses exactly two TCN blocks for JAX parity.")
+            raise ValueError(
+                "MarkerTokenEncoder uses exactly two TCN blocks for JAX parity."
+            )
         self.input_dim = in_dim
         self.history_len = history_len
         self.has_reference_frame = has_reference_frame
@@ -159,7 +165,9 @@ class MarkerTokenEncoder(nn.Module):
         self.prefix_num_tokens = prefix_num_tokens
         self.suffix_num_tokens = suffix_num_tokens
         self.blocks = nn.ModuleList(
-            TactileTCNBlock(in_dim if idx == 0 else suffix_width, suffix_width, kernel_size)
+            TactileTCNBlock(
+                in_dim if idx == 0 else suffix_width, suffix_width, kernel_size
+            )
             for idx in range(num_layers)
         )
         self.prefix_proj = nn.Linear(suffix_width, prefix_num_tokens * prefix_width)
@@ -187,9 +195,16 @@ class MarkerTokenEncoder(nn.Module):
         for block in self.blocks:
             hidden = block(hidden)
         pooled = hidden[:, -1, :]
-        prefix = self.prefix_proj(pooled).reshape(-1, self.prefix_num_tokens, self.prefix_width)
-        suffix = self.suffix_proj(pooled).reshape(-1, self.suffix_num_tokens, self.suffix_width)
-        return prefix + self.prefix_token_embedding, suffix + self.suffix_token_embedding
+        prefix = self.prefix_proj(pooled).reshape(
+            -1, self.prefix_num_tokens, self.prefix_width
+        )
+        suffix = self.suffix_proj(pooled).reshape(
+            -1, self.suffix_num_tokens, self.suffix_width
+        )
+        return (
+            prefix + self.prefix_token_embedding,
+            suffix + self.suffix_token_embedding,
+        )
 
 
 def _select_tcn_frames_torch(
@@ -200,11 +215,15 @@ def _select_tcn_frames_torch(
     diff_from_reference: bool,
 ) -> torch.Tensor:
     if tactile.ndim != 3:
-        raise ValueError(f"MarkerTokenEncoder expects rank 3 input, got {tuple(tactile.shape)}.")
+        raise ValueError(
+            f"MarkerTokenEncoder expects rank 3 input, got {tuple(tactile.shape)}."
+        )
     num_steps = tactile.shape[1]
     if has_reference_frame:
         if num_steps < 2:
-            raise ValueError("Reference-frame tactile input requires at least 2 frames.")
+            raise ValueError(
+                "Reference-frame tactile input requires at least 2 frames."
+            )
         if diff_from_reference:
             max_hist = min(history_len, num_steps - 1)
             return tactile[:, 1 : 1 + max_hist, :] - tactile[:, 0:1, :]
@@ -218,7 +237,9 @@ class TactilePrefixCrossAttention(nn.Module):
     def __init__(self, width: int, num_heads: int, *, eps: float = 1e-6):
         super().__init__()
         if num_heads <= 0 or width % num_heads:
-            raise ValueError("Cross-attention num_heads must divide the embedding width.")
+            raise ValueError(
+                "Cross-attention num_heads must divide the embedding width."
+            )
         self.num_heads = num_heads
         self.head_dim = width // num_heads
         self.norm = nn.LayerNorm(width, eps=eps)
@@ -228,6 +249,7 @@ class TactilePrefixCrossAttention(nn.Module):
         self.out = nn.Linear(width, width, bias=True)
         # FSDP requires a one-element vector instead of a scalar parameter.
         self.alpha = nn.Parameter(torch.zeros(1, dtype=torch.float32))
+        self.register_buffer("last_alpha", torch.zeros(()), persistent=False)
 
     def forward(
         self, base: torch.Tensor, tactile: torch.Tensor, tactile_mask: torch.Tensor
@@ -253,13 +275,21 @@ class TactilePrefixCrossAttention(nn.Module):
         )
         logits = torch.einsum("bqhd,bkhd->bhqk", query, key).float()
         logits = logits * (self.head_dim**-0.5)
-        key_mask = tactile_mask.to(device=logits.device, dtype=torch.bool)[:, None, None, :]
-        weights = torch.softmax(logits.masked_fill(~key_mask, torch.finfo(torch.float32).min), dim=-1)
+        key_mask = tactile_mask.to(device=logits.device, dtype=torch.bool)[
+            :, None, None, :
+        ]
+        weights = torch.softmax(
+            logits.masked_fill(~key_mask, torch.finfo(torch.float32).min), dim=-1
+        )
         weights = torch.where(key_mask, weights, torch.zeros_like(weights))
         attended = torch.einsum(
             "bhqk,bkhd->bqhd", weights.to(dtype=value.dtype), value
         ).reshape_as(base_work)
         residual = self.out(attended)
-        contact = tactile_mask.to(device=residual.device, dtype=torch.bool).any(dim=-1, keepdim=True)
+        contact = tactile_mask.to(device=residual.device, dtype=torch.bool).any(
+            dim=-1, keepdim=True
+        )
+        # Capture the diagnostic before FSDP reshards the scalar parameter.
+        self.last_alpha = torch.tanh(self.alpha.detach()).mean()
         scale = torch.tanh(self.alpha.to(dtype=residual.dtype)) * contact[:, :, None]
         return base + (scale * residual).to(dtype=base.dtype)
