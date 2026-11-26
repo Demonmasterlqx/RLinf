@@ -29,6 +29,7 @@ from openpi.models import model as _model
 from openpi.models.pi0_config import Pi0Config
 from openpi.models_pytorch.pi0_pytorch import PI0Pytorch, make_att_2d_masks
 from torch.utils._pytree import tree_map
+from transformers.cache_utils import DynamicCache
 
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
 from rlinf.models.embodiment.modules.explore_noise_net import ExploreNoiseNet
@@ -885,10 +886,8 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 "taccorl requires observation.tactile_prefix containing per-frame marker vectors."
             )
         encoder = self.marker_token_encoder
-        tactile_prefix = tactile_prefix.to(
-            device=encoder.prefix_proj.weight.device,
-            dtype=encoder.prefix_proj.weight.dtype,
-        )
+        # FSDP may expose a CPU weight view after saving until its pre-forward
+        # hook runs. Keep the observation device; the encoder casts its dtype.
         return self._apply_checkpoint(encoder, tactile_prefix)
 
     def _preprocess_observation_with_tactile(self, observation, *, train=True):
@@ -1171,7 +1170,8 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             marker_tokens=marker_tokens,
             tactile_contact=tactile_contact,
         )
-        v_t = self.denoise_step(
+        v_t = self._apply_checkpoint(
+            self.denoise_step,
             state,
             prefix_pad_masks,
             past_key_values,
@@ -1618,6 +1618,12 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         images = [img.to(device) for img in images]
         img_masks = [img_mask.to(device) for img_mask in img_masks]
         state = state.to(device)
+        if lang_tokens is not None:
+            lang_tokens = lang_tokens.to(device)
+        if lang_masks is not None:
+            lang_masks = lang_masks.to(device)
+        if tactile_prefix is not None:
+            tactile_prefix = tactile_prefix.to(device)
         # get log prob
         log_probs, value_t, entropy = self.get_log_prob_value(
             images,
@@ -2400,22 +2406,62 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
         self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
-        # Gemma disables KV cache creation when its checkpointing flag is set.
-        # Keep the prefix cache available to the checkpointed suffix forward.
         language_model = self.paligemma_with_expert.paligemma.language_model
-        checkpointing = getattr(language_model, "gradient_checkpointing", False)
-        language_model.gradient_checkpointing = False
-        try:
-            (prefix_output, _), past_key_values = self.paligemma_with_expert.forward(
-                attention_mask=prefix_att_2d_masks_4d,
-                position_ids=prefix_position_ids,
-                past_key_values=None,
-                inputs_embeds=[prefix_embs, None],
-                use_cache=True,
+        if self.gradient_checkpointing_enabled and self.training:
+            prefix_output, past_key_values = self._checkpoint_prefix_layers(
+                prefix_embs, prefix_att_2d_masks_4d, prefix_position_ids
             )
-        finally:
-            language_model.gradient_checkpointing = checkpointing
+        else:
+            # Gemma suppresses KV output when its internal checkpoint flag is on.
+            checkpointing = language_model.gradient_checkpointing
+            language_model.gradient_checkpointing = False
+            try:
+                (prefix_output, _), past_key_values = (
+                    self.paligemma_with_expert.forward(
+                        attention_mask=prefix_att_2d_masks_4d,
+                        position_ids=prefix_position_ids,
+                        past_key_values=None,
+                        inputs_embeds=[prefix_embs, None],
+                        use_cache=True,
+                    )
+                )
+            finally:
+                language_model.gradient_checkpointing = checkpointing
         return prefix_output, prefix_pad_masks, past_key_values
+
+    def _checkpoint_prefix_layers(self, embeddings, attention_mask, position_ids):
+        """Recompute each OpenPI Gemma layer without mutating the returned cache."""
+        model = self.paligemma_with_expert.paligemma.language_model
+        if model.layers[0].self_attn.q_proj.weight.dtype == torch.bfloat16:
+            embeddings = embeddings.to(torch.bfloat16)
+        positions = model.rotary_emb(embeddings, position_ids)
+        cache_position = torch.arange(embeddings.shape[1], device=embeddings.device)
+        cache = DynamicCache()
+        for index, layer in enumerate(model.layers):
+
+            def forward_layer(hidden, positions, layer=layer, index=index):
+                # A fresh cache isolates backward recomputation from the cache
+                # already consumed by the suffix and other decoder layers.
+                layer_cache = DynamicCache()
+                outputs = layer(
+                    hidden,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_value=layer_cache,
+                    use_cache=True,
+                    cache_position=cache_position,
+                    position_embeddings=positions,
+                    adarms_cond=None,
+                )
+                key, value = layer_cache[index]
+                return outputs[0], key, value
+
+            embeddings, key, value = self._apply_checkpoint(
+                forward_layer, embeddings, positions
+            )
+            cache.update(key, value, index)
+        output, _ = self._apply_checkpoint(model.norm, embeddings)
+        return output, cache
 
     def _compute_value_from_suffix(self, suffix_out):
         """Compute value from suffix output using value head."""
