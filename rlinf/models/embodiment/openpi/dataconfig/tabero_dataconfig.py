@@ -124,6 +124,7 @@ class TaberoTacCoRLDataConfig(TaberoTacFieldDataConfig):
 
     contact_threshold: float = 1.0
     contact_min_active: int = 5
+    episodes: tuple[int, ...] | None = None
 
     @override
     def create(
@@ -132,6 +133,7 @@ class TaberoTacCoRLDataConfig(TaberoTacFieldDataConfig):
         config = super().create(assets_dirs, model_config)
         return dataclasses.replace(
             config,
+            episodes=self.episodes,
             data_transforms=dataclasses.replace(
                 config.data_transforms,
                 inputs=[

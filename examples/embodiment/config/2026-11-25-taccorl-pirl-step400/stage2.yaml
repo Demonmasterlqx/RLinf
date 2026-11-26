@@ -1,0 +1,39 @@
+# @package _global_
+defaults:
+  - stage1
+  - _self_
+
+runner:
+  max_epochs: 400
+  max_steps: 400
+  resume_dir: ${runner.logger.log_path}/${runner.logger.experiment_name}/checkpoints/global_step_200
+  logger:
+    log_start_step: 200
+
+env:
+  train:
+    multi_task:
+      tasks:
+        - name: vitasoy
+          init_params:
+            target_object: target_object_1
+            task_description: pick up the Vitasoy and put it into the basket
+            success:
+              normalize_effort_reward:
+                enabled: true
+                min_effort: 2.0
+                max_effort: 36.0
+        - name: coca_cola
+          init_params:
+            target_object: target_object_2
+            task_description: Pick up the Coca-Cola and put it into the basket
+            success:
+              normalize_effort_reward:
+                enabled: true
+                min_effort: 4.0
+                max_effort: 12.0
+    init_params:
+      realworld_config_dir: ${oc.env:TACCORL_RUN_DIR}/env/stage2
+      success:
+        normalize_effort_reward:
+          enabled: true
