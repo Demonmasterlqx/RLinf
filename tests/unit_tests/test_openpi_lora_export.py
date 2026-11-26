@@ -19,7 +19,7 @@ import pytest
 import torch
 from omegaconf import OmegaConf
 from safetensors import safe_open
-from safetensors.torch import save_file
+from safetensors.torch import load_file, save_file
 from torch import nn
 
 from rlinf.utils.ckpt_convertor import export_openpi_lora_for_t2vla as exporter
@@ -377,9 +377,7 @@ def test_tabero_image_schema_matches_fixed_base_exactly(tmp_path, method):
     model = tmp_path / "model.safetensors"
     save_file(base_tensors, model)
 
-    counts = exporter._validate_tabero_sft_export_schema(
-        model, base, method=method
-    )
+    counts = exporter._validate_tabero_sft_export_schema(model, base, method=method)
 
     assert counts == {
         "base_tensor_count": 2,
@@ -404,9 +402,7 @@ def test_tabero_image_schema_rejects_extra_tensors(tmp_path, method):
     )
 
     with pytest.raises(ValueError, match="extra_count=1"):
-        exporter._validate_tabero_sft_export_schema(
-            model, base, method=method
-        )
+        exporter._validate_tabero_sft_export_schema(model, base, method=method)
 
 
 def test_trainable_sidecar_rejects_frozen_base_or_missing_tcn():
@@ -449,6 +445,44 @@ def test_export_metadata_carries_verified_fsdp_provenance_and_hashes(tmp_path):
     assert metadata["source_ckpt_metadata"] == inputs["checkpoint_meta"]
     assert metadata["model_sha256"] == _sha256(inputs["model_path"])
     assert metadata["model_tensor_count"] == 126
+
+
+@pytest.mark.parametrize("invalid", [None, "task_id", "frozen_delta"])
+def test_multitask_pirl_export_preserves_tasks_and_bounds_extra_updates(
+    tmp_path, invalid
+):
+    inputs = _export_metadata_fixture(tmp_path)
+    metadata = inputs["checkpoint_meta"]
+    metadata.pop("task_id")
+    metadata.update(
+        task_domain="realworld",
+        checkpoint_format="realworld_pirl_v1",
+        multi_task_format="ppo_multitask_v1",
+        tasks=[{"name": "milk", "task_id": 6}, {"name": "cola", "task_id": 6}],
+    )
+    inputs["extra_trainable_modules"] = ("marker_token_encoder", "tactile_cross_attn")
+    base_path = Path(inputs["source_model_path"]) / "model.safetensors"
+    for path, value in [(base_path, 1.0), (inputs["model_path"], 2.0)]:
+        tensors = load_file(path)
+        for module in inputs["extra_trainable_modules"]:
+            tensors[f"{module}.weight"] = torch.full((1,), value, dtype=torch.bfloat16)
+        tensors["frozen.weight"] = torch.ones(1, dtype=torch.bfloat16)
+        if invalid == "frozen_delta" and path == inputs["model_path"]:
+            tensors["frozen.weight"] *= 2
+        save_file(tensors, path)
+    if invalid == "task_id":
+        metadata["tasks"][1]["task_id"] = None
+    if invalid is not None:
+        with pytest.raises(
+            ValueError,
+            match="task_id" if invalid == "task_id" else "unexpected=.*frozen.weight",
+        ):
+            exporter._build_export_metadata(**inputs)
+        return
+    result = exporter._build_export_metadata(**inputs)
+    assert result["tasks"] == metadata["tasks"]
+    assert result["multi_task_format"] == "ppo_multitask_v1"
+    assert result["task_id"] is None
 
 
 @pytest.mark.parametrize(
@@ -535,7 +569,9 @@ def test_export_metadata_accepts_replay_firm_pi05_precision_contract(
                     1, dtype=torch.bfloat16
                 )
                 for index in range(
-                    0 if method in {"sft_full_lora_vision", "sft_full_lora_tacimg"} else 16
+                    0
+                    if method in {"sft_full_lora_vision", "sft_full_lora_tacimg"}
+                    else 16
                 )
             },
         },
@@ -554,7 +590,9 @@ def test_export_metadata_accepts_replay_firm_pi05_precision_contract(
 
     assert metadata["dataset"] == dataset
     assert metadata["base_model_tensor_count"] == 1
-    expected_extra = 0 if method in {"sft_full_lora_vision", "sft_full_lora_tacimg"} else 16
+    expected_extra = (
+        0 if method in {"sft_full_lora_vision", "sft_full_lora_tacimg"} else 16
+    )
     assert metadata["method"] == method
     assert metadata["extra_tensor_count"] == expected_extra
     assert metadata["model_tensor_count"] == 1 + expected_extra

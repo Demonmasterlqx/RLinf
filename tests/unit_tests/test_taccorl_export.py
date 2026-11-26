@@ -145,7 +145,6 @@ def test_taccorl_requires_fusion_config_and_source_model(tmp_path, method):
         "sft_full_lora_tacforce_tcn",
         "sft_full_lora_tacimg",
         "sft_full_lora_vision",
-        "pirl",
     ],
 )
 def test_non_taccorl_methods_reject_taccorl_models(tmp_path, method):
@@ -159,6 +158,10 @@ def test_non_taccorl_methods_reject_taccorl_models(tmp_path, method):
             source_model=model,
             openpi_cfg={"tactile_fusion": "taccorl"},
         )
+
+
+def test_pirl_accepts_taccorl_architecture():
+    exporter._validate_taccorl_export_method("pirl", {"tactile_fusion": "taccorl"})
 
 
 def test_taccorl_filtered_export_rejects_stray_module(tmp_path):
@@ -193,8 +196,18 @@ class _SyntheticAdapter(nn.Module):
 
 
 @pytest.mark.parametrize("method", _METHODS)
+@pytest.mark.parametrize(
+    "dataset",
+    [
+        "datasets/realworld_replay_task820_firm_mixed",
+        [
+            "xiangxin0923/realworld_task927_firm_4x4",
+            "xiangxin0923/realworld_replayed_firm_4x4",
+        ],
+    ],
+)
 def test_taccorl_sidecar_exports_bundle_with_serving_name_and_both_modules(
-    tmp_path, monkeypatch, method
+    tmp_path, monkeypatch, method, dataset
 ):
     model = _synthetic_model()
     model.paligemma_with_expert = nn.Module()
@@ -248,7 +261,7 @@ def test_taccorl_sidecar_exports_bundle_with_serving_name_and_both_modules(
     metadata = {
         "format": "trainable_weights",
         "method": method,
-        "dataset": "datasets/realworld_replay_task820_firm_mixed",
+        "dataset": dataset,
         "training_config": train_path.stem,
         "deployment_config_name": "old_training_name",
         "step": 150,

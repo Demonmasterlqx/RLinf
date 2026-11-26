@@ -84,12 +84,14 @@ TABERO_SFT_METHODS = {
 
 
 def _validate_taccorl_export_method(method: str | None, openpi_cfg: Mapping) -> None:
-    """Require TacCoRL architecture and SFT provenance to agree in both directions."""
+    """Accept TacCoRL SFT or PiRL provenance for a TacCoRL architecture."""
     is_taccorl = openpi_cfg.get("tactile_fusion", "none") == "taccorl"
-    if (method in TACCORL_SFT_METHODS) != is_taccorl:
+    if (method in TACCORL_SFT_METHODS and not is_taccorl) or (
+        is_taccorl and method not in {*TACCORL_SFT_METHODS, "pirl"}
+    ):
         raise ValueError(
             "TacCoRL export methods require tactile_fusion == 'taccorl', and "
-            "TacCoRL models require a TacCoRL SFT method; "
+            "TacCoRL models require a TacCoRL SFT method or pirl; "
             f"method={method!r}, tactile_fusion={openpi_cfg.get('tactile_fusion')!r}"
         )
 
@@ -104,8 +106,12 @@ def _is_action_expert_lora_weight(key: str) -> bool:
     return match is not None and 0 <= int(match.group(1)) < 18
 
 
-def validate_pirl_action_expert_delta(model_path: Path, base_path: Path) -> None:
-    """Require every action-expert LoRA target, and only those targets, to change."""
+def validate_pirl_action_expert_delta(
+    model_path: Path,
+    base_path: Path,
+    extra_trainable_modules: tuple[str, ...] = (),
+) -> None:
+    """Require expert LoRA updates; permit declared extra trainable modules."""
     try:
         with (
             safe_open(model_path, framework="pt", device="cpu") as model,
@@ -124,6 +130,14 @@ def validate_pirl_action_expert_delta(model_path: Path, base_path: Path) -> None
             expected_changes = {
                 key for key in base_keys if _is_action_expert_lora_weight(key)
             }
+            allowed_changes = expected_changes | {
+                key
+                for key in base_keys
+                if any(
+                    _matches_module_prefix(key, module)
+                    for module in extra_trainable_modules
+                )
+            }
             actual_changes = {
                 key
                 for key in base_keys
@@ -136,10 +150,11 @@ def validate_pirl_action_expert_delta(model_path: Path, base_path: Path) -> None
             f"cannot compare piRL model with fixed base: {error}"
         ) from error
     missing = sorted(expected_changes - actual_changes)
-    unexpected = sorted(actual_changes - expected_changes)
+    unexpected = sorted(actual_changes - allowed_changes)
     if (
         len(expected_changes) != PIRL_ACTION_EXPERT_LORA_TENSOR_COUNT
-        or actual_changes != expected_changes
+        or missing
+        or unexpected
     ):
         raise ValueError(
             "piRL action-expert delta mismatch: "
@@ -148,7 +163,7 @@ def validate_pirl_action_expert_delta(model_path: Path, base_path: Path) -> None
             "required_expected_count="
             f"{PIRL_ACTION_EXPERT_LORA_TENSOR_COUNT}, "
             f"missing={missing[:5]}, unexpected={unexpected[:5]}; "
-            "non-action-expert tensors must remain unchanged"
+            "tensors outside the expert and declared trainable modules must remain unchanged"
         )
 
 
@@ -756,6 +771,7 @@ def _build_export_metadata(
     lora_target: str,
     adapter_dirs: list[str],
     allow_non_final: bool = False,
+    extra_trainable_modules: tuple[str, ...] = (),
 ) -> dict:
     train_config = Path(train_config_path).expanduser().resolve()
     source_checkpoint = _checkpoint_path(ckpt_path)
@@ -800,11 +816,25 @@ def _build_export_metadata(
             "intermediate checkpoint for evaluation"
         )
     task_id = checkpoint_meta.get("task_id")
-    if method == "pirl" and (type(task_id) is not int or task_id not in range(10)):
-        raise ValueError("piRL checkpoint provenance task_id must be in [0, 9]")
+    multi_task = checkpoint_meta.get("multi_task_format") == "ppo_multitask_v1"
+    if method == "pirl":
+        tasks = checkpoint_meta.get("tasks") if multi_task else [checkpoint_meta]
+        if (
+            not isinstance(tasks, list)
+            or not tasks
+            or any(
+                not isinstance(task, Mapping)
+                or type(task.get("task_id")) is not int
+                or task["task_id"] not in range(10)
+                for task in tasks
+            )
+        ):
+            raise ValueError(
+                "piRL checkpoint provenance task_id must be in [0, 9] for every task"
+            )
     if method in TABERO_SFT_METHODS:
         dataset = checkpoint_meta.get("dataset")
-        if dataset not in {
+        supported_datasets = {
             "datas/tabero_firm",
             "datas/replay_firm_tabero",
             "datas/replay_firm_tabero_xarm_gripper",
@@ -816,7 +846,14 @@ def _build_export_metadata(
             "datasets/xiangxin0923/realworld_task820_firm_current",
             "datasets/tabero",
             "datasets/tabero_firmly_tightly_no_adverb",
-        }:
+            "xiangxin0923/realworld_task927_firm_4x4",
+            "xiangxin0923/realworld_replayed_firm_4x4",
+        }
+        datasets = dataset if isinstance(dataset, list) else [dataset]
+        if not datasets or any(
+            not isinstance(source, str) or source not in supported_datasets
+            for source in datasets
+        ):
             raise ValueError(
                 f"Tabero SFT checkpoint provenance dataset is unsupported: {dataset!r}."
             )
@@ -863,7 +900,9 @@ def _build_export_metadata(
             f"target_global_step {target_global_step}, got {global_step}"
         )
     if method == "pirl" and lora_target == "action_expert":
-        validate_pirl_action_expert_delta(output_model, base_checkpoint)
+        validate_pirl_action_expert_delta(
+            output_model, base_checkpoint, extra_trainable_modules
+        )
     safe_metadata = _json_safe(dict(checkpoint_meta))
     base_tensor_count = _safetensor_count(base_checkpoint)
     model_tensor_count = _safetensor_count(output_model)
@@ -878,6 +917,14 @@ def _build_export_metadata(
         "method": method,
         "lora_target": lora_target,
         "task_id": task_id,
+        **(
+            {
+                "multi_task_format": checkpoint_meta["multi_task_format"],
+                "tasks": safe_metadata["tasks"],
+            }
+            if multi_task
+            else {}
+        ),
         "global_step": global_step,
         "target_global_step": target_global_step,
         "is_final": is_final,
@@ -1276,6 +1323,7 @@ def export_checkpoint(
             lora_target=lora_target,
             adapter_dirs=adapter_dir_names if save_adapter else [],
             allow_non_final=allow_non_final,
+            extra_trainable_modules=configured_extra_modules,
         )
         if norm_stats_source is not None:
             export_metadata["normalization_asset_id"] = norm_asset_id
