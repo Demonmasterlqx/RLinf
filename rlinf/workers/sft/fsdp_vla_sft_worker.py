@@ -88,9 +88,13 @@ class _OpenPiTactileDataLoader:
         """Guard against resuming with a different rank/domain sampling contract."""
         if self._cotrain is None:
             return None
+        datasets = dataclasses.asdict(self._cotrain)
+        # Keep same-FPS checkpoints created before temporal_mode compatible.
+        if datasets["temporal_mode"] == "same_fps":
+            datasets.pop("temporal_mode")
         return {
             **self.sampler.resume_signature(),
-            "datasets": json.loads(json.dumps(dataclasses.asdict(self._cotrain))),
+            "datasets": json.loads(json.dumps(datasets)),
         }
 
     def __iter__(self):

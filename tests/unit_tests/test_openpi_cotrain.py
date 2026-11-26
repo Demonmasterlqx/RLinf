@@ -200,6 +200,67 @@ def test_specs_require_two_domains_and_mutually_exclusive_selections():
         CoTrainDatasetSpec("synthetic", episodes=(1,), episode_source="realworld")
 
 
+def test_native_frames_builder_uses_each_domains_timestamps(monkeypatch, tmp_path):
+    import openpi.training.data_loader as upstream
+
+    roots = {domain: tmp_path / domain for domain in ("real", "sim")}
+    for root in roots.values():
+        (root / "meta").mkdir(parents=True)
+        (root / "meta/info.json").write_text("{}")
+    fps = {str(roots["real"]): 5, str(roots["sim"]): 20}
+    monkeypatch.setattr(
+        upstream.lerobot_dataset,
+        "LeRobotDatasetMetadata",
+        lambda repo, **kw: SimpleNamespace(
+            root=kw["root"], fps=fps[repo], features={"actions": {"shape": [13]}}
+        ),
+    )
+    timestamps = {}
+
+    def dataset(repo, **kwargs):
+        timestamps[repo] = kwargs["delta_timestamps"]["actions"]
+        return SyntheticDataset(8)
+
+    monkeypatch.setattr(upstream.lerobot_dataset, "LeRobotDataset", dataset)
+    monkeypatch.setattr(upstream, "transform_dataset", lambda dataset, cfg: dataset)
+    data = SimpleNamespace(
+        norm_stats={"shared": object()},
+        rlds_data_dir=None,
+        action_sequence_keys=("actions",),
+        prompt_from_task=False,
+    )
+    config = SimpleNamespace(
+        data=SimpleNamespace(create=lambda *args: data),
+        assets_dirs="unused",
+        model=SimpleNamespace(action_horizon=3),
+        num_workers=0,
+    )
+    specs = {domain: {"dataset_path": str(root)} for domain, root in roots.items()}
+    with pytest.raises(ValueError, match="fps mismatch"):
+        create_cotrain_data_loader(
+            config,
+            CoTrainConfig.from_mapping(specs),
+            micro_batch_size=8,
+            rank=0,
+            world_size=1,
+            seed=42,
+        )
+    cotrain = CoTrainConfig.from_mapping({**specs, "temporal_mode": "native_frames"})
+    loader, _ = create_cotrain_data_loader(
+        config,
+        cotrain,
+        micro_batch_size=8,
+        rank=0,
+        world_size=1,
+        seed=42,
+    )
+    assert timestamps[str(roots["real"])] == [0.0, 0.2, 0.4]
+    assert timestamps[str(roots["sim"])] == [0.0, 0.05, 0.1]
+    assert next(iter(loader))["domain"].tolist().count(1) == 4
+    with pytest.raises(ValueError, match="temporal_mode"):
+        CoTrainConfig.from_mapping({**specs, "temporal_mode": "resample"})
+
+
 @pytest.mark.parametrize("domain", [[0, 1, 1, 0], [0, 0, 0, 0], [1, 1, 1, 1]])
 def test_domain_loss_means_and_absent_domains(domain):
     losses = torch.tensor([1.0, 3.0, 5.0, 7.0], requires_grad=True)

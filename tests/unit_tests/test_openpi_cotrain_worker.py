@@ -230,3 +230,19 @@ def test_resume_rejects_changed_seed_and_accepts_rank_independent_signature(tmp_
     changed = SimpleNamespace(data_loader=_loader(seed=7))
     with pytest.raises(ValueError, match="stream differs"):
         module.FSDPVlaSftWorker._load_openpi_data_state(changed, str(tmp_path))
+
+
+def test_resume_keeps_legacy_same_fps_and_rejects_changed_temporal_mode(tmp_path):
+    original = _loader()
+    assert "temporal_mode" not in original.resume_signature()["datasets"]
+    worker = SimpleNamespace(data_loader=original, _data_epoch=0, _data_iter_offset=2)
+    module.FSDPVlaSftWorker._save_openpi_data_state(worker, str(tmp_path))
+    changed = _loader()
+    changed._cotrain = dataclasses.replace(
+        changed._cotrain, temporal_mode="native_frames"
+    )
+    assert changed.resume_signature()["datasets"]["temporal_mode"] == "native_frames"
+    with pytest.raises(ValueError, match="stream differs"):
+        module.FSDPVlaSftWorker._load_openpi_data_state(
+            SimpleNamespace(data_loader=changed), str(tmp_path)
+        )

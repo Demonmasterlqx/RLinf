@@ -19,6 +19,9 @@
 (local LeRobot root or repo id) and optionally either ``episodes`` or
 ``episode_source``. Sources are resolved from ``meta/episode_sources.jsonl``.
 Both domains use the same transforms and offline union normalization stats.
+``temporal_mode: native_frames`` permits different source FPS: each action
+chunk spans consecutive frames in its own domain, without time resampling.
+The default ``same_fps`` requires matching FPS.
 Keep ``data.train_data_paths: []`` as the SFT entrypoint's training switch;
 its contents are ignored by the co-training loader.
 
@@ -77,24 +80,27 @@ class CoTrainConfig:
     real: CoTrainDatasetSpec
     sim: CoTrainDatasetSpec
     sim_weight: float = 0.5
+    temporal_mode: str = "same_fps"
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.sim_weight <= 1.0:
             raise ValueError("sim_weight must be finite and in [0, 1].")
+        if self.temporal_mode not in ("same_fps", "native_frames"):
+            raise ValueError("temporal_mode must be same_fps or native_frames.")
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> CoTrainConfig:
         """Validate the YAML block, including unknown or missing domains."""
-        unknown = set(value) - {"real", "sim", "sim_weight"}
+        unknown = set(value) - {"real", "sim", "sim_weight", "temporal_mode"}
         if unknown or value.get("real") is None or value.get("sim") is None:
             raise ValueError(
-                "data.cotrain requires real and sim, with optional sim_weight only; "
-                f"unknown keys: {sorted(unknown)}."
+                f"data.cotrain requires real and sim; unknown keys: {sorted(unknown)}."
             )
         return cls(
             real=CoTrainDatasetSpec(**dict(value["real"])),
             sim=CoTrainDatasetSpec(**dict(value["sim"])),
             sim_weight=float(value.get("sim_weight", 0.5)),
+            temporal_mode=value.get("temporal_mode", "same_fps"),
         )
 
 
@@ -292,13 +298,17 @@ def episodes_for_source(root: Path, source: str) -> tuple[int, ...]:
     return tuple(sorted(set(episodes)))
 
 
-def validate_dataset_compatibility(real: Any, sim: Any) -> None:
+def validate_dataset_compatibility(
+    real: Any, sim: Any, *, temporal_mode: str = "same_fps"
+) -> None:
     """Check FPS, feature keys and all shapes, including markers and actions."""
     real_fps, sim_fps = float(real.fps), float(sim.fps)
-    if (
-        real_fps <= 0
-        or not math.isfinite(real_fps)
-        or not math.isclose(real_fps, sim_fps, rel_tol=0.0, abs_tol=1e-6)
+    if any(fps <= 0 or not math.isfinite(fps) for fps in (real_fps, sim_fps)):
+        raise ValueError(
+            f"Co-training fps must be positive: real={real_fps}, sim={sim_fps}."
+        )
+    if temporal_mode == "same_fps" and not math.isclose(
+        real_fps, sim_fps, rel_tol=0.0, abs_tol=1e-6
     ):
         raise ValueError(f"Co-training fps mismatch: real={real_fps}, sim={sim_fps}.")
     real_features, sim_features = real.features, sim.features
@@ -365,7 +375,9 @@ def create_cotrain_data_loader(
             or resolve_lerobot_dataset_root(repo_id)
         )
     validate_dataset_compatibility(
-        metadata[cotrain.real.dataset_path], metadata[cotrain.sim.dataset_path]
+        metadata[cotrain.real.dataset_path],
+        metadata[cotrain.sim.dataset_path],
+        temporal_mode=cotrain.temporal_mode,
     )
     for repo_id, meta in metadata.items():
         # Loading the full index is essential even for non-contiguous subsets.
