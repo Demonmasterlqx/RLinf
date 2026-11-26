@@ -1006,6 +1006,35 @@ def test_multitask_accepts_optional_sft(multitask_sft_cfg, enabled_sft):
     validate_config(multitask_sft_cfg)
 
 
+@pytest.mark.parametrize("null_eval", [False, True])
+def test_multitask_validation_restores_tasks_without_eval(
+    multitask_sft_cfg, monkeypatch, null_eval
+):
+    import rlinf.config as config_module
+
+    cfg = multitask_sft_cfg
+    if null_eval:
+        cfg.env.eval = None
+    validate_embodied_cfg = config_module.validate_embodied_cfg
+    # Isolate the multi-task wrapper from the recursive single-task validators.
+    monkeypatch.setattr(
+        config_module, "validate_embodied_cfg", lambda task_cfg: task_cfg
+    )
+    monkeypatch.setattr(config_module, "Cluster", MagicMock())
+    placement = MagicMock()
+    placement.get_world_size.return_value = 8
+    monkeypatch.setattr(
+        config_module, "HybridComponentPlacement", MagicMock(return_value=placement)
+    )
+
+    validated = validate_embodied_cfg(cfg)
+
+    assert validated.env.get("eval") is None
+    assert validated.algorithm.multi_task.enabled
+    assert task_list(validated.env.train) == task_list(cfg.env.train)
+    assert validated.env.train.init_params == cfg.env.train.init_params
+
+
 @pytest.mark.parametrize(
     "field,value,message",
     [

@@ -1350,7 +1350,7 @@ def validate_embodied_cfg(cfg):
         with open_dict(validated):
             validated.algorithm.multi_task = copy.deepcopy(cfg.algorithm.multi_task)
             for split in ("train", "eval"):
-                if split in cfg.env and "multi_task" in cfg.env[split]:
+                if cfg.env.get(split) is not None and "multi_task" in cfg.env[split]:
                     validated.env[split].init_params = copy.deepcopy(
                         cfg.env[split].init_params
                     )
